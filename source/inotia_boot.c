@@ -222,38 +222,21 @@ static int gfx_init(void) {
 
 /* --------------------------------------------------------------- the game */
 
-/* The classes the engine wants registered through CWrapper.nativeSetClass.
- * The Java side registered every wrapper it uses at startup; missing one is
- * what makes an engine call through a NULL method ID later. */
-static const char *const k_wrapper_classes[] = {
-    "com/com2us/wrapper/kernel/CWrapperKernel",
-    "com/com2us/wrapper/kernel/CWrapperData",
-    "com/com2us/wrapper/common/CCommonAPI",
-    "com/com2us/wrapper/kernel/CEventHandler",
-    "com/com2us/wrapper/font/CFont",
-    "com/com2us/wrapper/sensor/CSensor",
-    "com/com2us/wrapper/ui/CTextInput",
-    "com/com2us/wrapper/ui/CUserInput",
-    "com/com2us/wrapper/network/CWrapperHttp",
-    "com/com2us/wrapper/utility/CUtility",
-    "com/com2us/wrapper/WrapperUserDefined",
-    NULL,
-};
-
 typedef int (*fn_env)(void *env);
 typedef int (*fn_env_obj)(void *env, void *obj);
-typedef int (*fn_env_obj_obj)(void *env, void *obj, void *a);
-typedef int (*fn_env_obj_int_int)(void *env, void *obj, int a, int b);
+typedef int (*fn_env_int_int)(void *env, int a, int b);
 
 static void *entry(const char *sym) { return (void *)so_try_find_addr_rx(&g_game, sym); }
 
-static void call0(const char *sym, fn_env_obj f, void *obj, const char *what) {
+static void call0(fn_env_obj f, void *obj, const char *what) {
   if (!f) {
     debugPrintf("[game] %s: MISSING\n", what);
     return;
   }
+  debugPrintf("[game] -> %s\n", what);
+  log_flush_ring();
   const int rc = f(g_jni_env, obj);
-  debugPrintf("[game] %s -> %d\n", what, rc);
+  debugPrintf("[game] <- %s = %d\n", what, rc);
   log_flush_ring();
 }
 
@@ -283,70 +266,79 @@ void port_run(void) {
     log_flush_ring();
   }
 
-  fn_env_obj_obj set_class = (fn_env_obj_obj)entry(ENTRY("wrapper_kernel_CWrapper_nativeSetClass"));
-  fn_env_obj_obj init = (fn_env_obj_obj)entry(ENTRY("wrapper_kernel_CWrapper_nativeInitialize"));
-  fn_env_obj_int_int set_size =
-      (fn_env_obj_int_int)entry(ENTRY("wrapper_kernel_CWrapperData_nativeSetScreenSize"));
+  fn_env_obj set_class = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapper_nativeSetClass"));
+  fn_env_int_int set_size =
+      (fn_env_int_int)entry(ENTRY("wrapper_kernel_CWrapperData_nativeSetScreenSize"));
+  fn_env_obj surface = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeSurfaceRecreated"));
   fn_env_obj start = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeStart"));
   fn_env_obj process = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeProcess"));
 
-  /* 1. CWrapper.nativeInitialize(context): the engine keeps the Context and
-   *    reads the package name and the file paths off it from here on.
-   *    (JNIEnv*, jclass, jobject) -- the jclass slot is the wrapper's, so the
-   *    activity goes in the third. */
-  if (init) {
-    const int rc = init(g_jni_env, NULL, inotia_activity());
-    debugPrintf("[game] CWrapper.nativeInitialize -> %d\n", rc);
-  } else {
-    debugPrintf("[game] CWrapper.nativeInitialize MISSING\n");
-  }
-  log_flush_ring();
+  /* The order and the arities below come from disassembling the entry points
+   * in lib/armeabi-v7a/libgame.so (Thumb), not from the Java side:
+   *
+   *   nativeSetClass(env, clazz)          -- reads r0/r1 only; it registers the
+   *                                          wrapper classes itself, by name.
+   *   nativeSetScreenSize(env,clazz,w,h)  -- what jWD_GetDisplayWidth/Height
+   *                                          later return.
+   *   nativeSurfaceRecreated(env, clazz)  -- the GL surface exists.
+   *   nativeStart(env, clazz)             -- TM_Initialize, __android_init,
+   *                                          RenderCoreInitialize(w, h, 0).
+   *
+   * CWrapper.nativeInitialize is NOT a lifecycle call: its third argument is a
+   * jstring (the code does env->GetStringUTFChars(env, arg2, NULL) and looks
+   * the result up in a name -> void(*)(JNIEnv*, jobject) table). Passing the
+   * activity there is what killed the first hardware run, so it is skipped
+   * until the names the engine expects are known. */
 
-  /* 2. CWrapper.nativeSetClass: one call per wrapper class. The engine stores
-   *    them in the jmethodID table it later calls back through. */
   if (set_class) {
-    for (int i = 0; k_wrapper_classes[i]; i++) {
-      JObj *cls = inotia_wrapper_class(k_wrapper_classes[i]);
-      const int rc = set_class(g_jni_env, NULL, cls);
-      debugPrintf("[game] nativeSetClass(%s) -> %d\n", k_wrapper_classes[i], rc);
-    }
+    debugPrintf("[game] -> nativeSetClass\n");
+    log_flush_ring();
+    const int rc = set_class(g_jni_env, NULL);
+    debugPrintf("[game] <- nativeSetClass = %d\n", rc);
+    log_flush_ring();
   } else {
-    debugPrintf("[game] CWrapper.nativeSetClass MISSING\n");
+    debugPrintf("[game] nativeSetClass MISSING\n");
   }
-  log_flush_ring();
-
-  /* 3. The other initialisers the Java side called before starting. */
-  call0(ENTRY("wrapper_common_CCommonAPI_nativeInitialize"),
-        (fn_env_obj)entry(ENTRY("wrapper_common_CCommonAPI_nativeInitialize")), NULL,
-        "CCommonAPI.nativeInitialize");
-  call0(ENTRY("wrapper_kernel_CEventHandler_nativeEventHandlerInitialize"),
-        (fn_env_obj)entry(ENTRY("wrapper_kernel_CEventHandler_nativeEventHandlerInitialize")), NULL,
-        "CEventHandler.nativeEventHandlerInitialize");
-  call0(ENTRY("wrapper_font_CFont_nativeFontInitialize"),
-        (fn_env_obj)entry(ENTRY("wrapper_font_CFont_nativeFontInitialize")), NULL,
-        "CFont.nativeFontInitialize");
-  call0(ENTRY("wrapper_sensor_CSensor_nativeSensorInitialize"),
-        (fn_env_obj)entry(ENTRY("wrapper_sensor_CSensor_nativeSensorInitialize")), NULL,
-        "CSensor.nativeSensorInitialize");
 
   if (set_size) {
+    debugPrintf("[game] -> nativeSetScreenSize(%d,%d)\n", w, h);
+    log_flush_ring();
     const int rc = set_size(g_jni_env, NULL, w, h);
-    debugPrintf("[game] CWrapperData.nativeSetScreenSize(%d,%d) -> %d\n", w, h, rc);
+    debugPrintf("[game] <- nativeSetScreenSize = %d\n", rc);
+    log_flush_ring();
   }
 
-  /* 4. The engine's main entry. On Android this is where MainActivity hands
-   *    the thread over; if it returns, the game is driven by nativeProcess
-   *    from the GL thread instead. */
+  /* The other initialisers the Java side called before starting. */
+  call0((fn_env_obj)entry(ENTRY("wrapper_common_CCommonAPI_nativeInitialize")), NULL,
+        "CCommonAPI.nativeInitialize");
+  call0((fn_env_obj)entry(ENTRY("wrapper_kernel_CEventHandler_nativeEventHandlerInitialize")), NULL,
+        "CEventHandler.nativeEventHandlerInitialize");
+  call0((fn_env_obj)entry(ENTRY("wrapper_font_CFont_nativeFontInitialize")), NULL,
+        "CFont.nativeFontInitialize");
+  call0((fn_env_obj)entry(ENTRY("wrapper_sensor_CSensor_nativeSensorInitialize")), NULL,
+        "CSensor.nativeSensorInitialize");
+
+  if (surface) {
+    debugPrintf("[game] -> nativeSurfaceRecreated\n");
+    log_flush_ring();
+    const int rc = surface(g_jni_env, NULL);
+    debugPrintf("[game] <- nativeSurfaceRecreated = %d\n", rc);
+    log_flush_ring();
+  }
+
+  /* The engine's main entry. On Android this is where MainActivity hands the
+   * thread over; if it returns, the game is driven by nativeProcess from the
+   * GL thread instead. */
   if (!start || !process) {
     debugPrintf("[game] nativeStart/nativeProcess MISSING: the engine cannot run\n");
     log_flush_ring();
     return;
   }
 
-  debugPrintf("[game] nativeStart\n");
+  debugPrintf("[game] -> nativeStart\n");
   log_flush_ring();
   const int rc = start(g_jni_env, NULL);
-  debugPrintf("[game] nativeStart returned %d\n", rc);
+  debugPrintf("[game] <- nativeStart = %d\n", rc);
   log_flush_ring();
 
   inotia_input_init();
