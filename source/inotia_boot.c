@@ -224,7 +224,7 @@ static int gfx_init(void) {
 
 typedef int (*fn_env)(void *env);
 typedef int (*fn_env_obj)(void *env, void *obj);
-typedef int (*fn_env_int_int)(void *env, int a, int b);
+typedef int (*fn_env_obj_int_int)(void *env, void *obj, int a, int b);
 
 static void *entry(const char *sym) { return (void *)so_try_find_addr_rx(&g_game, sym); }
 
@@ -267,7 +267,7 @@ void port_run(void) {
   }
 
   fn_env_obj set_class = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapper_nativeSetClass"));
-  fn_env_int_int set_size =
+  fn_env_obj_int_int set_size =
       (fn_env_int_int)entry(ENTRY("wrapper_kernel_CWrapperData_nativeSetScreenSize"));
   fn_env_obj surface = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeSurfaceRecreated"));
   fn_env_obj start = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeStart"));
