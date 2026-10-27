@@ -268,7 +268,7 @@ void port_run(void) {
 
   fn_env_obj set_class = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapper_nativeSetClass"));
   fn_env_obj_int_int set_size =
-      (fn_env_int_int)entry(ENTRY("wrapper_kernel_CWrapperData_nativeSetScreenSize"));
+      (fn_env_obj_int_int)entry(ENTRY("wrapper_kernel_CWrapperData_nativeSetScreenSize"));
   fn_env_obj surface = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeSurfaceRecreated"));
   fn_env_obj start = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeStart"));
   fn_env_obj process = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeProcess"));
