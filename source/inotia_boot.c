@@ -224,7 +224,7 @@ static int gfx_init(void) {
 
 typedef int (*fn_env)(void *env);
 typedef int (*fn_env_obj)(void *env, void *obj);
-typedef int (*fn_env_obj_int_int)(void *env, void *obj, int a, int b);
+typedef int (*fn_env_obj_6i)(void *env, void *obj, int a, int b, int c, int d, int e, int f);
 
 static void *entry(const char *sym) { return (void *)so_try_find_addr_rx(&g_game, sym); }
 
@@ -267,62 +267,61 @@ void port_run(void) {
   }
 
   fn_env_obj set_class = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapper_nativeSetClass"));
-  fn_env_obj_int_int set_size =
-      (fn_env_obj_int_int)entry(ENTRY("wrapper_kernel_CWrapperData_nativeSetScreenSize"));
+  fn_env_obj_6i set_size =
+      (fn_env_obj_6i)entry(ENTRY("wrapper_kernel_CWrapperData_nativeSetScreenSize"));
   fn_env_obj surface = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeSurfaceRecreated"));
   fn_env_obj start = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeStart"));
   fn_env_obj process = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeProcess"));
 
-  /* The order and the arities below come from disassembling the entry points
-   * in lib/armeabi-v7a/libgame.so (Thumb), not from the Java side:
+  /* The signatures below are the dex's, not guesses (tools/dex_natives.py):
    *
-   *   nativeSetClass(env, clazz)          -- reads r0/r1 only; it registers the
-   *                                          wrapper classes itself, by name.
-   *   nativeSetScreenSize(env,clazz,w,h)  -- what jWD_GetDisplayWidth/Height
-   *                                          later return.
-   *   nativeSurfaceRecreated(env, clazz)  -- the GL surface exists.
-   *   nativeStart(env, clazz)             -- TM_Initialize, __android_init,
-   *                                          RenderCoreInitialize(w, h, 0).
+   *   CWrapper.nativeSetClass()                        no arguments
+   *   CWrapperData.nativeSetScreenSize(I,I,I,I,I,I)    six ints
+   *   CWrapperKernel.nativeSurfaceRecreated()          no arguments
+   *   CWrapperKernel.nativeStart()                     no arguments
+   *   CWrapper.nativeInitialize(String)                a command name
+   *   CEventHandler.nativeEventHandlerInitialize(ByteBuffer,ByteBuffer,I,I)
+   *   CFont.nativeFontInitialize([I,I,I,I)
+   *   CSensor.nativeSensorInitialize([F)
    *
-   * CWrapper.nativeInitialize is NOT a lifecycle call: its third argument is a
-   * jstring (the code does env->GetStringUTFChars(env, arg2, NULL) and looks
-   * the result up in a name -> void(*)(JNIEnv*, jobject) table). Passing the
-   * activity there is what killed the first hardware run, so it is skipped
-   * until the names the engine expects are known. */
+   * nativeSetScreenSize stores its six ints as shorts, and the getters read
+   * exactly those slots (jWD_GetOriginalWidth -> +0x66, OriginalHeight ->
+   * +0x68, DisplayWidth -> +0x6a, DisplayHeight -> +0x6c, then device
+   * width/height): original, display, device. nativeStart then calls
+   * RenderCoreInitialize(jWD_GetOriginalWidth(), jWD_GetOriginalHeight(), 0),
+   * so all three pairs get the window size for the first light.
+   *
+   * CEventHandler/CFont/CSensor are skipped: they take a direct ByteBuffer and
+   * arrays that the Java layer fills in, and passing NULL is what killed the
+   * second run (nativeEventHandlerInitialize does GetDirectBufferAddress and
+   * then dereferences it). They come back when those buffers are built. */
 
   if (set_class) {
     debugPrintf("[game] -> nativeSetClass\n");
     log_flush_ring();
-    const int rc = set_class(g_jni_env, NULL);
-    debugPrintf("[game] <- nativeSetClass = %d\n", rc);
+    set_class(g_jni_env, NULL);
+    debugPrintf("[game] <- nativeSetClass\n");
     log_flush_ring();
   } else {
     debugPrintf("[game] nativeSetClass MISSING\n");
   }
 
   if (set_size) {
-    debugPrintf("[game] -> nativeSetScreenSize(%d,%d)\n", w, h);
+    debugPrintf("[game] -> nativeSetScreenSize(%d,%d x3)\n", w, h);
     log_flush_ring();
-    const int rc = set_size(g_jni_env, NULL, w, h);
-    debugPrintf("[game] <- nativeSetScreenSize = %d\n", rc);
+    set_size(g_jni_env, NULL, w, h, w, h, w, h);
+    debugPrintf("[game] <- nativeSetScreenSize\n");
     log_flush_ring();
   }
 
-  /* The other initialisers the Java side called before starting. */
   call0((fn_env_obj)entry(ENTRY("wrapper_common_CCommonAPI_nativeInitialize")), NULL,
         "CCommonAPI.nativeInitialize");
-  call0((fn_env_obj)entry(ENTRY("wrapper_kernel_CEventHandler_nativeEventHandlerInitialize")), NULL,
-        "CEventHandler.nativeEventHandlerInitialize");
-  call0((fn_env_obj)entry(ENTRY("wrapper_font_CFont_nativeFontInitialize")), NULL,
-        "CFont.nativeFontInitialize");
-  call0((fn_env_obj)entry(ENTRY("wrapper_sensor_CSensor_nativeSensorInitialize")), NULL,
-        "CSensor.nativeSensorInitialize");
 
   if (surface) {
     debugPrintf("[game] -> nativeSurfaceRecreated\n");
     log_flush_ring();
-    const int rc = surface(g_jni_env, NULL);
-    debugPrintf("[game] <- nativeSurfaceRecreated = %d\n", rc);
+    surface(g_jni_env, NULL);
+    debugPrintf("[game] <- nativeSurfaceRecreated\n");
     log_flush_ring();
   }
 
@@ -337,8 +336,8 @@ void port_run(void) {
 
   debugPrintf("[game] -> nativeStart\n");
   log_flush_ring();
-  const int rc = start(g_jni_env, NULL);
-  debugPrintf("[game] <- nativeStart = %d\n", rc);
+  start(g_jni_env, NULL);
+  debugPrintf("[game] <- nativeStart\n");
   log_flush_ring();
 
   inotia_input_init();
