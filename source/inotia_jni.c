@@ -1,0 +1,409 @@
+/* inotia_jni.c -- the Java the engine talks to.
+ *
+ * libgame.so is a C engine wrapped in a thin Java layer (com.com2us.wrapper.*).
+ * On a phone the wrapper objects do the platform work: they hand out the file
+ * paths, play sounds through SoundPool/MediaPlayer, rasterise glyphs through
+ * Typeface, and deliver touches. Here those answers come from this table.
+ *
+ * Order matters: the first match wins, so each class's named handlers come
+ * before its wildcard entry. The wildcards are deliberate -- an unhandled
+ * wrapper call returning 0 keeps the engine running instead of faulting
+ * through a NULL method ID, and g_jni_log (config.ini [debug] log_java_calls)
+ * records every call that lands on one, which is the to-do list for the next
+ * stage.
+ *
+ * MIT.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "inotia.h"
+#include "jni.h"
+#include "rt_settings.h"
+#include "util.h"
+
+/* ------------------------------------------------------------- File objects
+ * The engine builds its paths from Context.getFilesDir() / getExternalFilesDir
+ * and then asks the File for its path. The path stays in Android form
+ * (/sdcard/..., /data/data/...) on purpose: dcr_path translates it when the
+ * engine finally opens it. */
+static void file_free(JObj *self) {
+  free(self->p);
+  self->p = NULL;
+}
+
+static JObj *file_obj(const char *path) {
+  JObj *o = jni_new("java/io/File");
+  o->p = strdup(path);
+  o->finalize = file_free;
+  return o;
+}
+
+static const char *file_path(JObj *self) { return self && self->p ? (const char *)self->p : ""; }
+
+static jvalue h_file_path(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)a, (void)m;
+  return jv_l(jni_str(file_path(self)));
+}
+
+static jvalue h_file_exists(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)a, (void)m;
+  FILE *f = fopen(file_path(self), "rb");
+  if (!f)
+    return jv_z(0);
+  fclose(f);
+  return jv_z(1);
+}
+
+/* --------------------------------------------------------------- Context */
+#define MAIN_ACTIVITY PORT_PACKAGE "/MainActivity"
+
+static jvalue h_package_name(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(jni_str(PORT_PACKAGE));
+}
+
+static jvalue h_ext_files(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(file_obj("/sdcard/Android/data/" PORT_PACKAGE "/files"));
+}
+
+static jvalue h_files_dir(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(file_obj("/data/data/" PORT_PACKAGE "/files"));
+}
+
+static jvalue h_cache_dir(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(file_obj("/data/data/" PORT_PACKAGE "/cache"));
+}
+
+static jvalue h_ext_storage(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(file_obj("/sdcard"));
+}
+
+/* ------------------------------------------------------------ DisplayMetrics */
+/* The engine reads the screen size from the metrics object it is given, so the
+ * handlers below fill the fields on it. */
+static void fill_metrics(JObj *dm) {
+  if (!dm)
+    return;
+  jni_set_field(dm, "widthPixels", jv_i(RT_SCREEN_W), 0);
+  jni_set_field(dm, "heightPixels", jv_i(RT_SCREEN_H), 0);
+  jni_set_field(dm, "density", jv_f(1.0f), 0);
+  jni_set_field(dm, "densityDpi", jv_i(160), 0);
+  jni_set_field(dm, "scaledDensity", jv_f(1.0f), 0);
+  jni_set_field(dm, "xdpi", jv_f(160.0f), 0);
+  jni_set_field(dm, "ydpi", jv_f(160.0f), 0);
+}
+
+static jvalue h_new_metrics(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  JObj *dm = jni_new("android/util/DisplayMetrics");
+  fill_metrics(dm);
+  return jv_l(dm);
+}
+
+static jvalue h_get_metrics(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)m;
+  if (a && a[0].l)
+    fill_metrics((JObj *)a[0].l);
+  return jv_none();
+}
+
+/* ---------------------------------------------------------------- sound */
+static jvalue h_sound_load(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)m;
+  const char *path = a && a[0].l ? jni_utf(a[0].l) : NULL;
+  if (!path)
+    return jv_i(0);
+  /* A raw resource id (an int) instead of a path: not a file we can open. */
+  const int id = inotia_sound_load(path);
+  return jv_i(id);
+}
+
+/* play(soundID, leftVolume, rightVolume, priority, loop, rate) */
+static jvalue h_sound_play(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)m;
+  if (!a)
+    return jv_i(0);
+  const int id = a[0].i;
+  const float vol = a[1].f;
+  const int loop = a[4].i;
+  return jv_i(inotia_sound_play(id, vol, loop));
+}
+
+static jvalue h_sound_stop(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)m;
+  inotia_sound_stop(a ? a[0].i : 0);
+  return jv_none();
+}
+
+static jvalue h_sound_volume(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)m;
+  inotia_sound_set_volume(a ? a[0].i : 0, a ? (float)a[1].f : 1.0f);
+  return jv_none();
+}
+
+/* ------------------------------------------------------------ MediaPlayer */
+/* One object per player; its state lives in the object's payload. */
+static jvalue h_media_create(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(jni_new("android/media/MediaPlayer"));
+}
+
+static jvalue h_media_set_source(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)m;
+  const char *path = a && a[0].l ? jni_utf(a[0].l) : NULL;
+  return jv_i(path ? inotia_media_open(self, path) : -1);
+}
+
+static jvalue h_media_start(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)a, (void)m;
+  inotia_media_start(self);
+  return jv_none();
+}
+static jvalue h_media_pause(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)a, (void)m;
+  inotia_media_pause(self);
+  return jv_none();
+}
+static jvalue h_media_stop(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)a, (void)m;
+  inotia_media_stop(self);
+  return jv_none();
+}
+static jvalue h_media_release(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)a, (void)m;
+  inotia_media_release(self);
+  return jv_none();
+}
+static jvalue h_media_seek(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)m;
+  inotia_media_seek(self, a ? a[0].i : 0);
+  return jv_none();
+}
+static jvalue h_media_pos(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)a, (void)m;
+  return jv_i(inotia_media_position(self));
+}
+static jvalue h_media_dur(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)a, (void)m;
+  return jv_i(inotia_media_duration(self));
+}
+static jvalue h_media_playing(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)a, (void)m;
+  return jv_z(inotia_media_is_playing(self));
+}
+static jvalue h_media_volume(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)m;
+  inotia_media_set_volume(self, a ? (float)a[0].f : 1.0f);
+  return jv_none();
+}
+static jvalue h_media_looping(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)m;
+  inotia_media_set_looping(self, a ? a[0].z : 0);
+  return jv_none();
+}
+/* setOnCompletionListener etc.: keep the listener so a finished track can call
+ * onCompletion() back. Storing it is enough for now -- the mixer calls it. */
+static jvalue h_media_listener(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)m;
+  if (a && a[0].l)
+    jni_set_field(self, "listener", a[0], 1);
+  return jv_none();
+}
+
+/* ------------------------------------------------------------ MotionEvent */
+/* The engine reads the current touches from the object it polls; these answer
+ * from the input bridge in inotia_input.c. */
+static jvalue h_touch_count(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_i(inotia_touch_count());
+}
+static jvalue h_touch_action(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_i(0);
+}
+static jvalue h_touch_x(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)m;
+  return jv_f((jfloat)inotia_touch_x(a ? a[0].i : 0));
+}
+static jvalue h_touch_y(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)m;
+  return jv_f((jfloat)inotia_touch_y(a ? a[0].i : 0));
+}
+
+/* ------------------------------------------------------------------ Paint */
+/* Text metrics: the engine asks how wide a string is before drawing it. A
+ * rough advance per character keeps the layout sane until stage 1f puts a real
+ * rasteriser behind CFont. */
+static jvalue h_measure_text(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)m;
+  const char *s = a && a[0].l ? jni_utf(a[0].l) : "";
+  const float px = 12.0f;
+  return jv_f((jfloat)(strlen(s) * px * 0.55f));
+}
+
+/* ----------------------------------------------------------------- tables */
+
+const JMethodDef jni_method_defs[] = {
+    /* ---- java/io/File */
+    {"java/io/File", "getAbsolutePath", NULL, h_file_path},
+    {"java/io/File", "getPath", NULL, h_file_path},
+    {"java/io/File", "getCanonicalPath", NULL, h_file_path},
+    {"java/io/File", "toString", NULL, h_file_path},
+    {"java/io/File", "exists", NULL, h_file_exists},
+    {"java/io/File", "mkdirs", NULL, jni_h_true},
+    {"java/io/File", "mkdir", NULL, jni_h_true},
+    {"java/io/File", NULL, NULL, jni_h_null},
+
+    /* ---- Context / Activity: paths and identity */
+    {"android/content/Context", "getPackageName", NULL, h_package_name},
+    {"android/content/Context", "getExternalFilesDir", NULL, h_ext_files},
+    {"android/content/Context", "getExternalCacheDir", NULL, h_ext_files},
+    {"android/content/Context", "getFilesDir", NULL, h_files_dir},
+    {"android/content/Context", "getCacheDir", NULL, h_cache_dir},
+    {"android/content/Context", "getExternalStorageDirectory", NULL, h_ext_storage},
+    {"android/content/Context", "getApplicationContext", NULL, jni_h_self},
+    {"android/content/Context", "getSystemService", NULL, jni_h_null},
+
+    /* ---- screen size */
+    {"android/util/DisplayMetrics", "<init>", NULL, h_new_metrics},
+    {"android/view/Display", "getMetrics", NULL, h_get_metrics},
+
+    /* ---- sound */
+    {"android/media/SoundPool", "<init>", NULL, jni_h_self},
+    {"android/media/SoundPool", "load", NULL, h_sound_load},
+    {"android/media/SoundPool", "play", NULL, h_sound_play},
+    {"android/media/SoundPool", "stop", NULL, h_sound_stop},
+    {"android/media/SoundPool", "pause", NULL, h_sound_stop},
+    {"android/media/SoundPool", "resume", NULL, jni_h_void},
+    {"android/media/SoundPool", "setVolume", NULL, h_sound_volume},
+    {"android/media/SoundPool", "unload", NULL, jni_h_true},
+    {"android/media/SoundPool", "release", NULL, jni_h_void},
+
+    {"android/media/MediaPlayer", "create", NULL, h_media_create},
+    {"android/media/MediaPlayer", "<init>", NULL, jni_h_self},
+    {"android/media/MediaPlayer", "setDataSource", NULL, h_media_set_source},
+    {"android/media/MediaPlayer", "prepare", NULL, jni_h_void},
+    {"android/media/MediaPlayer", "prepareAsync", NULL, jni_h_void},
+    {"android/media/MediaPlayer", "start", NULL, h_media_start},
+    {"android/media/MediaPlayer", "pause", NULL, h_media_pause},
+    {"android/media/MediaPlayer", "stop", NULL, h_media_stop},
+    {"android/media/MediaPlayer", "release", NULL, h_media_release},
+    {"android/media/MediaPlayer", "reset", NULL, jni_h_void},
+    {"android/media/MediaPlayer", "seekTo", NULL, h_media_seek},
+    {"android/media/MediaPlayer", "getCurrentPosition", NULL, h_media_pos},
+    {"android/media/MediaPlayer", "getDuration", NULL, h_media_dur},
+    {"android/media/MediaPlayer", "isPlaying", NULL, h_media_playing},
+    {"android/media/MediaPlayer", "setVolume", NULL, h_media_volume},
+    {"android/media/MediaPlayer", "setLooping", NULL, h_media_looping},
+    {"android/media/MediaPlayer", "setOnCompletionListener", NULL, h_media_listener},
+    {"android/media/MediaPlayer", "setOnErrorListener", NULL, h_media_listener},
+    {"android/media/MediaPlayer", "setOnPreparedListener", NULL, h_media_listener},
+
+    /* ---- touch */
+    {"android/view/MotionEvent", "getPointerCount", NULL, h_touch_count},
+    {"android/view/MotionEvent", "getAction", NULL, h_touch_action},
+    {"android/view/MotionEvent", "getActionMasked", NULL, h_touch_action},
+    {"android/view/MotionEvent", "getX", NULL, h_touch_x},
+    {"android/view/MotionEvent", "getY", NULL, h_touch_y},
+
+    /* ---- text metrics */
+    {"android/graphics/Paint", "measureText", NULL, h_measure_text},
+
+    /* ---- the Com2uS wrapper classes: named answers first, then a wildcard so
+     * an unknown call returns a zero instead of faulting. */
+    {"com/com2us/wrapper/kernel/CWrapperKernel", "nativeStart", NULL, jni_h_void},
+    {"com/com2us/wrapper/kernel/CWrapperKernel", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/kernel/CWrapperData", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/kernel/CWrapper", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/kernel/CEventHandler", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/common/CCommonAPI", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/font/CFont", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/sensor/CSensor", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/ui/CTextInput", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/ui/CUserInput", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/network/CWrapperHttp", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/utility/CUtility", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/WrapperUserDefined", NULL, NULL, jni_h_zero},
+
+    {NULL, NULL, NULL, NULL},
+};
+
+const JFieldDef jni_field_defs[] = {
+    /* The engine gates features on the API level: 24 is the APK's minSdk, and
+     * the oldest one that keeps the engine on its non-scoped-storage paths. */
+    {"android/os/Build$VERSION", "SDK_INT", NULL, 24, NULL},
+    {"android/os/Build", "MODEL", NULL, 0, "Switch"},
+    {"android/os/Build", "MANUFACTURER", NULL, 0, "Nintendo"},
+    {"android/os/Build", "DEVICE", NULL, 0, "nx"},
+    {"android/os/Build", "PRODUCT", NULL, 0, PORT_NAME},
+    {NULL, NULL, NULL, 0, NULL},
+};
+
+/* The engine calls Context methods on the activity, so the activity has to be
+ * an Activity and an Activity a Context. */
+const char *const jni_class_supers[][2] = {
+    {MAIN_ACTIVITY, "android/app/Activity"},
+    {"android/app/Activity", "android/content/Context"},
+    {"android/app/Activity", "android/view/ContextThemeWrapper"},
+    {"android/view/ContextThemeWrapper", "android/content/ContextWrapper"},
+    {"android/content/ContextWrapper", "android/content/Context"},
+    {"android/media/MediaPlayer", "java/lang/Object"},
+    {"java/io/File", "java/lang/Object"},
+    {NULL, NULL},
+};
+
+/* Classes the engine asks for that the APK's own classes.txt does not list:
+ * the framework ones, plus the wrapper classes (the APK has them, but a
+ * classes.txt read from the dex is not guaranteed to be complete on the first
+ * start). */
+const char *const jni_missing_classes[] = {
+    "android/content/Context",
+    "android/app/Activity",
+    "android/os/Build",
+    "android/os/Build$VERSION",
+    "android/util/DisplayMetrics",
+    "android/view/Display",
+    "android/view/MotionEvent",
+    "android/media/SoundPool",
+    "android/media/MediaPlayer",
+    "android/graphics/Paint",
+    "android/graphics/Typeface",
+    "java/io/File",
+    "com/com2us/wrapper/kernel/CWrapperKernel",
+    "com/com2us/wrapper/kernel/CWrapperData",
+    "com/com2us/wrapper/kernel/CWrapper",
+    "com/com2us/wrapper/kernel/CEventHandler",
+    "com/com2us/wrapper/common/CCommonAPI",
+    "com/com2us/wrapper/font/CFont",
+    "com/com2us/wrapper/sensor/CSensor",
+    "com/com2us/wrapper/ui/CTextInput",
+    "com/com2us/wrapper/ui/CUserInput",
+    "com/com2us/wrapper/network/CWrapperHttp",
+    "com/com2us/wrapper/utility/CUtility",
+    "com/com2us/wrapper/WrapperUserDefined",
+    NULL,
+};
+
+/* ------------------------------------------------------- the objects */
+JObj *inotia_activity(void) {
+  static JObj *activity;
+  if (!activity)
+    activity = jni_new(MAIN_ACTIVITY);
+  return activity;
+}
+
+JObj *inotia_wrapper_class(const char *short_name) {
+  char full[160];
+  snprintf(full, sizeof full, "%s", short_name);
+  for (char *p = full; *p; p++)
+    if (*p == '.')
+      *p = '/';
+  JClass *c = jni_class(full);
+  return c ? c->obj : NULL;
+}

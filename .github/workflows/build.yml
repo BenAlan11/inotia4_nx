@@ -1,0 +1,76 @@
+name: build
+
+# Builds the 32-bit wrapper (inotia4_nx.nsp) and the 64-bit launcher
+# (inotia4_nx.nro) on GitHub's runners, so no local toolchain is needed.
+#
+# Nothing that is not source is committed: the runtime (android32), libnx32 and
+# Mesa are fetched here, from their own releases. The game's files never enter
+# the repository -- the APK stays on the player's SD card and is read at run
+# time.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**.md"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the runtime and the prebuilt dependencies
+        run: |
+          set -eux
+          # android32: the shared AArch32 runtime, at runtime/
+          curl -sSL -o rt.zip https://codeload.github.com/aks796/android32/zip/refs/heads/main
+          unzip -q rt.zip
+          mv android32-main runtime
+
+          # libnx32 4.12.0 (prebuilt): mounted over the image's stock copy
+          curl -sSL -o libnx32.zip \
+            https://github.com/aks796/libnx32/releases/download/4.12.0/libnx32.zip
+          mkdir -p third_party
+          unzip -q libnx32.zip -d third_party/_libnx
+          mv third_party/_libnx/libnx32 third_party/libnx32
+
+          # Mesa 26.2 (prebuilt): portlibs32/
+          curl -sSL -o mesa.zip \
+            https://github.com/aks796/mesa-switch32/releases/download/release/mesa-switch32.zip
+          unzip -q mesa.zip -d _mesa
+          mv _mesa/mesa-switch32 portlibs32
+
+          test -f third_party/libnx32/lib/libnx.a
+          test -f third_party/libnx32/include/switch.h
+          test -f portlibs32/lib/libEGL.a
+          test -f portlibs32/lib/libnouveau_horizon.a
+
+      - name: Show what is being built
+        run: |
+          chmod +x build.sh runtime/tools/docker_build.sh launcher/build.sh tools/verify.sh
+          ./tools/verify.sh || true
+          DCR_LIBNX32="$PWD/third_party/libnx32" ./build.sh rt-files
+
+      - name: Build the 32-bit wrapper
+        run: DCR_LIBNX32="$PWD/third_party/libnx32" ./build.sh
+
+      - name: Build the 64-bit launcher
+        run: cd launcher && ./build.sh
+
+      - name: Collect
+        run: |
+          set -eux
+          mkdir -p out
+          cp inotia4_nx.nsp out/
+          cp inotia4_nx.build out/ || true
+          cp launcher/inotia4_nx.nro out/
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inotia4_nx
+          path: out/
+          if-no-files-found: error

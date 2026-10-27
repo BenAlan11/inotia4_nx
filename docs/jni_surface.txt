@@ -1,0 +1,61 @@
+Inotia 4 v1.3.7 (com.com2us.inotia4.normal.freefull.google.global.android.common)
+JNI surface extracted from lib/armeabi-v7a/libgame.so + lib/arm64-v8a/libgame.so
+共 58 个导出 Java_* 入口。分组依据：是否决定画面 / 是否属于 Com2uS 平台 SDK。
+
+A 档 · 内核（必须真实现，决定能不能出画面）
+--------------------------------------------------------------------
+CWrapperKernel   nativeStart               主循环入口
+CWrapperKernel   nativeProcess             每帧推进
+CWrapperKernel   nativePause / nativeResume
+CWrapperKernel   nativeDestroy
+CWrapperKernel   nativeSurfaceRecreated    GL 上下文重建后通知
+CWrapperKernel   nativeOnScreenSizeChanged
+CWrapperKernel   nativeStartClet / nativePauseClet / nativeResumeClet / nativeDestroyClet
+CWrapper         nativeInitialize
+CWrapper         nativeSetClass            关键：传入 jclass/jmethodID 表
+CWrapper         nativeFinalize
+CWrapperData     nativeInitialize / nativeSetScreenSize / nativeFinalize
+CCommonAPI       nativeInitialize / nativeUninitialize
+CEventHandler    nativeEventHandlerInitialize / nativeRemoveAll
+
+B 档 · 平台服务（部分要实现）
+--------------------------------------------------------------------
+CFont            nativeFontInitialize       字体（最大不确定项）
+CFont            nativeCreateFromTypeface   ← 字形来自 Java Typeface
+CFont            nativeCreateWeightAlias
+CSensor          nativeSensorInitialize     返回 0
+CTextInput       nativeCallback             文本输入
+CUserInput       nativeCallback             触摸/用户输入 ← 接 rt_pad
+CWrapperHttp     nativeConnectCB / nativeConnectingCB / nativeIsExistConnectingCB
+                                            单机可返回失败
+CUtility         nativeWebviewCB            桩
+WrapperUserDefined nativeExitCB             退出
+
+C 档 · Com2uS 平台 SDK（整体桩掉，libHercules.so 不加载）
+--------------------------------------------------------------------
+MainActivity     nativeHerculesInit / nativeUseFmod
+ActiveUser       jniInitialize / jniUninitialize / jniActiveUserNotifier
+                 jniNoticePopupNotifier / jniNoticeShowPopupNotifier
+                 jniPermissionViewDataNotifier / jniRequestUserPermissionsNotifier
+                 jniUserAgreeNotifier
+InAppV4          jniInAppV4Initialize
+                 csPurchaseCB / csRestoreCB / csMarketListCB / csGetProductInfoCB
+                 csGetBalanceInfoCB / csCheckPromotePurchaseCB
+                 csIapV4LifecycleCB / csIapV4ShowInAppMessagesCB
+                 csTransactionFinishCB
+Mercury          nativeMercuryInitialize / nativeMercuryCallBack
+                 nativeMercuryCallBackWithData
+                 jniRequestGetBannerInfoNotifier / jniRequestUAInfoNotifier
+HubBridge        callCSHubInitialize / hubCallbackWithJSON
+
+需要注意的运行时线索
+--------------------------------------------------------------------
+- 需要 nativeSetClass：引擎靠它拿到 Java 侧的 jmethodID 表，之后用
+  CallStaticVoidMethod / CallIntMethod 大量回调。JNI 表要按它请求的
+  类名/方法名逐个应答，缺一个就可能空指针。
+- GetPackageName 出现在 .so 字符串里：包名要如实返回，否则资源路径错。
+- CS_mdaSound*（Create/Play/Stop/Pause/Resume/SetVolume/GetVolume/
+  Prepare/Destroy）→ Java SoundPool / MediaPlayer，需自建 Ogg 后端。
+- CS_knlGetTouchCount → 触摸输入由外部合成。
+- 引擎符号前缀 GEM_LIB_*、CS_*、Ino3_*，源码路径
+  jni/gamesrc/Source/{Ino3_UI.c, s_character.c, GEM_LIB_Logger.c, ...}

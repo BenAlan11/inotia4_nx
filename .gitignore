@@ -1,0 +1,9 @@
+/runtime
+/portlibs32
+/third_party
+/build
+*.nsp
+*.build
+*.elf
+/launcher/*.nro
+/launcher/romfs
