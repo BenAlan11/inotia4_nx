@@ -291,9 +291,11 @@ void port_run(void) {
   fn_env_obj process = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeProcess"));
 
   /* 1. CWrapper.nativeInitialize(context): the engine keeps the Context and
-   *    reads the package name and the file paths off it from here on. */
+   *    reads the package name and the file paths off it from here on.
+   *    (JNIEnv*, jclass, jobject) -- the jclass slot is the wrapper's, so the
+   *    activity goes in the third. */
   if (init) {
-    const int rc = init(g_jni_env, inotia_activity());
+    const int rc = init(g_jni_env, NULL, inotia_activity());
     debugPrintf("[game] CWrapper.nativeInitialize -> %d\n", rc);
   } else {
     debugPrintf("[game] CWrapper.nativeInitialize MISSING\n");

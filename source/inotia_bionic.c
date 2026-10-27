@@ -5,8 +5,8 @@
  * newlib functions (atof atoll rand srand: listed as PASSTHROUGH in
  * tools/imports.cfg); the nine here are bionic's _FORTIFY_SOURCE wrappers,
  * which take the destination size as an extra argument. The runtime has the
- * mem*/str* family in bionic_mem.c and __vsnprintf_chk in bionic_extra.c; the
- * rest are this file, written the same way: check the bound, then call the
+ * mem and str families in bionic_mem.c and __vsnprintf_chk in bionic_extra.c;
+ * the rest are this file, written the same way: check the bound, then call the
  * runtime's b_ shim (not newlib directly) so the path stays the same one the
  * rest of the engine takes.
  *
