@@ -48,6 +48,12 @@ jobs:
           test -f portlibs32/lib/libEGL.a
           test -f portlibs32/lib/libnouveau_horizon.a
 
+      # The toolchain image does not run as root, and /work is bind-mounted from
+      # the runner's workspace: without this, make's first `mkdir build` is
+      # "Permission denied".
+      - name: Let the container write to the workspace
+        run: chmod -R a+rwX "$GITHUB_WORKSPACE"
+
       - name: Show what is being built
         run: |
           chmod +x build.sh runtime/tools/docker_build.sh launcher/build.sh tools/verify.sh
