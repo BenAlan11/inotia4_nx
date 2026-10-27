@@ -25,7 +25,10 @@ static const CfgOpt k_opts[] = {
     CFG_ROW_SWAP_AB("Swap A and B in the virtual-finger controls.", &g_cfg.swap_ab),
     CFG_ROW_GL_SELFTEST(NULL),
     CFG_ROW_BOOT_LOG(CFG_HELP_BOOT_LOG, NULL),
-    CFG_ROW_LOG_JNI(CFG_HELP_LOG_JNI, NULL),
+    /* The runtime's row defaults to false; this port is at the stage where the
+     * engine's Java calls are the only way to see what it is missing, so it
+     * starts on. Turn it off once the port is stable -- it is slow. */
+    {"debug", "log_java_calls", "true", CFG_HELP_LOG_JNI, CFG_BOOL, NULL, NULL, 0, 0, 0, 0},
 };
 
 static const CfgSection k_sections[] = {

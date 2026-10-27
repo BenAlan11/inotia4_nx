@@ -48,6 +48,12 @@ jobs:
           test -f portlibs32/lib/libEGL.a
           test -f portlibs32/lib/libnouveau_horizon.a
 
+      # Temporary: a FindClass miss is silent, so the engine ends up calling a
+      # Java method through a NULL ID with nothing in the log about why. This
+      # adds the two lines that name the class. Remove once the port boots.
+      - name: Instrument the runtime's JNI lookups
+        run: python3 tools/ci_patch_runtime.py
+
       # The toolchain image does not run as root, and /work is bind-mounted from
       # the runner's workspace: without this, make's first `mkdir build` is
       # "Permission denied".
