@@ -2,6 +2,7 @@
 /portlibs32
 /third_party
 /build
+/dist
 *.nsp
 *.build
 *.elf
