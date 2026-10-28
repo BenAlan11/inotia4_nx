@@ -513,31 +513,36 @@ void port_run(void) {
   debugPrintf("[game] <- nativeStart\n");
   log_flush_ring();
 
-  /* The kernel state machine after nativeStart is WAIT_UNLOCK_STARTCLET, and
-   * only nativeStartClet moves it to RUNNING:
+  /* nativeStartClet is Protection checks + startClet():
    *
-   *   CWrapperActivity.initialize(data)   lockStartCletForModule("InitializeWrapper")
-   *                                       ... every module locks and unlocks ...
-   *   CWrapperKernel.onUnlockStartClet()  list empty + state WAIT_UNLOCK_STARTCLET
-   *                                       -> queueEventForcedly(CWrapperKernel$4)
-   *   CWrapperKernel$4.run()              setState(NATIVE_STARTCLET)
-   *   CInnerStateNativeStartClet.start()  nativeStartClet() -> RUNNING
+   *   Protection::getInstance()->startCheckSpeedHack()   (a `return 1` stub)
+   *   if (isRunningMemoryHack()) jShowDialogAndExit()
+   *   if (jWD_GetIsTerminateIfCracked() && isRooted()) jShowDialogAndExit()
+   *   startClet()                                        <- the real work
    *
-   * The port has no Java lock list to empty, so it calls the last step itself.
-   * Without it the engine never reaches RUNNING and the first nativeProcess
-   * does not come back. */
+   * isRunningMemoryHack is Android-only: it builds a path out of
+   * CFunction.getUserDir() + getPackageName(), runs system(...) (a -1 stub
+   * here) and then fopen()s a /proc-ish path. On this port the run died
+   * inside it, right after getUserDir, with no message -- a silent exit, not a
+   * fault. There is no Android to check and nothing to detect, so the port
+   * calls startClet() itself and skips the scan.
+   *
+   * startClet is a straight line of engine initialisers (CS_ActiveUserSetLogged,
+   * jSetOriginalSize, SGL_grpInitialize, MEM_Create, UTIL_GetUDID,
+   * APPINFO_Initialize, IMGSYS_LoadTitleImg, CS_knlDefTimer, ...) and ends by
+   * arming the engine's 100 ms timer. */
   {
-    fn_env_obj start_clet = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeStartClet"));
+    void (*start_clet)(void) = (void (*)(void))entry("startClet");
     if (start_clet) {
-      debugPrintf("[game] -> nativeStartClet\n");
+      debugPrintf("[game] -> startClet (Protection's memory-hack scan skipped)\n");
       log_flush_ring();
-      busy_begin("nativeStartClet");
-      start_clet(g_jni_env, NULL);
+      busy_begin("startClet");
+      start_clet();
       busy_end();
-      debugPrintf("[game] <- nativeStartClet\n");
+      debugPrintf("[game] <- startClet\n");
       log_flush_ring();
     } else {
-      debugPrintf("[game] nativeStartClet MISSING\n");
+      debugPrintf("[game] startClet MISSING\n");
     }
   }
 
