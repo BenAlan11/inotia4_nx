@@ -335,45 +335,127 @@ static jvalue h_cf_activity(JObj *self, const jvalue *a, const JMethod *m) {
 }
 
 /* ------------------------------------------- CResource.getFileDescriptorFromAsset
- * The Java side opens the asset through AssetManager and hands the engine a
- * FileDescriptor plus (startOffset, length) in the int[2]; the engine lseeks
- * and reads. There is no AssetManager here, but assets/common/** is already
- * unpacked next to the game, so the same contract is served from a real file:
- * offset 0, length = size, and an fd from b_open so the engine's b_read finds
- * it.
+ * This has to behave like Android's AssetManager, because that is what the
+ * engine is written against: the FileDescriptor it gets back is the APK's own
+ * fd, and the int[2] holds (offset, length) of the entry *inside* the APK. The
+ * engine lseeks that fd to the offset and reads.
  *
- * The naming is the APK's, not the engine's: every asset lives in
- * assets/common/game_res/ and every one of the 732 is stored with a .jpg
- * suffix (the trick that stops aapt from compressing PNGs), while the engine
- * asks for "UI_TITLEMAIN_02.png". The candidates below cover that.
+ * Serving a separate file instead (offset 0, its own fd) worked for the first
+ * image and then broke: the engine closes the fd and reopens the APK, the fd
+ * number is reused, and the next read of the "asset" returns the zip header --
+ * run #14's "libpng error: Not a PNG file".
  *
- * The engine closes what it opens by name (CResource.closeFileDescriptor), so
- * the fds are tracked here and released on that call -- 732 assets would
- * otherwise run the runtime's fd table dry. */
-#define MAX_ASSET_FDS 96
+ * So the APK is opened once and kept, the central directory is parsed once into
+ * a small table, and every asset answers (apk_fd, entry_offset, entry_size).
+ * Only stored (uncompressed) entries qualify, which is all of them: aapt stores
+ * the .jpg-named assets verbatim. */
+#define APK_MAX_ENTRIES 2048
+#define APK_NAME_MAX 88
 static struct {
-  char name[72];
-  int fd;
-} g_asset_fds[MAX_ASSET_FDS];
-static int g_asset_n;
-static int g_asset_ok, g_asset_miss;
+  char name[APK_NAME_MAX];
+  unsigned off, size, method;
+} g_apk_entries[APK_MAX_ENTRIES];
+static int g_apk_entry_n = -1; /* -1: not parsed yet */
+static int g_apk_fd = -1;
+static int g_asset_miss;
 
-static void asset_close_name(const char *name) {
-  for (int i = 0; i < g_asset_n; i++) {
-    if (!strcmp(g_asset_fds[i].name, name)) {
-      if (g_asset_fds[i].fd >= 0)
-        b_close(g_asset_fds[i].fd);
-      g_asset_fds[i] = g_asset_fds[--g_asset_n];
-      return;
-    }
-  }
+static unsigned rd16(const unsigned char *p) { return (unsigned)p[0] | ((unsigned)p[1] << 8); }
+static unsigned rd32(const unsigned char *p) {
+  return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
 }
 
-static void asset_close_all(void) {
-  for (int i = 0; i < g_asset_n; i++)
-    if (g_asset_fds[i].fd >= 0)
-      b_close(g_asset_fds[i].fd);
-  g_asset_n = 0;
+static void apk_parse_directory(void) {
+  g_apk_entry_n = 0;
+  FILE *f = fopen(inotia_apk_path(), "rb");
+  if (!f)
+    return;
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fclose(f);
+    return;
+  }
+  const long end = ftell(f);
+  const long tail = end < 66000 ? end : 66000;
+  unsigned char *buf = malloc((size_t)tail);
+  if (!buf || tail < 22 || fseek(f, end - tail, SEEK_SET) != 0) {
+    free(buf);
+    fclose(f);
+    return;
+  }
+  const size_t got = fread(buf, 1, (size_t)tail, f);
+  long eocd = -1;
+  for (long i = (long)got - 22; i >= 0; i--)
+    if (rd32(buf + i) == 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  if (eocd < 0) {
+    free(buf);
+    fclose(f);
+    return;
+  }
+  const unsigned count = rd16(buf + eocd + 10);
+  const unsigned cd_off = rd32(buf + eocd + 16);
+  const unsigned cd_size = rd32(buf + eocd + 12);
+  unsigned char *cd = malloc(cd_size ? cd_size : 1);
+  if (!cd || fseek(f, (long)cd_off, SEEK_SET) != 0 || fread(cd, 1, cd_size, f) != cd_size) {
+    free(cd);
+    free(buf);
+    fclose(f);
+    return;
+  }
+  unsigned p = 0;
+  for (unsigned i = 0; i < count && p + 46 <= cd_size && g_apk_entry_n < APK_MAX_ENTRIES; i++) {
+    if (rd32(cd + p) != 0x02014b50)
+      break;
+    const unsigned name_len = rd16(cd + p + 28);
+    const unsigned extra_len = rd16(cd + p + 30);
+    const unsigned comment_len = rd16(cd + p + 32);
+    const unsigned method = rd16(cd + p + 10);
+    const unsigned csize = rd32(cd + p + 20);
+    const unsigned lho = rd32(cd + p + 42);
+    if (p + 46 + name_len <= cd_size && name_len < APK_NAME_MAX) {
+      memcpy(g_apk_entries[g_apk_entry_n].name, cd + p + 46, name_len);
+      g_apk_entries[g_apk_entry_n].name[name_len] = 0;
+      /* the data starts after the local header's own name/extra fields */
+      unsigned lname = 0, lextra = 0;
+      if (fseek(f, (long)lho, SEEK_SET) == 0) {
+        unsigned char lh[30];
+        if (fread(lh, 1, sizeof lh, f) == sizeof lh && rd32(lh) == 0x04034b50) {
+          lname = rd16(lh + 26);
+          lextra = rd16(lh + 28);
+        }
+      }
+      g_apk_entries[g_apk_entry_n].off = lho + 30 + lname + lextra;
+      g_apk_entries[g_apk_entry_n].size = csize;
+      g_apk_entries[g_apk_entry_n].method = method;
+      g_apk_entry_n++;
+    }
+    p += 46 + name_len + extra_len + comment_len;
+  }
+  free(cd);
+  free(buf);
+  fclose(f);
+  debugPrintf("[res] APK directory: %d entries indexed\n", g_apk_entry_n);
+}
+
+static const char *const k_asset_forms[] = {
+    "assets/common/game_res/%s.jpg", "assets/common/game_res/%s",
+    "assets/common/%s.jpg",          "assets/common/%s",
+    "assets/%s.jpg",                 "assets/%s",
+};
+
+/* -> index in g_apk_entries, or -1 */
+static int apk_find(const char *name) {
+  if (g_apk_entry_n < 0)
+    apk_parse_directory();
+  char want[APK_NAME_MAX];
+  for (unsigned i = 0; i < sizeof k_asset_forms / sizeof k_asset_forms[0]; i++) {
+    snprintf(want, sizeof want, k_asset_forms[i], name);
+    for (int k = 0; k < g_apk_entry_n; k++)
+      if (!strcmp(g_apk_entries[k].name, want))
+        return k;
+  }
+  return -1;
 }
 
 static jvalue h_cf_fd_asset(JObj *self, const jvalue *a, const JMethod *m) {
@@ -384,62 +466,50 @@ static jvalue h_cf_fd_asset(JObj *self, const jvalue *a, const JMethod *m) {
                   ? (int *)out->a.data
                   : NULL;
 
-  static const char *const k_forms[] = {
-      "common/game_res/%s.jpg", "common/game_res/%s", "common/%s.jpg", "common/%s", "%s.jpg", "%s",
-  };
-  char path[512];
-  int fd = -1;
-  for (unsigned i = 0; i < sizeof k_forms / sizeof k_forms[0] && fd < 0; i++) {
-    snprintf(path, sizeof path, "%s/", inotia_resource_dir());
-    const size_t used = strlen(path);
-    snprintf(path + used, sizeof path - used, k_forms[i], name);
-    fd = b_open(path, O_RDONLY);
-  }
-
-  if (fd < 0) {
+  const int e = apk_find(name);
+  if (e < 0 || g_apk_entries[e].method != 0) {
     if (slot) {
       slot[0] = -1;
       slot[1] = 0;
     }
     if (g_asset_miss++ < 12)
-      debugPrintf("[res] asset '%s': not found under %s/common/game_res/\n", name,
-                  inotia_resource_dir());
+      debugPrintf("[res] asset '%s': not in the APK (or not stored)\n", name);
+    return jv_l(NULL);
+  }
+  if (g_apk_fd < 0)
+    g_apk_fd = b_open(inotia_apk_path(), O_RDONLY);
+  if (g_apk_fd < 0) {
+    if (slot) {
+      slot[0] = -1;
+      slot[1] = 0;
+    }
     return jv_l(NULL);
   }
 
-  const b_off64_t size = b_lseek64(fd, 0, SEEK_END);
-  b_lseek64(fd, 0, SEEK_SET);
   if (slot) {
-    slot[0] = 0;
-    slot[1] = (int)size;
+    slot[0] = (int)g_apk_entries[e].off;
+    slot[1] = (int)g_apk_entries[e].size;
   }
-  if (g_asset_ok++ < 8)
-    debugPrintf("[res] asset '%s' -> fd %d, %d bytes\n", name, fd, (int)size);
-  else if (g_asset_ok == 9)
-    debugPrintf("[res] (more assets load without a line each)\n");
-
-  if (g_asset_n < MAX_ASSET_FDS) {
-    asset_close_name(name);
-    snprintf(g_asset_fds[g_asset_n].name, sizeof g_asset_fds[0].name, "%s", name);
-    g_asset_fds[g_asset_n].fd = fd;
-    g_asset_n++;
-  }
+  static int logged;
+  if (logged++ < 6)
+    debugPrintf("[res] asset '%s' -> %s +%u, %u bytes\n", name, g_apk_entries[e].name,
+                g_apk_entries[e].off, g_apk_entries[e].size);
 
   JObj *fdo = jni_new("java/io/FileDescriptor");
-  jni_set_field(fdo, "descriptor", jv_i(fd), 0);
+  jni_set_field(fdo, "descriptor", jv_i(g_apk_fd), 0);
   return jv_l(fdo);
 }
 
+/* The fd above is the APK's own and is shared by every asset, exactly as
+ * AssetManager shares it -- closing it on one asset would break the rest, so
+ * these only exist to answer the calls. */
 static jvalue h_cf_close_asset(JObj *self, const jvalue *a, const JMethod *m) {
-  (void)self, (void)m;
-  if (a && a[0].l)
-    asset_close_name(jni_utf(a[0].l));
+  (void)self, (void)a, (void)m;
   return jv_none();
 }
 
 static jvalue h_cf_close_assets(JObj *self, const jvalue *a, const JMethod *m) {
   (void)self, (void)a, (void)m;
-  asset_close_all();
   return jv_none();
 }
 
