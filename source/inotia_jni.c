@@ -268,6 +268,65 @@ static jvalue h_cf_max_memory(JObj *self, const jvalue *a, const JMethod *m) {
   return jv_j(512LL * 1024 * 1024);
 }
 
+static jvalue h_cf_apk_path(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(jni_str(inotia_apk_path()));
+}
+
+static jvalue h_cf_device_id(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(jni_str("switch"));
+}
+
+static jvalue h_cf_model(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(jni_str("Switch"));
+}
+
+static jvalue h_cf_language(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(jni_str("en"));
+}
+
+static jvalue h_cf_country(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(jni_str("US"));
+}
+
+static jvalue h_cf_sys_version(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(jni_str("9"));
+}
+
+/* API 28: new enough for the engine's non-scoped-storage paths, and the value
+ * the wrapper's own version check expects. */
+static jvalue h_cf_sys_version_code(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_i(28);
+}
+
+static jvalue h_cf_free_memory(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_j(512LL * 1024 * 1024);
+}
+
+/* convertDPtoPX / convertOriginaltoDisplay: identity. The engine's layout was
+ * built for one density and one resolution, and both are what it gets. */
+static jvalue h_cf_same_int(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)m;
+  return jv_i(a ? a[0].i : 0);
+}
+
+static jvalue h_cf_same_obj(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)m;
+  return jv_l(a ? a[0].l : NULL);
+}
+
+static jvalue h_cf_activity(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(inotia_activity());
+}
+
 /* ------------------------------------------- CResource.getFileDescriptorFromAsset
  * The Java side opens the asset through AssetManager and hands the engine a
  * FileDescriptor plus (startOffset, length) in the int[2]; the engine lseeks
