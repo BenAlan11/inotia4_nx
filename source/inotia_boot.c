@@ -371,6 +371,29 @@ static void stub_out(const char *sym) {
     debugPrintf("[game] %s: could not patch\n", sym);
 }
 
+/* What the engine actually put on the screen. Five samples read back from the
+ * back buffer before the swap: a black frame and a drawn frame look the same in
+ * a log otherwise, and "the picture is black" is the one thing a log cannot
+ * otherwise say. */
+static void probe_frame(uint64_t frame) {
+  if (frame != 0 && frame != 1 && frame != 10 && frame % 120 != 0)
+    return;
+  static const int pts[5][2] = {{640, 360}, {100, 100}, {1180, 100}, {100, 620}, {1180, 620}};
+  unsigned char centre[4] = {0, 0, 0, 0};
+  int lit = 0;
+  for (int i = 0; i < 5; i++) {
+    unsigned char px[4] = {0, 0, 0, 0};
+    glReadPixels(pts[i][0], RT_SCREEN_H - 1 - pts[i][1], 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    if (i == 0)
+      memcpy(centre, px, 4);
+    if (px[0] || px[1] || px[2])
+      lit++;
+  }
+  debugPrintf("[gfx] frame %llu: centre %02x%02x%02x%02x, %d/5 samples non-black\n",
+              (unsigned long long)frame, centre[0], centre[1], centre[2], centre[3], lit);
+  log_flush_ring();
+}
+
 void port_run(void) {
   int w = 0, h = 0;
   dcr_window_size(&w, &h);
@@ -684,6 +707,7 @@ void port_run(void) {
     busy_begin("nativeProcess");
     process(g_jni_env, NULL);
     g_busy = 0; /* not busy_end(): a slow frame every frame would flood the log */
+    probe_frame(g_frames);
     if (g_frames == 0) {
       debugPrintf("[game] <- nativeProcess (first frame, %llu ms)\n",
                   (unsigned long long)((armTicksToNs(armGetSystemTick()) - g_busy_since) / 1000000ull));

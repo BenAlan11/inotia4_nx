@@ -112,7 +112,13 @@ void inotia_input_frame(void) {
   if (g_cy > RT_SCREEN_H - 1)
     g_cy = RT_SCREEN_H - 1;
 
+  const int was_down = g_cursor_down;
   g_cursor_down = (held & (HidNpadButton_A | HidNpadButton_ZR)) != 0;
+  if (g_cursor_down != was_down) {
+    debugPrintf("[input] virtual finger %s at %d,%d\n", g_cursor_down ? "down" : "up",
+                (int)g_cx, (int)g_cy);
+    log_flush_ring();
+  }
 
   g_touch[0].down = g_cursor_down;
   g_touch[0].x = (int)g_cx;
