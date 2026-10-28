@@ -14,9 +14,12 @@
  *
  * MIT.
  */
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "bionic_io.h"
 
 #include "inotia.h"
 #include "jni.h"
@@ -253,9 +256,54 @@ static jvalue h_measure_text(JObj *self, const jvalue *a, const JMethod *m) {
  * getPackageName is the first one the engine needs -- jgetMediaPath does
  * GetStaticMethodID(CFunction, "getPackageName", "()Ljava/lang/String;") and
  * strcpy()s the answer, so a NULL there is a fault at address 0. */
+/* Trailing slash matters: the engine builds "<userDir><packageName>/appinfo.dat"
+ * by concatenation, and run #11 showed ".../filescom.com2us.../appinfo.dat". */
 static jvalue h_cf_user_dir(JObj *self, const jvalue *a, const JMethod *m) {
   (void)self, (void)a, (void)m;
-  return jv_l(jni_str("/sdcard/Android/data/" PORT_PACKAGE "/files"));
+  return jv_l(jni_str("/sdcard/Android/data/" PORT_PACKAGE "/files/"));
+}
+
+static jvalue h_cf_max_memory(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_j(512LL * 1024 * 1024);
+}
+
+/* ------------------------------------------- CResource.getFileDescriptorFromAsset
+ * The Java side opens the asset through AssetManager and hands the engine a
+ * FileDescriptor plus (startOffset, length) in the int[2], which the engine
+ * then lseek()s and read()s. There is no AssetManager here, but the port has
+ * already unpacked assets/common/** next to the game, so the same contract is
+ * served from a real file: offset 0, length = file size, and an fd from the
+ * runtime's own table (b_open) so the engine's b_read finds it. */
+static jvalue h_cf_fd_asset(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)m;
+  const char *name = (a && a[0].l) ? jni_utf(a[0].l) : "";
+  JObj *out = (a && a[1].l) ? (JObj *)a[1].l : NULL;
+  int *slot = (out && out->kind == JK_ARRAY && out->a.data && out->a.len >= 2)
+                  ? (int *)out->a.data
+                  : NULL;
+
+  char path[512];
+  snprintf(path, sizeof path, "%s/%s", inotia_resource_dir(), name);
+  const int fd = b_open(path, O_RDONLY);
+  if (fd < 0) {
+    debugPrintf("[res] asset '%s': %s: no such file\n", name, path);
+    if (slot) {
+      slot[0] = -1;
+      slot[1] = 0;
+    }
+    return jv_l(NULL);
+  }
+  const b_off64_t size = b_lseek64(fd, 0, SEEK_END);
+  b_lseek64(fd, 0, SEEK_SET);
+  if (slot) {
+    slot[0] = 0;
+    slot[1] = (int)size;
+  }
+  debugPrintf("[res] asset '%s' -> fd %d, %d bytes\n", name, fd, (int)size);
+  JObj *fdo = jni_new("java/io/FileDescriptor");
+  jni_set_field(fdo, "descriptor", jv_i(fd), 0);
+  return jv_l(fdo);
 }
 
 static jvalue h_cf_apk_path(JObj *self, const jvalue *a, const JMethod *m) {
@@ -440,6 +488,13 @@ const JMethodDef jni_method_defs[] = {
     {"android/view/MotionEvent", "getActionMasked", NULL, h_touch_action},
     {"android/view/MotionEvent", "getX", NULL, h_touch_x},
     {"android/view/MotionEvent", "getY", NULL, h_touch_y},
+
+    /* ---- CResource: the assets the engine would read out of the APK */
+    {"com/com2us/wrapper/function/CResource", "getFileDescriptorFromAsset", NULL, h_cf_fd_asset},
+    {"com/com2us/wrapper/function/CResource", NULL, NULL, jni_h_zero},
+
+    /* ---- the game's own wrapper: how much memory it may use */
+    {"com/com2us/wrapper/WrapperUserDefined", "getMaxMemory", NULL, h_cf_max_memory},
 
     /* ---- java.nio: the buffers above, so a Java-side call still chains */
     {"java/nio/ByteBuffer", "order", NULL, jni_h_self},

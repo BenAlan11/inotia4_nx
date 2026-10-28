@@ -146,6 +146,15 @@ static char g_apk_path[DCR_PATH_MAX];
 
 const char *inotia_apk_path(void) { return g_apk_path; }
 
+/* The folder the assets were unpacked into; CResource serves its assets from
+ * here instead of from the APK. */
+const char *inotia_resource_dir(void) {
+  static char dir[DCR_PATH_MAX];
+  if (!dir[0])
+    snprintf(dir, sizeof dir, "%s/%s", dcr_game_root(), RES_ROOT);
+  return dir;
+}
+
 int port_load(const char *apk) {
   snprintf(g_apk_path, sizeof g_apk_path, "%s", apk ? apk : "");
   dcr_setup_from_apk(apk);
