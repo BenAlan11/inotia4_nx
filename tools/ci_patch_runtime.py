@@ -83,6 +83,20 @@ static JClass *cls_of(const void *clsobj) {"""
     if old not in text:
         raise SystemExit("GetObjectClass not found: the runtime changed")
     text = text.replace(old, new)
+
+    # 5. jni_class_exists: the port's list is an override, not a fallback.
+    #    Once classes.txt is loaded the lookup is a bsearch over that file only,
+    #    so a class the APK does not define (WrapperStatistics, which this
+    #    engine asks for anyway) can never be satisfied -- and the FindClass miss
+    #    leaves a pending NoClassDefFoundError behind.
+    old = """  if (g_ncls >= 0)
+    return bsearch(&name, g_cls, (size_t)g_ncls, sizeof *g_cls, cmp_cstr) != NULL;"""
+    new = """  if (g_ncls >= 0)
+    return is_missing_class(name) ||
+           bsearch(&name, g_cls, (size_t)g_ncls, sizeof *g_cls, cmp_cstr) != NULL;"""
+    if old not in text:
+        raise SystemExit("jni_class_exists not found: the runtime changed")
+    text = text.replace(old, new)
     return text
 
 
