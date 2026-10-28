@@ -280,6 +280,39 @@ static void call0(fn_env_obj f, void *obj, const char *what) {
   log_flush_ring();
 }
 
+/* ------------------------------------------------------------- heartbeat */
+/* A log that stops in the middle of a call cannot tell a hang from a slow
+ * load: nativeProcess on the first frame may legitimately take seconds while
+ * the engine parses its resource tables. While a call is on the stack this
+ * prints once a second, so the next debug.log says which one it was. */
+static volatile int g_busy;
+static volatile uint64_t g_busy_since; /* ns */
+
+static void heartbeat_thread(void *arg) {
+  (void)arg;
+  for (;;) {
+    svcSleepThread(1000000000ll);
+    if (!g_busy)
+      continue;
+    const uint64_t s = (armTicksToNs(armGetSystemTick()) - g_busy_since) / 1000000000ull;
+    debugPrintf("[game] still inside nativeProcess: %llu s\n", (unsigned long long)s);
+    log_flush_ring();
+  }
+}
+
+static void heartbeat_start(void) {
+  static Thread th;
+  const Result rc = threadCreate(&th, heartbeat_thread, NULL, NULL, 0x4000, 0x2C, -2);
+  if (R_FAILED(rc)) {
+    debugPrintf("[game] no heartbeat thread (0x%x)\n", rc);
+    return;
+  }
+  if (R_FAILED(threadStart(&th))) {
+    threadClose(&th);
+    debugPrintf("[game] no heartbeat thread (start)\n");
+  }
+}
+
 void port_run(void) {
   int w = 0, h = 0;
   dcr_window_size(&w, &h);
@@ -417,6 +450,32 @@ void port_run(void) {
   debugPrintf("[game] <- nativeStart\n");
   log_flush_ring();
 
+  /* The kernel state machine after nativeStart is WAIT_UNLOCK_STARTCLET, and
+   * only nativeStartClet moves it to RUNNING:
+   *
+   *   CWrapperActivity.initialize(data)   lockStartCletForModule("InitializeWrapper")
+   *                                       ... every module locks and unlocks ...
+   *   CWrapperKernel.onUnlockStartClet()  list empty + state WAIT_UNLOCK_STARTCLET
+   *                                       -> queueEventForcedly(CWrapperKernel$4)
+   *   CWrapperKernel$4.run()              setState(NATIVE_STARTCLET)
+   *   CInnerStateNativeStartClet.start()  nativeStartClet() -> RUNNING
+   *
+   * The port has no Java lock list to empty, so it calls the last step itself.
+   * Without it the engine never reaches RUNNING and the first nativeProcess
+   * does not come back. */
+  {
+    fn_env_obj start_clet = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeStartClet"));
+    if (start_clet) {
+      debugPrintf("[game] -> nativeStartClet\n");
+      log_flush_ring();
+      start_clet(g_jni_env, NULL);
+      debugPrintf("[game] <- nativeStartClet\n");
+      log_flush_ring();
+    } else {
+      debugPrintf("[game] nativeStartClet MISSING\n");
+    }
+  }
+
   if (surface) {
     debugPrintf("[game] -> nativeSurfaceRecreated\n");
     log_flush_ring();
@@ -430,6 +489,7 @@ void port_run(void) {
 
   debugPrintf("[game] frame loop\n");
   log_flush_ring();
+  heartbeat_start();
 
   while (!rt_exit_requested() && appletMainLoop()) {
     rt_applet_poll();
@@ -443,16 +503,19 @@ void port_run(void) {
 
     /* The first frame is the one that tells a hang from a slow load: the
      * engine parses its resource tables here and can sit for a while. Each
-     * side of the call is logged once so a log that stops mid-frame says so. */
+     * side of the call is logged once so a log that stops mid-frame says so,
+     * and the heartbeat thread keeps counting while it runs. */
     if (g_frames == 0) {
       debugPrintf("[game] -> nativeProcess (first frame)\n");
       log_flush_ring();
     }
-    const uint64_t t0 = armTicksToNs(armGetSystemTick());
+    g_busy_since = armTicksToNs(armGetSystemTick());
+    g_busy = 1;
     process(g_jni_env, NULL);
+    g_busy = 0;
     if (g_frames == 0) {
       debugPrintf("[game] <- nativeProcess (first frame, %llu ms)\n",
-                  (unsigned long long)((armTicksToNs(armGetSystemTick()) - t0) / 1000000ull));
+                  (unsigned long long)((armTicksToNs(armGetSystemTick()) - g_busy_since) / 1000000ull));
       log_flush_ring();
     }
 
