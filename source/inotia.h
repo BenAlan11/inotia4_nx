@@ -18,6 +18,10 @@ JObj *inotia_activity(void);
  * one it did not ask for. */
 JObj *inotia_wrapper_class(const char *short_name);
 
+/* The APK the game was loaded from, as the engine's Java layer asks for it
+ * (CFunction.getApkFilePath). */
+const char *inotia_apk_path(void);
+
 /* ---------------------------------------------------------------- audio */
 /* The mixer behind android/media/SoundPool and MediaPlayer: stb_vorbis
  * streams on rt_audout. Returns 0 when the pump started. */

@@ -247,6 +247,76 @@ static jvalue h_measure_text(JObj *self, const jvalue *a, const JMethod *m) {
   return jv_f((jfloat)(strlen(s) * px * 0.55f));
 }
 
+/* --------------------------------------- com.com2us.wrapper.function.CFunction
+ * The engine's own answers about the device, asked as static calls on CFunction
+ * (the dex has them: tools/dex_class.py com.com2us.wrapper.function.CFunction).
+ * getPackageName is the first one the engine needs -- jgetMediaPath does
+ * GetStaticMethodID(CFunction, "getPackageName", "()Ljava/lang/String;") and
+ * strcpy()s the answer, so a NULL there is a fault at address 0. */
+static jvalue h_cf_user_dir(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(jni_str("/sdcard/Android/data/" PORT_PACKAGE "/files"));
+}
+
+static jvalue h_cf_apk_path(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(jni_str(inotia_apk_path()));
+}
+
+static jvalue h_cf_device_id(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(jni_str("switch"));
+}
+
+static jvalue h_cf_model(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(jni_str("Switch"));
+}
+
+static jvalue h_cf_language(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(jni_str("en"));
+}
+
+static jvalue h_cf_country(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(jni_str("US"));
+}
+
+static jvalue h_cf_sys_version(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(jni_str("9"));
+}
+
+/* API 28: new enough for the engine's non-scoped-storage paths, and the value
+ * the wrapper's own version check expects. */
+static jvalue h_cf_sys_version_code(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_i(28);
+}
+
+static jvalue h_cf_free_memory(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_j(512LL * 1024 * 1024);
+}
+
+/* convertDPtoPX / convertOriginaltoDisplay: identity. The engine's layout was
+ * built for one density and one resolution, and both are what it gets. */
+static jvalue h_cf_same_int(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)m;
+  return jv_i(a ? a[0].i : 0);
+}
+
+static jvalue h_cf_same_obj(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)m;
+  return jv_l(a ? a[0].l : NULL);
+}
+
+static jvalue h_cf_activity(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_l(inotia_activity());
+}
+
 /* ----------------------------------------------------------------- tables */
 
 const JMethodDef jni_method_defs[] = {
@@ -315,20 +385,74 @@ const JMethodDef jni_method_defs[] = {
     /* ---- text metrics */
     {"android/graphics/Paint", "measureText", NULL, h_measure_text},
 
+    /* ---- com.com2us.wrapper.function.CFunction: the device's own answers */
+    {"com/com2us/wrapper/function/CFunction", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/function/CFunction", "getUserDir", NULL, h_cf_user_dir},
+    {"com/com2us/wrapper/function/CFunction", "getApkFilePath", NULL, h_cf_apk_path},
+    {"com/com2us/wrapper/function/CFunction", "getActivity", NULL, h_cf_activity},
+    {"com/com2us/wrapper/function/CFunction", "getGLSurfaceView", NULL, h_cf_activity},
+    {"com/com2us/wrapper/function/CFunction", "getDeviceId", NULL, h_cf_device_id},
+    {"com/com2us/wrapper/function/CFunction", "getAndroidId", NULL, h_cf_device_id},
+    {"com/com2us/wrapper/function/CFunction", "getCom2usUniqueId", NULL, h_cf_device_id},
+    {"com/com2us/wrapper/function/CFunction", "getDeviceModel", NULL, h_cf_model},
+    {"com/com2us/wrapper/function/CFunction", "getPhoneNumber", NULL, jni_h_empty_string},
+    {"com/com2us/wrapper/function/CFunction", "getMIN", NULL, h_cf_same_obj},
+    {"com/com2us/wrapper/function/CFunction", "getLanguage", NULL, h_cf_language},
+    {"com/com2us/wrapper/function/CFunction", "getInitialLanguage", NULL, h_cf_language},
+    {"com/com2us/wrapper/function/CFunction", "getCountry", NULL, h_cf_country},
+    {"com/com2us/wrapper/function/CFunction", "getInitialCountry", NULL, h_cf_country},
+    {"com/com2us/wrapper/function/CFunction", "getSystemVersion", NULL, h_cf_sys_version},
+    {"com/com2us/wrapper/function/CFunction", "getSystemVersionCode", NULL, h_cf_sys_version_code},
+    {"com/com2us/wrapper/function/CFunction", "getNativeAvailableMemory", NULL, h_cf_free_memory},
+    {"com/com2us/wrapper/function/CFunction", "convertDPtoPX", NULL, h_cf_same_int},
+    {"com/com2us/wrapper/function/CFunction", "convertOriginaltoDisplay", NULL, h_cf_same_obj},
+    {"com/com2us/wrapper/function/CFunction", "convertDisplaytoOriginal", NULL, h_cf_same_obj},
+    {"com/com2us/wrapper/function/CFunction", "getActiveAirplaneMode", NULL, jni_h_false},
+    {"com/com2us/wrapper/function/CFunction", "getRoaming", NULL, jni_h_false},
+    {"com/com2us/wrapper/function/CFunction", "isActiveUsim", NULL, jni_h_false},
+    {"com/com2us/wrapper/function/CFunction", "startVibrate", NULL, jni_h_void},
+    {"com/com2us/wrapper/function/CFunction", "stopVibrate", NULL, jni_h_void},
+    {"com/com2us/wrapper/function/CFunction", NULL, NULL, jni_h_zero},
+
     /* ---- the Com2uS wrapper classes: named answers first, then a wildcard so
-     * an unknown call returns a zero instead of faulting. */
+     * an unknown call returns a zero instead of faulting. The getPackageName
+     * entries are the safety net for the engine's cached jclass: whichever
+     * wrapper class it ends up holding, asking it for the package name has to
+     * give the package name. */
     {"com/com2us/wrapper/kernel/CWrapperKernel", "nativeStart", NULL, jni_h_void},
+    {"com/com2us/wrapper/kernel/CWrapperKernel", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/kernel/CWrapperData", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/kernel/CWrapper", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/kernel/CEventHandler", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/common/CCommonAPI", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/font/CFont", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/font/CSGLFont", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/sensor/CSensor", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/ui/CTextInput", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/ui/CUserInput", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/network/CWrapperHttp", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/network/CHttpManager", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/utility/CUtility", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/game/CGameManager", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/function/CFunctionTaskRunner", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/media/CSoundManager", "getPackageName", NULL, h_package_name},
+    {"com/com2us/wrapper/WrapperUserDefined", "getPackageName", NULL, h_package_name},
     {"com/com2us/wrapper/kernel/CWrapperKernel", NULL, NULL, jni_h_zero},
     {"com/com2us/wrapper/kernel/CWrapperData", NULL, NULL, jni_h_zero},
     {"com/com2us/wrapper/kernel/CWrapper", NULL, NULL, jni_h_zero},
     {"com/com2us/wrapper/kernel/CEventHandler", NULL, NULL, jni_h_zero},
     {"com/com2us/wrapper/common/CCommonAPI", NULL, NULL, jni_h_zero},
     {"com/com2us/wrapper/font/CFont", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/font/CSGLFont", NULL, NULL, jni_h_zero},
     {"com/com2us/wrapper/sensor/CSensor", NULL, NULL, jni_h_zero},
     {"com/com2us/wrapper/ui/CTextInput", NULL, NULL, jni_h_zero},
     {"com/com2us/wrapper/ui/CUserInput", NULL, NULL, jni_h_zero},
     {"com/com2us/wrapper/network/CWrapperHttp", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/network/CHttpManager", NULL, NULL, jni_h_zero},
     {"com/com2us/wrapper/utility/CUtility", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/game/CGameManager", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/function/CFunctionTaskRunner", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/media/CSoundManager", NULL, NULL, jni_h_zero},
     {"com/com2us/wrapper/WrapperUserDefined", NULL, NULL, jni_h_zero},
 
     {NULL, NULL, NULL, NULL},
@@ -386,6 +510,13 @@ const char *const jni_missing_classes[] = {
     "com/com2us/wrapper/ui/CUserInput",
     "com/com2us/wrapper/network/CWrapperHttp",
     "com/com2us/wrapper/utility/CUtility",
+    "com/com2us/wrapper/function/CFunction",
+    "com/com2us/wrapper/function/CFunctionTaskRunner",
+    "com/com2us/wrapper/function/CResource",
+    "com/com2us/wrapper/game/CGameManager",
+    "com/com2us/wrapper/font/CSGLFont",
+    "com/com2us/wrapper/media/CSoundManager",
+    "com/com2us/wrapper/network/CHttpManager",
     "com/com2us/wrapper/WrapperUserDefined",
     NULL,
 };

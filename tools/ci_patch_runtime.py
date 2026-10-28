@@ -41,6 +41,48 @@ def patch(text):
     if old not in text:
         raise SystemExit("method_id guard not found: the runtime changed")
     text = text.replace(old, new)
+
+    # 3. j_FindClass: and say which class *was* found, with its pointer. The
+    #    engine caches the result in a global; when a later GetStaticMethodID
+    #    gets class 0, this line says whether the lookup ever happened and what
+    #    it returned.
+    old = """  return jni_class(buf)->obj;
+}
+
+static JClass *cls_of(const void *clsobj) {"""
+    new = """  {
+    JObj *found_ = jni_class(buf)->obj;
+    debugPrintf("[jni] FindClass %s -> %p\\n", buf, (void *)found_);
+    return found_;
+  }
+}
+
+static JClass *cls_of(const void *clsobj) {"""
+    if old not in text:
+        raise SystemExit("FindClass tail not found: the runtime changed")
+    text = text.replace(old, new)
+
+    # 4. j_GetObjectClass: the other way the engine gets a jclass, and the one
+    #    that silently returns NULL for a NULL receiver.
+    old = """static jobj_t j_GetObjectClass(void *env, jobj_t obj) {
+  JObj *o = obj;
+  if (!is_obj(o))
+    return NULL;
+  return o->cls->obj;
+}"""
+    new = """static jobj_t j_GetObjectClass(void *env, jobj_t obj) {
+  JObj *o = obj;
+  if (!is_obj(o)) {
+    debugPrintf("[jni] GetObjectClass(%p) -> NULL\\n", (void *)obj);
+    return NULL;
+  }
+  debugPrintf("[jni] GetObjectClass(%p) -> %s %p\\n", (void *)obj, o->cls->name,
+              (void *)o->cls->obj);
+  return o->cls->obj;
+}"""
+    if old not in text:
+        raise SystemExit("GetObjectClass not found: the runtime changed")
+    text = text.replace(old, new)
     return text
 
 

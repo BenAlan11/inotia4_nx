@@ -134,7 +134,12 @@ static const char *const k_known[] = {
     NULL,
 };
 
+static char g_apk_path[DCR_PATH_MAX];
+
+const char *inotia_apk_path(void) { return g_apk_path; }
+
 int port_load(const char *apk) {
+  snprintf(g_apk_path, sizeof g_apk_path, "%s", apk ? apk : "");
   dcr_setup_from_apk(apk);
 
   char path[DCR_PATH_MAX];
@@ -224,7 +229,34 @@ static int gfx_init(void) {
 
 typedef int (*fn_env)(void *env);
 typedef int (*fn_env_obj)(void *env, void *obj);
+typedef int (*fn_env_obj_obj)(void *env, void *obj, void *a);
+typedef int (*fn_env_obj_1i)(void *env, void *obj, int a);
 typedef int (*fn_env_obj_6i)(void *env, void *obj, int a, int b, int c, int d, int e, int f);
+
+/* The module names CWrapper.nativeInitialize dispatches on: they are the
+ * literals in libgame.so, and they are exactly the Java classes that extend
+ * CWrapper and reach onCreate(name, true). Each one's native init caches the
+ * jclass and jmethodIDs that module will call back through, so all of them have
+ * to run before nativeStart.
+ *
+ * CWrapperKernel and CWrapperData are deliberately absent: they are not keys
+ * (the engine has no literal for them) and their own natives are called
+ * directly below. */
+static const char *const k_modules[] = {
+    "com.com2us.wrapper.function.CFunctionTaskRunner",
+    "com.com2us.wrapper.utility.CUtility",
+    "com.com2us.wrapper.network.CHttpManager",
+    "com.com2us.wrapper.game.CGameManager",
+    "com.com2us.wrapper.kernel.CEventHandler",
+    "com.com2us.wrapper.media.CSoundManager",
+    "com.com2us.wrapper.sensor.CSensor",
+    "com.com2us.wrapper.ui.CTextInput",
+    "com.com2us.wrapper.ui.CUserInput",
+    "com.com2us.wrapper.font.CFont",
+    "com.com2us.wrapper.font.CSGLFont",
+    "com.com2us.wrapper.WrapperUserDefined",
+    NULL,
+};
 
 static void *entry(const char *sym) { return (void *)so_try_find_addr_rx(&g_game, sym); }
 
@@ -267,34 +299,38 @@ void port_run(void) {
   }
 
   fn_env_obj set_class = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapper_nativeSetClass"));
+  fn_env_obj_obj init_module = (fn_env_obj_obj)entry(ENTRY("wrapper_kernel_CWrapper_nativeInitialize"));
+  fn_env_obj_1i data_init =
+      (fn_env_obj_1i)entry(ENTRY("wrapper_kernel_CWrapperData_nativeInitialize"));
   fn_env_obj_6i set_size =
       (fn_env_obj_6i)entry(ENTRY("wrapper_kernel_CWrapperData_nativeSetScreenSize"));
   fn_env_obj surface = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeSurfaceRecreated"));
   fn_env_obj start = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeStart"));
   fn_env_obj process = (fn_env_obj)entry(ENTRY("wrapper_kernel_CWrapperKernel_nativeProcess"));
 
-  /* The signatures below are the dex's, not guesses (tools/dex_natives.py):
+  /* The order and the arities below are the dex's, not guesses
+   * (tools/dex_class.py reads the bytecode; docs/native_signatures.txt has the
+   * prototypes). The Java side is:
    *
-   *   CWrapper.nativeSetClass()                        no arguments
-   *   CWrapperData.nativeSetScreenSize(I,I,I,I,I,I)    six ints
-   *   CWrapperKernel.nativeSurfaceRecreated()          no arguments
-   *   CWrapperKernel.nativeStart()                     no arguments
-   *   CWrapper.nativeInitialize(String)                a command name
-   *   CEventHandler.nativeEventHandlerInitialize(ByteBuffer,ByteBuffer,I,I)
-   *   CFont.nativeFontInitialize([I,I,I,I)
-   *   CSensor.nativeSensorInitialize([F)
+   *   CWrapper.<clinit>                 -> CWrapper.nativeSetClass()
+   *   CWrapper.<init>()                 -> mUseNativeCallback = true;
+   *                                        onCreate(getClass().getName(), true)
+   *   CWrapper.onCreate(String, Z)      -> nativeInitialize(mModuleName)
+   *   CWrapperData.<init>()             -> nativeInitialize(TimeZone.getRawOffset())
+   *   CWrapperKernel$1$1.run() (GL)     -> if state == INITIAL  setState(NATIVE_START)
+   *                                          -> nativeStart()
+   *                                        else nativeSurfaceRecreated()
    *
-   * nativeSetScreenSize stores its six ints as shorts, and the getters read
-   * exactly those slots (jWD_GetOriginalWidth -> +0x66, OriginalHeight ->
-   * +0x68, DisplayWidth -> +0x6a, DisplayHeight -> +0x6c, then device
-   * width/height): original, display, device. nativeStart then calls
-   * RenderCoreInitialize(jWD_GetOriginalWidth(), jWD_GetOriginalHeight(), 0),
-   * so all three pairs get the window size for the first light.
+   * nativeInitialize is an *instance* method whose argument is the module name,
+   * and it dispatches to that module's native init -- the one that caches the
+   * jclass and the jmethodIDs the engine calls back through. Skipping it is why
+   * the third run died inside jgetMediaPath with a NULL jclass: it does
+   * GetStaticMethodID(CFunction, "getPackageName", "()Ljava/lang/String;") and
+   * strcpy()s the result.
    *
-   * CEventHandler/CFont/CSensor are skipped: they take a direct ByteBuffer and
-   * arrays that the Java layer fills in, and passing NULL is what killed the
-   * second run (nativeEventHandlerInitialize does GetDirectBufferAddress and
-   * then dereferences it). They come back when those buffers are built. */
+   * nativeStart comes *before* nativeSurfaceRecreated: the GL thread runs
+   * nativeStart while the kernel state is still INITIAL, and every later
+   * surface event is the other one. */
 
   if (set_class) {
     debugPrintf("[game] -> nativeSetClass\n");
@@ -304,6 +340,35 @@ void port_run(void) {
     log_flush_ring();
   } else {
     debugPrintf("[game] nativeSetClass MISSING\n");
+  }
+
+  if (init_module) {
+    for (int i = 0; k_modules[i]; i++) {
+      char cls[96];
+      snprintf(cls, sizeof cls, "%s", k_modules[i]);
+      for (char *p = cls; *p; p++)
+        if (*p == '.')
+          *p = '/';
+      JObj *thiz = jni_new(cls);
+      JObj *name = jni_str(k_modules[i]);
+      debugPrintf("[game] -> nativeInitialize(%s)\n", k_modules[i]);
+      log_flush_ring();
+      init_module(g_jni_env, thiz, name);
+      debugPrintf("[game] <- nativeInitialize(%s)\n", k_modules[i]);
+      log_flush_ring();
+    }
+  } else {
+    debugPrintf("[game] CWrapper.nativeInitialize MISSING\n");
+  }
+
+  if (data_init) {
+    /* CWrapperData.<init> passes TimeZone.getRawOffset(): milliseconds. */
+    const int tz_ms = 8 * 3600 * 1000;
+    debugPrintf("[game] -> CWrapperData.nativeInitialize(%d)\n", tz_ms);
+    log_flush_ring();
+    data_init(g_jni_env, NULL, tz_ms);
+    debugPrintf("[game] <- CWrapperData.nativeInitialize\n");
+    log_flush_ring();
   }
 
   if (set_size) {
@@ -316,14 +381,6 @@ void port_run(void) {
 
   call0((fn_env_obj)entry(ENTRY("wrapper_common_CCommonAPI_nativeInitialize")), NULL,
         "CCommonAPI.nativeInitialize");
-
-  if (surface) {
-    debugPrintf("[game] -> nativeSurfaceRecreated\n");
-    log_flush_ring();
-    surface(g_jni_env, NULL);
-    debugPrintf("[game] <- nativeSurfaceRecreated\n");
-    log_flush_ring();
-  }
 
   /* The engine's main entry. On Android this is where MainActivity hands the
    * thread over; if it returns, the game is driven by nativeProcess from the
@@ -339,6 +396,14 @@ void port_run(void) {
   start(g_jni_env, NULL);
   debugPrintf("[game] <- nativeStart\n");
   log_flush_ring();
+
+  if (surface) {
+    debugPrintf("[game] -> nativeSurfaceRecreated\n");
+    log_flush_ring();
+    surface(g_jni_env, NULL);
+    debugPrintf("[game] <- nativeSurfaceRecreated\n");
+    log_flush_ring();
+  }
 
   inotia_input_init();
   inotia_audio_init();
