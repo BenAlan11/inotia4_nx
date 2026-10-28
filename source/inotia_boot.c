@@ -513,6 +513,58 @@ void port_run(void) {
   debugPrintf("[game] <- nativeStart\n");
   log_flush_ring();
 
+  /* startClet died with no message at all: the log is written through, so it
+   * is not a lost line -- the process went away. The first thing it does is a
+   * straight line of engine calls, so the port runs the argument-free ones
+   * itself first, one log line each. Where the log stops names the culprit;
+   * if all five come back, the fault is further down the chain
+   * (OriginalDisplay_ConfigInfo / SGL_grpInitialize / MEM_Create / ...). */
+  {
+    typedef int (*fn_i)(int);
+    typedef int (*fn_v)(void);
+    typedef void (*fn_ii)(int, int);
+    fn_i set_logged = (fn_i)entry("CS_ActiveUserSetLogged");
+    fn_i set_orient = (fn_i)entry("CS_SetModuleOrientation");
+    fn_v get_w = (fn_v)entry("CS_knlGetRealScreenWidth");
+    fn_v get_h = (fn_v)entry("CS_knlGetRealScreenHeight");
+    fn_ii set_original = (fn_ii)entry("jSetOriginalSize");
+
+    int rw = w, rh = h;
+    if (set_logged) {
+      debugPrintf("[game] -> CS_ActiveUserSetLogged(0)\n");
+      log_flush_ring();
+      busy_begin("CS_ActiveUserSetLogged");
+      const int rc = set_logged(0);
+      busy_end();
+      debugPrintf("[game] <- CS_ActiveUserSetLogged = %d\n", rc);
+      log_flush_ring();
+    }
+    if (set_orient) {
+      debugPrintf("[game] -> CS_SetModuleOrientation(2)\n");
+      log_flush_ring();
+      busy_begin("CS_SetModuleOrientation");
+      const int rc = set_orient(2);
+      busy_end();
+      debugPrintf("[game] <- CS_SetModuleOrientation = %d\n", rc);
+      log_flush_ring();
+    }
+    if (get_w && get_h) {
+      rw = get_w();
+      rh = get_h();
+      debugPrintf("[game] CS_knlGetRealScreen: %dx%d\n", rw, rh);
+      log_flush_ring();
+    }
+    if (set_original && rw > 0 && rh > 0) {
+      debugPrintf("[game] -> jSetOriginalSize(%d,%d)\n", rw, rh);
+      log_flush_ring();
+      busy_begin("jSetOriginalSize");
+      set_original(rw, rh);
+      busy_end();
+      debugPrintf("[game] <- jSetOriginalSize\n");
+      log_flush_ring();
+    }
+  }
+
   /* nativeStartClet is Protection checks + startClet():
    *
    *   Protection::getInstance()->startCheckSpeedHack()   (a `return 1` stub)
