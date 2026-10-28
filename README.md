@@ -128,6 +128,39 @@ The lines to look for, in order:
 
 Send `debug.log` back with the last thing it printed.
 
+## The Java side, as the dex has it
+
+The engine is a C core behind a thin Java layer (`com.com2us.wrapper.*`), and the
+Java layer — not the core — decides the order the natives are called in. That
+order is readable straight out of the APK, and `source/inotia_boot.c` follows it:
+
+```
+CWrapper.<clinit>              CWrapper.nativeSetClass()          static
+CWrapper.<init>                mUseNativeCallback = true;
+                               onCreate(getClass().getName(), true)
+CWrapper.onCreate(String,Z)    nativeInitialize(moduleName)       instance
+CWrapperData.<init>            nativeInitialize(TimeZone.getRawOffset())
+CWrapperKernel$1$1.run (GL)    state == INITIAL ? nativeStart() : nativeSurfaceRecreated()
+```
+
+`nativeInitialize` is a **dispatcher**, not a lifecycle call: it looks the module
+name up and runs that module's native init, which caches the `jclass` and the
+`jmethodID`s the core later calls back through. The twelve names it accepts are
+the dotted literals in `libgame.so` (`CWrapperKernel` and `CWrapperData` are not
+among them — their natives are called directly).
+
+Two tools read this out, and both are worth knowing about:
+
+```sh
+python3 tools/dex_natives.py  game.apk            # every native prototype
+python3 tools/dex_class.py    game.apk com.com2us.wrapper.kernel.CWrapper
+python3 tools/dex_grep.py     game.apk com.com2us.wrapper.kernel.CWrapperKernel nativeStart
+```
+
+`dex_class.py` decodes the bytecode (registers and all) and `dex_grep.py` finds
+call sites across every class, which is what turns "the engine asked for
+something" into "the engine asked for this, here, with these arguments".
+
 ## The stage plan
 
 | Stage | Goal | Gate |
