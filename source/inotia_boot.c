@@ -51,7 +51,11 @@ static uint64_t g_frames;
 /* --------------------------------------------------------------- setup plan */
 
 #define ASSETS_DIR "assets/common/"
-#define RES_ROOT "Android/data/" PORT_PACKAGE "/files/resources"
+/* The engine builds /sdcard/Android/data/<package>/files/resources/... from
+ * getPackageName(), and dcr_path maps that to <root>/external/files/... --
+ * "external" is the runtime's name for shared storage, not "Android". Writing
+ * anywhere else leaves the engine looking at an empty folder. */
+#define RES_ROOT "external/files/resources"
 
 static const char *const k_libs[] = {"libgame.so"};
 
@@ -65,7 +69,11 @@ static void extract_assets(RtSetupCtx *ctx) {
     return;
   }
   unsigned long crc = 0, size = 0;
-  if (rt_setup_stamp_get("assets", &crc, &size) && crc == (unsigned long)dcr_manifest_version_code()) {
+  /* The key carries the layout: builds before this one unpacked into
+   * Android/data/..., which dcr_path never looks at, so those copies have to
+   * be redone rather than trusted. */
+  if (rt_setup_stamp_get("assets-external", &crc, &size) &&
+      crc == (unsigned long)dcr_manifest_version_code()) {
     debugPrintf("[setup] assets already unpacked for versionCode %d\n", dcr_manifest_version_code());
     return;
   }
@@ -89,7 +97,7 @@ static void extract_assets(RtSetupCtx *ctx) {
   }
 
   debugPrintf("[setup] assets: %d files -> %s/common/\n", done, RES_ROOT);
-  rt_setup_stamp_set("assets", (unsigned long)dcr_manifest_version_code(), (unsigned long)done);
+  rt_setup_stamp_set("assets-external", (unsigned long)dcr_manifest_version_code(), (unsigned long)done);
   rt_setup_stamp_save();
 }
 
@@ -420,8 +428,28 @@ void port_run(void) {
 
     dcr_boost_frame_begin();
     inotia_input_frame();
+
+    /* The first frame is the one that tells a hang from a slow load: the
+     * engine parses its resource tables here and can sit for a while. Each
+     * side of the call is logged once so a log that stops mid-frame says so. */
+    if (g_frames == 0) {
+      debugPrintf("[game] -> nativeProcess (first frame)\n");
+      log_flush_ring();
+    }
+    const uint64_t t0 = armTicksToNs(armGetSystemTick());
     process(g_jni_env, NULL);
-    eglSwapBuffers(g_dpy, g_surf);
+    if (g_frames == 0) {
+      debugPrintf("[game] <- nativeProcess (first frame, %llu ms)\n",
+                  (unsigned long long)((armTicksToNs(armGetSystemTick()) - t0) / 1000000ull));
+      log_flush_ring();
+    }
+
+    if (!eglSwapBuffers(g_dpy, g_surf)) {
+      debugPrintf("[game] eglSwapBuffers failed at frame %llu: 0x%x\n",
+                  (unsigned long long)g_frames, eglGetError());
+      log_flush_ring();
+      break;
+    }
     dcr_boost_frame_end(g_frames);
 
     if (g_frames == 0) {
@@ -430,6 +458,11 @@ void port_run(void) {
       log_flush_ring();
     }
     g_frames++;
+
+    if (g_frames == 2 || g_frames == 10 || !(g_frames % 60)) {
+      debugPrintf("[game] frame %llu\n", (unsigned long long)g_frames);
+      log_flush_ring();
+    }
   }
 
   debugPrintf("[game] leaving after %llu frames\n", (unsigned long long)g_frames);

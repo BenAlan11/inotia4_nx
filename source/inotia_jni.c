@@ -317,6 +317,52 @@ static jvalue h_cf_activity(JObj *self, const jvalue *a, const JMethod *m) {
   return jv_l(inotia_activity());
 }
 
+/* ------------------------------------------------ the Java-side singletons
+ * The engine never keeps a Java object it was handed: it reads the wrapper
+ * layer's static fields. getWrapperData() is
+ * GetStaticObjectField(CWrapperData, "mWrapperData"), and the hand-off after
+ * CWrapperData.nativeInitialize(tz) goes through that object -- with NULL there
+ * the engine calls setDataFromNative through a NULL method ID and never
+ * receives its own settings (country, language, device, screen size). */
+static JObj *gl_view(void) {
+  static JObj *view;
+  if (!view)
+    view = jni_new("com/com2us/wrapper/game/CCustomGLSurfaceView");
+  return view;
+}
+
+static JObj *wrapper_data(void) {
+  static JObj *data;
+  if (!data)
+    data = jni_new("com/com2us/wrapper/kernel/CWrapperData");
+  return data;
+}
+
+static jvalue f_activity(JObj *self, const JField *f) {
+  (void)self, (void)f;
+  return jv_l(inotia_activity());
+}
+
+static jvalue f_gl_view(JObj *self, const JField *f) {
+  (void)self, (void)f;
+  return jv_l(gl_view());
+}
+
+static jvalue f_wrapper_data(JObj *self, const JField *f) {
+  (void)self, (void)f;
+  return jv_l(wrapper_data());
+}
+
+static jvalue h_view_w(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_i(RT_SCREEN_W);
+}
+
+static jvalue h_view_h(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_i(RT_SCREEN_H);
+}
+
 /* ----------------------------------------------------------------- tables */
 
 const JMethodDef jni_method_defs[] = {
@@ -414,6 +460,20 @@ const JMethodDef jni_method_defs[] = {
     {"com/com2us/wrapper/function/CFunction", "stopVibrate", NULL, jni_h_void},
     {"com/com2us/wrapper/function/CFunction", NULL, NULL, jni_h_zero},
 
+    /* ---- classes the engine asks for that the APK does not define (a newer
+     * wrapper than this build shipped): FindClass has to succeed or the JNI
+     * layer is left with a pending NoClassDefFoundError. */
+    {"com/com2us/wrapper/WrapperStatistics", NULL, NULL, jni_h_zero},
+    {"com/com2us/peppermint/HubBridge", NULL, NULL, jni_h_zero},
+
+    /* ---- the GLSurfaceView the engine thinks it renders into */
+    {"com/com2us/wrapper/game/CCustomGLSurfaceView", "getWidth", NULL, h_view_w},
+    {"com/com2us/wrapper/game/CCustomGLSurfaceView", "getHeight", NULL, h_view_h},
+    {"com/com2us/wrapper/game/CCustomGLSurfaceView", "queueEvent", NULL, jni_h_void},
+    {"com/com2us/wrapper/game/CCustomGLSurfaceView", "queueEventForcedly", NULL, jni_h_void},
+    {"com/com2us/wrapper/game/CCustomGLSurfaceView", "requestRender", NULL, jni_h_void},
+    {"com/com2us/wrapper/game/CCustomGLSurfaceView", NULL, NULL, jni_h_zero},
+
     /* ---- the Com2uS wrapper classes: named answers first, then a wildcard so
      * an unknown call returns a zero instead of faulting. The getPackageName
      * entries are the safety net for the engine's cached jclass: whichever
@@ -466,6 +526,12 @@ const JFieldDef jni_field_defs[] = {
     {"android/os/Build", "MANUFACTURER", NULL, 0, "Nintendo"},
     {"android/os/Build", "DEVICE", NULL, 0, "nx"},
     {"android/os/Build", "PRODUCT", NULL, 0, PORT_NAME},
+
+    /* The wrapper layer's singletons, as the engine reaches for them. */
+    {"com/com2us/wrapper/kernel/CWrapperKernel", "mActivity", f_activity, 0, NULL},
+    {"com/com2us/wrapper/kernel/CWrapperKernel", "mGLSurfaceView", f_gl_view, 0, NULL},
+    {"com/com2us/wrapper/kernel/CWrapperData", "mWrapperData", f_wrapper_data, 0, NULL},
+
     {NULL, NULL, NULL, 0, NULL},
 };
 
@@ -514,6 +580,9 @@ const char *const jni_missing_classes[] = {
     "com/com2us/wrapper/function/CFunctionTaskRunner",
     "com/com2us/wrapper/function/CResource",
     "com/com2us/wrapper/game/CGameManager",
+    "com/com2us/wrapper/game/CCustomGLSurfaceView",
+    "com/com2us/wrapper/WrapperStatistics",
+    "com/com2us/peppermint/HubBridge",
     "com/com2us/wrapper/font/CSGLFont",
     "com/com2us/wrapper/media/CSoundManager",
     "com/com2us/wrapper/network/CHttpManager",
