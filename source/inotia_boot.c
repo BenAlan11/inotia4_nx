@@ -322,14 +322,21 @@ static void heartbeat_start(void) {
   }
 }
 
-/* Every call into the engine is bracketed with these. */
+/* Every call into the engine is bracketed with these. A call that takes more
+ * than a second says so on the way out, which is how a slow load and a hang
+ * get told apart without another run. */
 static void busy_begin(const char *what) {
   g_busy_what = what;
   g_busy_since = armTicksToNs(armGetSystemTick());
   g_busy = 1;
 }
 
-static void busy_end(void) { g_busy = 0; }
+static void busy_end(void) {
+  const uint64_t ms = (armTicksToNs(armGetSystemTick()) - g_busy_since) / 1000000ull;
+  g_busy = 0;
+  if (ms >= 1000)
+    debugPrintf("[game] %s took %llu ms\n", (const char *)g_busy_what, (unsigned long long)ms);
+}
 
 void port_run(void) {
   int w = 0, h = 0;
@@ -570,7 +577,7 @@ void port_run(void) {
     }
     busy_begin("nativeProcess");
     process(g_jni_env, NULL);
-    busy_end();
+    g_busy = 0; /* not busy_end(): a slow frame every frame would flood the log */
     if (g_frames == 0) {
       debugPrintf("[game] <- nativeProcess (first frame, %llu ms)\n",
                   (unsigned long long)((armTicksToNs(armGetSystemTick()) - g_busy_since) / 1000000ull));
