@@ -338,6 +338,30 @@ static void busy_end(void) {
     debugPrintf("[game] %s took %llu ms\n", (const char *)g_busy_what, (unsigned long long)ms);
 }
 
+/* --------------------------------------------------------- stubbing things
+ * The engine's CS_* layer forwards to the Java modules (Hive's ActiveUser,
+ * the module orientation service): it GetEnv()s, FindClass()es the module's
+ * class and calls a static method on it. This port never initialises those
+ * modules, so the call ends on a callback nobody registered and the process
+ * goes away without a message -- exactly what run #10 showed, stopping between
+ * "-> CS_ActiveUserSetLogged(0)" and its return line.
+ *
+ * so_patch_code writes through a temporary RW alias, so replacing the first
+ * instruction with `bx lr` (0x4770, Thumb) makes the function return 0 and the
+ * engine keeps going. Nothing an offline port loses. */
+static void stub_out(const char *sym) {
+  const uintptr_t p = (uintptr_t)so_try_find_addr_rx(&g_game, sym);
+  if (!p) {
+    debugPrintf("[game] %s: not found, cannot stub\n", sym);
+    return;
+  }
+  static const unsigned char bx_lr[2] = {0x70, 0x47};
+  if (so_patch_code((void *)(p & ~(uintptr_t)1), bx_lr, sizeof bx_lr) == 0)
+    debugPrintf("[game] %s -> bx lr (its Java module is not part of this port)\n", sym);
+  else
+    debugPrintf("[game] %s: could not patch\n", sym);
+}
+
 void port_run(void) {
   int w = 0, h = 0;
   dcr_window_size(&w, &h);
@@ -512,6 +536,11 @@ void port_run(void) {
   busy_end();
   debugPrintf("[game] <- nativeStart\n");
   log_flush_ring();
+
+  /* The two CS_* calls at the top of startClet that only exist to talk to the
+   * Hive modules. Neutralised before anything calls them. */
+  stub_out("CS_ActiveUserSetLogged");
+  stub_out("CS_SetModuleOrientation");
 
   /* startClet died with no message at all: the log is written through, so it
    * is not a lost line -- the process went away. The first thing it does is a
