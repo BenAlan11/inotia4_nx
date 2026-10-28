@@ -543,12 +543,27 @@ static void drive_engine(uint64_t frame, uint64_t now_ns) {
     return;
   g_drive_next_ns = now_ns + 100000000ull; /* the period startClet passed to TM_Set */
 
-  const unsigned steps = start_clet_steps();
+  unsigned steps = start_clet_steps();
   if (steps < 5) {
     typedef void (*fn_proc)(void *, int);
     fn_proc step = (fn_proc)entry("StartCletProcess");
     if (!step)
       return;
+    /* Step 0 is Hive and only Hive: Flurry_Start, CS_UserAgreeSetCallback,
+     * CS_ActiveUserSetCallback, CS_hlpGetLanguageCodeEx. Run #21 died inside it
+     * with no log line at all, the same silent exit the two CS_ wrappers gave
+     * before -- those functions reach a Java module through a vtable the port
+     * does not provide. An offline port has no user agreement and no active
+     * user, so the counter starts at 1 and the engine's own steps run from
+     * there: GRP_Initialize, COLOR_Initialize + FONT_Load + GRPX_Init,
+     * MATH_SetRandom + KEYSYSTEM_Create, then the swap to MainProcess. */
+    if (steps == 0) {
+      *(volatile uint32_t *)(b + STARTCLET_CNT_OFF) = 1;
+      debugPrintf("[tm] startClet step 0 is Hive (agreement, active user, language); "
+                  "skipping to the engine's own steps\n");
+      log_flush_ring();
+      steps = 1;
+    }
     debugPrintf("[tm] startClet step %u\n", steps);
     log_flush_ring();
     step((void *)(b + START_TIMER_OFF), 0);
@@ -769,6 +784,10 @@ void port_run(void) {
    * Hive modules. Neutralised before anything calls them. */
   stub_out("CS_ActiveUserSetLogged");
   stub_out("CS_SetModuleOrientation");
+  /* The same Java-module forwarders, reached from StartCletProcess step 0 and
+   * from the Hive notifications the engine may still fire. */
+  stub_out("CS_UserAgreeSetCallback");
+  stub_out("CS_ActiveUserSetCallback");
 
   /* startClet died with no message at all: the log is written through, so it
    * is not a lost line -- the process went away. The first thing it does is a
