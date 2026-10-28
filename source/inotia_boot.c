@@ -448,41 +448,122 @@ static void stub_out(const char *sym) {
  * Reading a YUV window as RGBA is not a thing that can be trusted, and a
  * diagnostic that can kill the process is worse than no diagnostic. */
 
-/* Why TM_Run does nothing. TM_Run walks the timer list TM_Define built and
- * fires a callback only when a node is both enabled and due; with draw 0 and
- * clear 0 forever, either the list is empty or nothing in it is due. Both are
- * visible from two values, and neither needs a dereference: the list head
- * pointer itself, and CS_knlCurrentTime(), which has to keep advancing or no
- * timer can ever expire.
+/* ------------------------------------------------- the engine's frame timer
  *
- * The head lives at the address TM_Run builds from its own literal, so it is
- * derived from TM_Run's address the same way the code does it -- no hardcoded
- * module base. */
-static void probe_timer(uint64_t frame) {
-  if (frame != 0 && frame != 60 && frame % 300 != 0)
-    return;
+ * nativeProcess is jProcessEvent(); TM_Run(); ThreadProc(). ThreadProc drains
+ * an event queue (empty here, so it returns at once) and TM_Run only walks the
+ * timer list -- so every frame of real work happens inside a timer callback.
+ * With draw 0 and clear 0 forever, no callback is running.
+ *
+ * startClet arms the first one:
+ *
+ *   TM_Define(&g_StartTimer, StartCletProcess)
+ *   TM_Set   (&g_StartTimer, 0, 100, 0, 0)
+ *
+ * and StartCletProcess is a five-step startup state machine driven by
+ * g_StartCletCnt, one step per 100 ms tick:
+ *
+ *   step 0  Flurry_Start, CS_UserAgreeSetCallback, CS_ActiveUserSetCallback,
+ *           CS_hlpGetLanguageCodeEx
+ *   step 1  GRP_Initialize
+ *   step 2  COLOR_Initialize, FONT_Load, GRPX_Init
+ *   step 3  MATH_SetRandom(CS_knlCurrentTime()), KEYSYSTEM_Create(0)
+ *   step 4  TM_Unset(&g_StartTimer); TM_Define(&g_MainTimer, MainProcess);
+ *           TM_Set(&g_MainTimer, 0, 100, 0, 0)      <- the real frame loop
+ *
+ * and MainProcess is UI_PopupProcess, STATE_NextStartProcess, the popup state
+ * machine and then the draw. Both MainProcess and g_MainTimer are exported, so
+ * if the timer never fires the port can do the timer's job itself: advance the
+ * five startup steps, then call MainProcess at the same 100 ms cadence
+ * startClet asked for. That keeps the game's own timing instead of inventing a
+ * frame rate, and it is a plain call into exported code -- no pointer is read
+ * out of the engine's data structures, which is what killed run #17 and run
+ * #20.
+ *
+ * g_StartCletCnt says which of the two is happening: 0 after a second means the
+ * timer never fired. */
+#define STARTCLET_CNT_OFF 0x1c3610u
+#define START_TIMER_OFF   0x1c3618u
+#define MAIN_TIMER_OFF    0x1c3630u
+#define MAIN_PROCESS_OFF  0x000f4454u
+
+/* MainProcess's file offset, used only to find the load base. The first
+ * instruction there is `push {r4, r5, r6, r7, lr}` (0xb5f0); if it is not,
+ * the base is wrong and nothing below is read. */
+static uintptr_t engine_base(void) {
   static uintptr_t base;
-  if (!base) {
-    void *tm = entry("TM_Run");
-    if (!tm)
+  if (base)
+    return base;
+  void *mp = entry("MainProcess");
+  if (!mp)
+    return 0;
+  const uintptr_t b = ((uintptr_t)mp & ~(uintptr_t)1) - MAIN_PROCESS_OFF;
+  if (*(const uint16_t *)(b + MAIN_PROCESS_OFF) != 0xb5f0u)
+    return 0;
+  base = b;
+  return base;
+}
+
+static unsigned start_clet_steps(void) {
+  const uintptr_t b = engine_base();
+  if (!b)
+    return 0;
+  return *(const volatile uint32_t *)(b + STARTCLET_CNT_OFF);
+}
+
+static int g_drive;              /* 0 undecided, 1 the engine's timer works, 2 the port drives */
+static uint64_t g_drive_next_ns; /* ns */
+static unsigned g_main_calls;
+
+static void drive_engine(uint64_t frame, uint64_t now_ns) {
+  const uintptr_t b = engine_base();
+  if (!b)
+    return;
+
+  if (g_drive == 0) {
+    if (frame < 60) /* one second: the five steps take 500 ms if they run */
       return;
-    base = (uintptr_t)tm - 0x180254u; /* TM_Run's file offset */
+    const unsigned steps = start_clet_steps();
+    if (steps == 0) {
+      g_drive = 2;
+      g_drive_next_ns = now_ns;
+      debugPrintf("[tm] the engine's 100 ms timer never fired (startClet step 0): "
+                  "the port drives the frame instead\n");
+    } else {
+      g_drive = 1;
+      debugPrintf("[tm] the engine's timer runs (startClet reached step %u): left alone\n",
+                  steps);
+    }
+    log_flush_ring();
   }
-  const uint32_t lit = *(const uint32_t *)(base + 0x1802f0u);
-  void *const *slot = (void *const *)(base + 0x180268u + lit);
-  void *gvar = *slot;
-  /* Only follow it when it is a plausible user-space address: a diagnostic
-   * that can fault is worse than no diagnostic (run #17 taught that). */
-  const uintptr_t gp = (uintptr_t)gvar;
-  const void *head = (gp >= 0x10000000u && gp < 0x90000000u) ? *(void *const *)gp : NULL;
 
-  typedef unsigned long long (*fn_u64)(void);
-  fn_u64 now_fn = (fn_u64)entry("CS_knlCurrentTime");
-  const unsigned long long now = now_fn ? now_fn() : 0;
+  if (g_drive != 2)
+    return;
+  if (now_ns < g_drive_next_ns)
+    return;
+  g_drive_next_ns = now_ns + 100000000ull; /* the period startClet passed to TM_Set */
 
-  debugPrintf("[tm] frame %llu: timer list head %p, engine time %llu ms\n",
-              (unsigned long long)frame, head, now);
-  log_flush_ring();
+  const unsigned steps = start_clet_steps();
+  if (steps < 5) {
+    typedef void (*fn_proc)(void *, int);
+    fn_proc step = (fn_proc)entry("StartCletProcess");
+    if (!step)
+      return;
+    debugPrintf("[tm] startClet step %u\n", steps);
+    log_flush_ring();
+    step((void *)(b + START_TIMER_OFF), 0);
+    return;
+  }
+
+  typedef void (*fn_main)(void *, int);
+  fn_main main_process = (fn_main)entry("MainProcess");
+  if (!main_process)
+    return;
+  main_process((void *)(b + MAIN_TIMER_OFF), 0);
+  if (++g_main_calls <= 3 || g_main_calls % 60 == 0) {
+    debugPrintf("[tm] MainProcess #%u\n", g_main_calls);
+    log_flush_ring();
+  }
 }
 
 /* glGetError at a few checkpoints. It cannot say whether the picture is right,
@@ -491,7 +572,6 @@ static void probe_timer(uint64_t frame) {
 static void check_gl(uint64_t frame) {
   if (frame != 0 && frame != 10 && frame != 60 && frame % 300 != 0)
     return;
-  probe_timer(frame);
   const GLenum e = glGetError();
   debugPrintf("[gfx] frame %llu: draw %u, clear %u, texImage %u, bindTex %u%s\n",
               (unsigned long long)frame, g_gl_draw, g_gl_clear, g_gl_tex, g_gl_bind,
@@ -812,6 +892,7 @@ void port_run(void) {
     busy_begin("nativeProcess");
     process(g_jni_env, NULL);
     g_busy = 0; /* not busy_end(): a slow frame every frame would flood the log */
+    drive_engine(g_frames, armTicksToNs(armGetSystemTick()));
     check_gl(g_frames);
     if (g_frames == 0) {
       debugPrintf("[game] <- nativeProcess (first frame, %llu ms)\n",
