@@ -240,6 +240,7 @@ typedef int (*fn_env_obj)(void *env, void *obj);
 typedef int (*fn_env_obj_obj)(void *env, void *obj, void *a);
 typedef int (*fn_env_obj_1i)(void *env, void *obj, int a);
 typedef int (*fn_env_obj_6i)(void *env, void *obj, int a, int b, int c, int d, int e, int f);
+typedef int (*fn_env_obj_obj_2i)(void *env, void *obj, void *a, void *b, int c, int d);
 
 /* The module names CWrapper.nativeInitialize dispatches on: they are the
  * literals in libgame.so, and they are exactly the Java classes that extend
@@ -410,6 +411,27 @@ void port_run(void) {
     data_init(g_jni_env, NULL, tz_ms);
     debugPrintf("[game] <- CWrapperData.nativeInitialize\n");
     log_flush_ring();
+  }
+
+  /* CEventHandler.<init> allocates two direct buffers and hands them over:
+   * 16 bytes of manage data and 2048 of event queue (256 events x 8 bytes),
+   * with (mEventMax, mSizeForEvent) as the last two arguments. jProcessEvent,
+   * the first thing nativeProcess does, reads through them. */
+  {
+    static unsigned char manage[16];
+    static unsigned char queue[2048];
+    fn_env_obj_obj_2i ev_init =
+        (fn_env_obj_obj_2i)entry(ENTRY("wrapper_kernel_CEventHandler_nativeEventHandlerInitialize"));
+    if (ev_init) {
+      debugPrintf("[game] -> nativeEventHandlerInitialize(16, 2048, 256, 8)\n");
+      log_flush_ring();
+      ev_init(g_jni_env, NULL, inotia_direct_buffer(manage, sizeof manage),
+              inotia_direct_buffer(queue, sizeof queue), 256, 8);
+      debugPrintf("[game] <- nativeEventHandlerInitialize\n");
+      log_flush_ring();
+    } else {
+      debugPrintf("[game] nativeEventHandlerInitialize MISSING\n");
+    }
   }
 
   if (set_size) {

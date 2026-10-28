@@ -317,6 +317,19 @@ static jvalue h_cf_activity(JObj *self, const jvalue *a, const JMethod *m) {
   return jv_l(inotia_activity());
 }
 
+/* ------------------------------------------------------- direct ByteBuffers
+ * CEventHandler's two queues are direct buffers the Java side allocates with
+ * allocateDirect() (CEventHandler.<init>: 16 bytes of manage data, 2048 bytes
+ * of event queue = 256 events x 8 bytes). The engine reads them through
+ * GetDirectBufferAddress, so they have to be real memory with the layout the
+ * runtime's NewDirectByteBuffer makes. */
+JObj *inotia_direct_buffer(void *addr, int cap) {
+  JObj *o = jni_new("java/nio/DirectByteBuffer");
+  o->p = addr;
+  o->v[0] = cap;
+  return o;
+}
+
 /* ------------------------------------------------ the Java-side singletons
  * The engine never keeps a Java object it was handed: it reads the wrapper
  * layer's static fields. getWrapperData() is
@@ -427,6 +440,13 @@ const JMethodDef jni_method_defs[] = {
     {"android/view/MotionEvent", "getActionMasked", NULL, h_touch_action},
     {"android/view/MotionEvent", "getX", NULL, h_touch_x},
     {"android/view/MotionEvent", "getY", NULL, h_touch_y},
+
+    /* ---- java.nio: the buffers above, so a Java-side call still chains */
+    {"java/nio/ByteBuffer", "order", NULL, jni_h_self},
+    {"java/nio/ByteBuffer", "rewind", NULL, jni_h_self},
+    {"java/nio/ByteBuffer", "clear", NULL, jni_h_self},
+    {"java/nio/ByteBuffer", "flip", NULL, jni_h_self},
+    {"java/nio/ByteBuffer", NULL, NULL, jni_h_zero},
 
     /* ---- text metrics */
     {"android/graphics/Paint", "measureText", NULL, h_measure_text},
@@ -545,6 +565,7 @@ const char *const jni_class_supers[][2] = {
     {"android/content/ContextWrapper", "android/content/Context"},
     {"android/media/MediaPlayer", "java/lang/Object"},
     {"java/io/File", "java/lang/Object"},
+    {"java/nio/DirectByteBuffer", "java/nio/ByteBuffer"},
     {NULL, NULL},
 };
 
@@ -565,6 +586,8 @@ const char *const jni_missing_classes[] = {
     "android/graphics/Paint",
     "android/graphics/Typeface",
     "java/io/File",
+    "java/nio/ByteBuffer",
+    "java/nio/DirectByteBuffer",
     "com/com2us/wrapper/kernel/CWrapperKernel",
     "com/com2us/wrapper/kernel/CWrapperData",
     "com/com2us/wrapper/kernel/CWrapper",

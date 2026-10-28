@@ -22,6 +22,10 @@ JObj *inotia_wrapper_class(const char *short_name);
  * (CFunction.getApkFilePath). */
 const char *inotia_apk_path(void);
 
+/* A java.nio.DirectByteBuffer over memory the port owns, for the queues
+ * CEventHandler reads through GetDirectBufferAddress. */
+JObj *inotia_direct_buffer(void *addr, int cap);
+
 /* ---------------------------------------------------------------- audio */
 /* The mixer behind android/media/SoundPool and MediaPlayer: stb_vorbis
  * streams on rt_audout. Returns 0 when the pump started. */
