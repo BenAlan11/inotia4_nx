@@ -448,12 +448,50 @@ static void stub_out(const char *sym) {
  * Reading a YUV window as RGBA is not a thing that can be trusted, and a
  * diagnostic that can kill the process is worse than no diagnostic. */
 
+/* Why TM_Run does nothing. TM_Run walks the timer list TM_Define built and
+ * fires a callback only when a node is both enabled and due; with draw 0 and
+ * clear 0 forever, either the list is empty or nothing in it is due. Both are
+ * visible from two values, and neither needs a dereference: the list head
+ * pointer itself, and CS_knlCurrentTime(), which has to keep advancing or no
+ * timer can ever expire.
+ *
+ * The head lives at the address TM_Run builds from its own literal, so it is
+ * derived from TM_Run's address the same way the code does it -- no hardcoded
+ * module base. */
+static void probe_timer(uint64_t frame) {
+  if (frame != 0 && frame != 60 && frame % 300 != 0)
+    return;
+  static uintptr_t base;
+  if (!base) {
+    void *tm = entry("TM_Run");
+    if (!tm)
+      return;
+    base = (uintptr_t)tm - 0x180254u; /* TM_Run's file offset */
+  }
+  const uint32_t lit = *(const uint32_t *)(base + 0x1802f0u);
+  void *const *slot = (void *const *)(base + 0x180268u + lit);
+  void *gvar = *slot;
+  /* Only follow it when it is a plausible user-space address: a diagnostic
+   * that can fault is worse than no diagnostic (run #17 taught that). */
+  const uintptr_t gp = (uintptr_t)gvar;
+  const void *head = (gp >= 0x10000000u && gp < 0x90000000u) ? *(void *const *)gp : NULL;
+
+  typedef unsigned long long (*fn_u64)(void);
+  fn_u64 now_fn = (fn_u64)entry("CS_knlCurrentTime");
+  const unsigned long long now = now_fn ? now_fn() : 0;
+
+  debugPrintf("[tm] frame %llu: timer list head %p, engine time %llu ms\n",
+              (unsigned long long)frame, head, now);
+  log_flush_ring();
+}
+
 /* glGetError at a few checkpoints. It cannot say whether the picture is right,
  * but it does say whether the engine's own drawing is failing, and unlike a
  * framebuffer readback it cannot hurt: it touches no pixels. */
 static void check_gl(uint64_t frame) {
   if (frame != 0 && frame != 10 && frame != 60 && frame % 300 != 0)
     return;
+  probe_timer(frame);
   const GLenum e = glGetError();
   debugPrintf("[gfx] frame %llu: draw %u, clear %u, texImage %u, bindTex %u%s\n",
               (unsigned long long)frame, g_gl_draw, g_gl_clear, g_gl_tex, g_gl_bind,
