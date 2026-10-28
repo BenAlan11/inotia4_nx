@@ -269,6 +269,9 @@ static const char *const k_modules[] = {
 
 static void *entry(const char *sym) { return (void *)so_try_find_addr_rx(&g_game, sym); }
 
+static void busy_begin(const char *what);
+static void busy_end(void);
+
 static void call0(fn_env_obj f, void *obj, const char *what) {
   if (!f) {
     debugPrintf("[game] %s: MISSING\n", what);
@@ -276,17 +279,21 @@ static void call0(fn_env_obj f, void *obj, const char *what) {
   }
   debugPrintf("[game] -> %s\n", what);
   log_flush_ring();
+  busy_begin(what);
   const int rc = f(g_jni_env, obj);
+  busy_end();
   debugPrintf("[game] <- %s = %d\n", what, rc);
   log_flush_ring();
 }
 
 /* ------------------------------------------------------------- heartbeat */
 /* A log that stops in the middle of a call cannot tell a hang from a slow
- * load: nativeProcess on the first frame may legitimately take seconds while
- * the engine parses its resource tables. While a call is on the stack this
- * prints once a second, so the next debug.log says which one it was. */
+ * load, and the engine's own logging goes to a RAM ring that is only written
+ * out when someone flushes it -- so the last line in debug.log is the last
+ * flushed one, not the last executed one. While a call is on the stack this
+ * prints once a second and flushes, which makes both questions answerable. */
 static volatile int g_busy;
+static volatile const char *g_busy_what = "?";
 static volatile uint64_t g_busy_since; /* ns */
 
 static void heartbeat_thread(void *arg) {
@@ -296,7 +303,8 @@ static void heartbeat_thread(void *arg) {
     if (!g_busy)
       continue;
     const uint64_t s = (armTicksToNs(armGetSystemTick()) - g_busy_since) / 1000000000ull;
-    debugPrintf("[game] still inside nativeProcess: %llu s\n", (unsigned long long)s);
+    debugPrintf("[game] still inside %s: %llu s\n", (const char *)g_busy_what,
+                (unsigned long long)s);
     log_flush_ring();
   }
 }
@@ -314,6 +322,15 @@ static void heartbeat_start(void) {
   }
 }
 
+/* Every call into the engine is bracketed with these. */
+static void busy_begin(const char *what) {
+  g_busy_what = what;
+  g_busy_since = armTicksToNs(armGetSystemTick());
+  g_busy = 1;
+}
+
+static void busy_end(void) { g_busy = 0; }
+
 void port_run(void) {
   int w = 0, h = 0;
   dcr_window_size(&w, &h);
@@ -326,7 +343,10 @@ void port_run(void) {
 
   debugPrintf("[game] constructors\n");
   log_flush_ring();
+  heartbeat_start(); /* from here on, every engine call is bracketed */
+  busy_begin("constructors");
   so_execute_init_array(&g_game);
+  busy_end();
 
   jni_init();
   debugPrintf("[game] JNIEnv %p JavaVM %p\n", g_jni_env, g_jni_vm);
@@ -335,7 +355,9 @@ void port_run(void) {
    * jmethodIDs it will call back through. */
   fn_env_obj onload = (fn_env_obj)entry("JNI_OnLoad");
   if (onload) {
+    busy_begin("JNI_OnLoad");
     const int rc = onload(g_jni_vm, NULL);
+    busy_end();
     debugPrintf("[game] JNI_OnLoad -> 0x%x\n", rc);
     log_flush_ring();
   }
@@ -377,7 +399,9 @@ void port_run(void) {
   if (set_class) {
     debugPrintf("[game] -> nativeSetClass\n");
     log_flush_ring();
+    busy_begin("nativeSetClass");
     set_class(g_jni_env, NULL);
+    busy_end();
     debugPrintf("[game] <- nativeSetClass\n");
     log_flush_ring();
   } else {
@@ -395,7 +419,9 @@ void port_run(void) {
       JObj *name = jni_str(k_modules[i]);
       debugPrintf("[game] -> nativeInitialize(%s)\n", k_modules[i]);
       log_flush_ring();
+      busy_begin(k_modules[i]);
       init_module(g_jni_env, thiz, name);
+      busy_end();
       debugPrintf("[game] <- nativeInitialize(%s)\n", k_modules[i]);
       log_flush_ring();
     }
@@ -408,7 +434,9 @@ void port_run(void) {
     const int tz_ms = 8 * 3600 * 1000;
     debugPrintf("[game] -> CWrapperData.nativeInitialize(%d)\n", tz_ms);
     log_flush_ring();
+    busy_begin("CWrapperData.nativeInitialize");
     data_init(g_jni_env, NULL, tz_ms);
+    busy_end();
     debugPrintf("[game] <- CWrapperData.nativeInitialize\n");
     log_flush_ring();
   }
@@ -425,8 +453,10 @@ void port_run(void) {
     if (ev_init) {
       debugPrintf("[game] -> nativeEventHandlerInitialize(16, 2048, 256, 8)\n");
       log_flush_ring();
+      busy_begin("nativeEventHandlerInitialize");
       ev_init(g_jni_env, NULL, inotia_direct_buffer(manage, sizeof manage),
               inotia_direct_buffer(queue, sizeof queue), 256, 8);
+      busy_end();
       debugPrintf("[game] <- nativeEventHandlerInitialize\n");
       log_flush_ring();
     } else {
@@ -437,7 +467,9 @@ void port_run(void) {
   if (set_size) {
     debugPrintf("[game] -> nativeSetScreenSize(%d,%d x3)\n", w, h);
     log_flush_ring();
+    busy_begin("nativeSetScreenSize");
     set_size(g_jni_env, NULL, w, h, w, h, w, h);
+    busy_end();
     debugPrintf("[game] <- nativeSetScreenSize\n");
     log_flush_ring();
   }
@@ -468,7 +500,9 @@ void port_run(void) {
 
   debugPrintf("[game] -> nativeStart\n");
   log_flush_ring();
+  busy_begin("nativeStart");
   start(g_jni_env, NULL);
+  busy_end();
   debugPrintf("[game] <- nativeStart\n");
   log_flush_ring();
 
@@ -490,7 +524,9 @@ void port_run(void) {
     if (start_clet) {
       debugPrintf("[game] -> nativeStartClet\n");
       log_flush_ring();
+      busy_begin("nativeStartClet");
       start_clet(g_jni_env, NULL);
+      busy_end();
       debugPrintf("[game] <- nativeStartClet\n");
       log_flush_ring();
     } else {
@@ -501,7 +537,9 @@ void port_run(void) {
   if (surface) {
     debugPrintf("[game] -> nativeSurfaceRecreated\n");
     log_flush_ring();
+    busy_begin("nativeSurfaceRecreated");
     surface(g_jni_env, NULL);
+    busy_end();
     debugPrintf("[game] <- nativeSurfaceRecreated\n");
     log_flush_ring();
   }
@@ -511,7 +549,6 @@ void port_run(void) {
 
   debugPrintf("[game] frame loop\n");
   log_flush_ring();
-  heartbeat_start();
 
   while (!rt_exit_requested() && appletMainLoop()) {
     rt_applet_poll();
@@ -531,10 +568,9 @@ void port_run(void) {
       debugPrintf("[game] -> nativeProcess (first frame)\n");
       log_flush_ring();
     }
-    g_busy_since = armTicksToNs(armGetSystemTick());
-    g_busy = 1;
+    busy_begin("nativeProcess");
     process(g_jni_env, NULL);
-    g_busy = 0;
+    busy_end();
     if (g_frames == 0) {
       debugPrintf("[game] <- nativeProcess (first frame, %llu ms)\n",
                   (unsigned long long)((armTicksToNs(armGetSystemTick()) - g_busy_since) / 1000000ull));
