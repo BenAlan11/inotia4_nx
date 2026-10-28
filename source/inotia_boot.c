@@ -529,6 +529,17 @@ void port_run(void) {
     log_flush_ring();
   }
 
+  /* The engine writes its own state under <userDir><package>/ (appinfo.dat and
+   * friends) and does not create the folder: getUserDir() ends in ".../files/"
+   * and it appends the package name to that. */
+  {
+    char dir[DCR_PATH_MAX];
+    snprintf(dir, sizeof dir, "%s/external/files/%s", dcr_game_root(), PORT_PACKAGE);
+    mkdir(dir, 0777);
+    debugPrintf("[setup] user dir: %s\n", dir);
+    log_flush_ring();
+  }
+
   /* The engine's main entry. On Android this is where MainActivity hands the
    * thread over; if it returns, the game is driven by nativeProcess from the
    * GL thread instead. */

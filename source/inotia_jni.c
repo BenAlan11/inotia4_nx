@@ -268,9 +268,16 @@ static jvalue h_cf_max_memory(JObj *self, const jvalue *a, const JMethod *m) {
   return jv_j(512LL * 1024 * 1024);
 }
 
+/* The Java side answers ApplicationInfo.sourceDir, i.e. /data/app/<pkg>-1/base.apk.
+ * The engine treats a name that starts with '/' as an absolute path and anything
+ * else as a relative asset name, so handing it the SD path ("sdmc:/...") made it
+ * prefix the resource folders: run #13 shows it looking for
+ * resources/common/game_res/sdmc:/switch/inotia4_nx/Inotia4.apk and then feeding
+ * the APK to libpng. dcr_path maps /data/app/<pkg>-1/base.apk to the player's own
+ * APK, so the Android form is both faithful and functional. */
 static jvalue h_cf_apk_path(JObj *self, const jvalue *a, const JMethod *m) {
   (void)self, (void)a, (void)m;
-  return jv_l(jni_str(inotia_apk_path()));
+  return jv_l(jni_str("/data/app/" PORT_PACKAGE "-1/base.apk"));
 }
 
 static jvalue h_cf_device_id(JObj *self, const jvalue *a, const JMethod *m) {
