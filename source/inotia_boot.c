@@ -48,6 +48,76 @@
 so_module g_game;
 static uint64_t g_frames;
 
+/* ------------------------------------------------------- GL call counting
+ * A black screen with no GL error is ambiguous: the engine may be drawing
+ * nothing, or drawing somewhere that never reaches the window. port_gl_wrap is
+ * the runtime's hook for exactly this question -- every gl* name the engine
+ * resolves comes through it -- so the counters below answer it from the log:
+ * "draw 0, clear 60" is an engine that is not drawing, "draw 4800, tex 3" is an
+ * engine that is drawing and something else is wrong.
+ *
+ * Wrapping is transparent: each stub forwards to the pointer the runtime
+ * handed over. */
+static unsigned g_gl_draw, g_gl_clear, g_gl_tex, g_gl_bind;
+
+static void (*real_draw_arrays)(GLenum, GLint, GLsizei);
+static void (*real_draw_elements)(GLenum, GLsizei, GLenum, const void *);
+static void (*real_clear)(GLbitfield);
+static void (*real_tex_image)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum,
+                              const void *);
+static void (*real_bind_texture)(GLenum, GLuint);
+
+static void cnt_draw_arrays(GLenum m, GLint f, GLsizei c) {
+  g_gl_draw++;
+  if (real_draw_arrays)
+    real_draw_arrays(m, f, c);
+}
+static void cnt_draw_elements(GLenum m, GLsizei c, GLenum t, const void *i) {
+  g_gl_draw++;
+  if (real_draw_elements)
+    real_draw_elements(m, c, t, i);
+}
+static void cnt_clear(GLbitfield mask) {
+  g_gl_clear++;
+  if (real_clear)
+    real_clear(mask);
+}
+static void cnt_tex_image(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h,
+                          GLint border, GLenum fmt, GLenum type, const void *px) {
+  g_gl_tex++;
+  if (real_tex_image)
+    real_tex_image(target, level, ifmt, w, h, border, fmt, type, px);
+}
+static void cnt_bind_texture(GLenum target, GLuint id) {
+  g_gl_bind++;
+  if (real_bind_texture)
+    real_bind_texture(target, id);
+}
+
+uintptr_t port_gl_wrap(const char *name, uintptr_t real) {
+  if (!strcmp(name, "glDrawArrays")) {
+    real_draw_arrays = (void *)real;
+    return (uintptr_t)cnt_draw_arrays;
+  }
+  if (!strcmp(name, "glDrawElements")) {
+    real_draw_elements = (void *)real;
+    return (uintptr_t)cnt_draw_elements;
+  }
+  if (!strcmp(name, "glClear")) {
+    real_clear = (void *)real;
+    return (uintptr_t)cnt_clear;
+  }
+  if (!strcmp(name, "glTexImage2D")) {
+    real_tex_image = (void *)real;
+    return (uintptr_t)cnt_tex_image;
+  }
+  if (!strcmp(name, "glBindTexture")) {
+    real_bind_texture = (void *)real;
+    return (uintptr_t)cnt_bind_texture;
+  }
+  return 0;
+}
+
 /* --------------------------------------------------------------- setup plan */
 
 #define ASSETS_DIR "assets/common/"
@@ -385,10 +455,9 @@ static void check_gl(uint64_t frame) {
   if (frame != 0 && frame != 10 && frame != 60 && frame % 300 != 0)
     return;
   const GLenum e = glGetError();
-  if (e != GL_NO_ERROR)
-    debugPrintf("[gfx] frame %llu: glGetError 0x%x\n", (unsigned long long)frame, e);
-  else if (frame == 0 || frame % 300 == 0)
-    debugPrintf("[gfx] frame %llu: no GL error\n", (unsigned long long)frame);
+  debugPrintf("[gfx] frame %llu: draw %u, clear %u, texImage %u, bindTex %u%s\n",
+              (unsigned long long)frame, g_gl_draw, g_gl_clear, g_gl_tex, g_gl_bind,
+              e == GL_NO_ERROR ? "" : " (GL error)");
   log_flush_ring();
 }
 
