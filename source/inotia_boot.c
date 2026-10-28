@@ -390,6 +390,18 @@ void port_run(void) {
   call0((fn_env_obj)entry(ENTRY("wrapper_common_CCommonAPI_nativeInitialize")), NULL,
         "CCommonAPI.nativeInitialize");
 
+  /* Where the engine will look for its resources: /sdcard/Android/data/<pkg>/
+   * files/resources/common through dcr_path. Say whether it is there, so a
+   * black screen with ENOENT in the log is one line to explain. */
+  {
+    char probe[DCR_PATH_MAX];
+    struct stat st;
+    snprintf(probe, sizeof probe, "%s/%s/common", dcr_game_root(), RES_ROOT);
+    debugPrintf("[setup] resources: %s -> %s\n", probe,
+                stat(probe, &st) == 0 ? "present" : "MISSING");
+    log_flush_ring();
+  }
+
   /* The engine's main entry. On Android this is where MainActivity hands the
    * thread over; if it returns, the game is driven by nativeProcess from the
    * GL thread instead. */
