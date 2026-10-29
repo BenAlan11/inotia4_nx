@@ -512,10 +512,17 @@ static unsigned start_clet_steps(void) {
 }
 
 static int g_drive;              /* 0 undecided, 1 the engine's timer works, 2 the port drives */
-static uint64_t g_drive_next_ns; /* ns */
 static unsigned g_main_calls;
 
-static void drive_engine(uint64_t frame, uint64_t now_ns) {
+/* The cadence is counted in frames, not in nanoseconds. Run #22 called
+ * MainProcess only three times in thirteen minutes: armTicksToNs() is the
+ * 32-bit runtime's, and the tick-to-nanosecond product wraps long before a
+ * minute, so "has 100 ms passed" was almost never true. Six frames at the
+ * vsync'd 60 fps the log shows is the same 100 ms, and a counter cannot wrap
+ * in a way that starves the call. */
+#define DRIVE_EVERY_FRAMES 6u
+
+static void drive_engine(uint64_t frame) {
   const uintptr_t b = engine_base();
   if (!b)
     return;
@@ -526,7 +533,6 @@ static void drive_engine(uint64_t frame, uint64_t now_ns) {
     const unsigned steps = start_clet_steps();
     if (steps == 0) {
       g_drive = 2;
-      g_drive_next_ns = now_ns;
       debugPrintf("[tm] the engine's 100 ms timer never fired (startClet step 0): "
                   "the port drives the frame instead\n");
     } else {
@@ -539,9 +545,8 @@ static void drive_engine(uint64_t frame, uint64_t now_ns) {
 
   if (g_drive != 2)
     return;
-  if (now_ns < g_drive_next_ns)
+  if (frame % DRIVE_EVERY_FRAMES)
     return;
-  g_drive_next_ns = now_ns + 100000000ull; /* the period startClet passed to TM_Set */
 
   unsigned steps = start_clet_steps();
   if (steps < 5) {
@@ -575,8 +580,9 @@ static void drive_engine(uint64_t frame, uint64_t now_ns) {
   if (!main_process)
     return;
   main_process((void *)(b + MAIN_TIMER_OFF), 0);
-  if (++g_main_calls <= 3 || g_main_calls % 60 == 0) {
-    debugPrintf("[tm] MainProcess #%u\n", g_main_calls);
+  if (++g_main_calls <= 10 || g_main_calls % 100 == 0) {
+    debugPrintf("[tm] MainProcess #%u (frame %llu, draw %u)\n", g_main_calls,
+                (unsigned long long)frame, g_gl_draw);
     log_flush_ring();
   }
 }
@@ -911,7 +917,7 @@ void port_run(void) {
     busy_begin("nativeProcess");
     process(g_jni_env, NULL);
     g_busy = 0; /* not busy_end(): a slow frame every frame would flood the log */
-    drive_engine(g_frames, armTicksToNs(armGetSystemTick()));
+    drive_engine(g_frames);
     check_gl(g_frames);
     if (g_frames == 0) {
       debugPrintf("[game] <- nativeProcess (first frame, %llu ms)\n",
