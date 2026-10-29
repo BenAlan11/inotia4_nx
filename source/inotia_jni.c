@@ -557,14 +557,14 @@ static jvalue h_snd_new_id(JObj *self, const jvalue *a, const JMethod *m) {
 
 static jvalue h_snd_true(JObj *self, const jvalue *a, const JMethod *m) {
   (void)self, (void)a, (void)m;
-  return jni_h_true;
+  return jv_z(1);
 }
 
 static jvalue h_snd_play(JObj *self, const jvalue *a, const JMethod *m) {
   (void)self, (void)m;
   if (g_sound_played++ < 12)
     debugPrintf("[snd] play %d\n", a ? (int)a[0].i : -1);
-  return jni_h_true;
+  return jv_z(1);
 }
 
 static jvalue h_snd_volume(JObj *self, const jvalue *a, const JMethod *m) {
