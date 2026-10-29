@@ -59,6 +59,7 @@ static uint64_t g_frames;
  * Wrapping is transparent: each stub forwards to the pointer the runtime
  * handed over. */
 static unsigned g_gl_draw, g_gl_clear, g_gl_tex, g_gl_bind;
+static unsigned g_last_tex, g_tex_logged;
 
 static void (*real_draw_arrays)(GLenum, GLint, GLsizei);
 static void (*real_draw_elements)(GLenum, GLsizei, GLenum, const void *);
@@ -72,7 +73,15 @@ static void (*real_bind_texture)(GLenum, GLuint);
  * drawing" without another build. */
 static void draw_tick(void) {
   if (g_gl_draw % 250 == 0) {
-    debugPrintf("[gfx] draw #%u\n", g_gl_draw);
+    debugPrintf("[gfx] draw #%u tex %u\n", g_gl_draw, g_last_tex);
+    log_flush_ring();
+  }
+  /* The title screen is the first frame that draws hundreds of primitives, and
+   * the process dies in the frame after it, deterministically: run #24 and #25
+   * both stopped at draw 1836. Fine resolution from 1750 on, with the texture
+   * that was bound, so the dying primitive can be identified. */
+  else if (g_gl_draw > 1750 && g_gl_draw % 25 == 0) {
+    debugPrintf("[gfx] draw #%u tex %u\n", g_gl_draw, g_last_tex);
     log_flush_ring();
   }
 }
@@ -97,11 +106,16 @@ static void cnt_clear(GLbitfield mask) {
 static void cnt_tex_image(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h,
                           GLint border, GLenum fmt, GLenum type, const void *px) {
   g_gl_tex++;
+  if (g_tex_logged++ < 24) {
+    debugPrintf("[gfx] texImage %ux%u fmt %x type %x px %p\n", w, h, fmt, type, px);
+    log_flush_ring();
+  }
   if (real_tex_image)
     real_tex_image(target, level, ifmt, w, h, border, fmt, type, px);
 }
 static void cnt_bind_texture(GLenum target, GLuint id) {
   g_gl_bind++;
+  g_last_tex = id;
   if (real_bind_texture)
     real_bind_texture(target, id);
 }
