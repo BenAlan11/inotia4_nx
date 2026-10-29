@@ -579,19 +579,22 @@ static void drive_engine(uint64_t frame) {
   fn_main main_process = (fn_main)entry("MainProcess");
   if (!main_process)
     return;
+  /* Logged on the way in, not on the way out. A crash inside the call then
+   * leaves its own number as the last line, which says both where it died and
+   * what the frame looked like just before -- run #23 died somewhere after
+   * #3800 and there was no way to tell which call it was. */
+  debugPrintf("[tm] MainProcess #%u in (frame %llu, draw %u)\n", g_main_calls + 1,
+              (unsigned long long)frame, g_gl_draw);
+  log_flush_ring();
   main_process((void *)(b + MAIN_TIMER_OFF), 0);
-  if (++g_main_calls <= 10 || g_main_calls % 100 == 0) {
-    debugPrintf("[tm] MainProcess #%u (frame %llu, draw %u)\n", g_main_calls,
-                (unsigned long long)frame, g_gl_draw);
-    log_flush_ring();
-  }
+  g_main_calls++;
 }
 
 /* glGetError at a few checkpoints. It cannot say whether the picture is right,
  * but it does say whether the engine's own drawing is failing, and unlike a
  * framebuffer readback it cannot hurt: it touches no pixels. */
 static void check_gl(uint64_t frame) {
-  if (frame != 0 && frame != 10 && frame != 60 && frame % 300 != 0)
+  if (frame != 0 && frame != 10 && frame != 60 && frame % 60 != 0)
     return;
   const GLenum e = glGetError();
   debugPrintf("[gfx] frame %llu: draw %u, clear %u, texImage %u, bindTex %u%s\n",
