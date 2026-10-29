@@ -60,6 +60,12 @@ static uint64_t g_frames;
  * handed over. */
 static unsigned g_gl_draw, g_gl_clear, g_gl_tex, g_gl_bind;
 static unsigned g_last_tex, g_tex_logged;
+/* The GLES1 fixed pipeline draws from client-side arrays. If one of these is
+ * null or stale, glDrawArrays reads it and the process goes away with no
+ * message -- which is what the title screen looks like from here. */
+static const void *g_vptr, *g_tptr;
+static int g_vsize, g_vtype, g_vstride;
+static int g_draw_logged;
 
 static void (*real_draw_arrays)(GLenum, GLint, GLsizei);
 static void (*real_draw_elements)(GLenum, GLsizei, GLenum, const void *);
@@ -71,6 +77,16 @@ static void (*real_bind_texture)(GLenum, GLuint);
 /* Every 250 draws says so, so a frame that draws hundreds of primitives leaves
  * a trail: the last line then separates "died while drawing" from "died before
  * drawing" without another build. */
+static void draw_detail(const char *what, unsigned mode, int first, int count,
+                        const void *idx) {
+  if (g_gl_draw <= 1790 || g_draw_logged > 200)
+    return;
+  g_draw_logged++;
+  debugPrintf("[gfx] %s mode %x first %d count %d idx %p | vtx %p size %d type %x stride %d tex %p\n",
+              what, mode, first, count, idx, g_vptr, g_vsize, g_vtype, g_vstride, g_tptr);
+  log_flush_ring();
+}
+
 static void draw_tick(void) {
   if (g_gl_draw % 250 == 0) {
     debugPrintf("[gfx] draw #%u tex %u\n", g_gl_draw, g_last_tex);
@@ -88,12 +104,14 @@ static void draw_tick(void) {
 
 static void cnt_draw_arrays(GLenum m, GLint f, GLsizei c) {
   g_gl_draw++;
+  draw_detail("drawArrays", m, f, c, NULL);
   draw_tick();
   if (real_draw_arrays)
     real_draw_arrays(m, f, c);
 }
 static void cnt_draw_elements(GLenum m, GLsizei c, GLenum t, const void *i) {
   g_gl_draw++;
+  draw_detail("drawElements", m, (int)t, c, i);
   draw_tick();
   if (real_draw_elements)
     real_draw_elements(m, c, t, i);
@@ -120,7 +138,29 @@ static void cnt_bind_texture(GLenum target, GLuint id) {
     real_bind_texture(target, id);
 }
 
+static void (*real_vertex_ptr)(GLint, GLenum, GLsizei, const void *);
+static void (*real_texcoord_ptr)(GLint, GLenum, GLsizei, const void *);
+
+static void cnt_vertex_ptr(GLint size, GLenum type, GLsizei stride, const void *p) {
+  g_vptr = p, g_vsize = size, g_vtype = type, g_vstride = stride;
+  if (real_vertex_ptr)
+    real_vertex_ptr(size, type, stride, p);
+}
+static void cnt_texcoord_ptr(GLint size, GLenum type, GLsizei stride, const void *p) {
+  g_tptr = p;
+  if (real_texcoord_ptr)
+    real_texcoord_ptr(size, type, stride, p);
+}
+
 uintptr_t port_gl_wrap(const char *name, uintptr_t real) {
+  if (!strcmp(name, "glVertexPointer")) {
+    real_vertex_ptr = (void *)real;
+    return (uintptr_t)cnt_vertex_ptr;
+  }
+  if (!strcmp(name, "glTexCoordPointer")) {
+    real_texcoord_ptr = (void *)real;
+    return (uintptr_t)cnt_texcoord_ptr;
+  }
   if (!strcmp(name, "glDrawArrays")) {
     real_draw_arrays = (void *)real;
     return (uintptr_t)cnt_draw_arrays;
