@@ -526,6 +526,52 @@ JObj *inotia_direct_buffer(void *addr, int cap) {
   return o;
 }
 
+/* ------------------------------------------------------- CSoundManager
+ * soundCreate answered -1 through the wildcard, because the Java side resolves
+ * the name with CResource.getFullPathName() and assetOpenFd(), neither of which
+ * this port has, so it never gets an AssetFileDescriptor. The engine stores the
+ * -1 and SOUNDSYSTEM_Process -- the last thing MainProcess does each tick --
+ * goes looking for it. Run #24 died on the very tick after a burst of
+ * soundCreate/soundPrepare, with the title screen already drawn.
+ *
+ * The port has a real mixer (stb_vorbis in inotia_audio.c) but the assets live
+ * inside the APK, so wiring the name to a file is a separate job. Until then a
+ * sound is a valid id that does nothing, which is what an engine can hold
+ * without falling over. */
+static int g_next_sound_id = 1;
+static int g_sound_created, g_sound_played;
+
+static jvalue h_snd_create(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)m;
+  const char *name = (a && a[0].l) ? jni_utf(a[0].l) : "";
+  const int id = g_next_sound_id++;
+  if (g_sound_created++ < 12)
+    debugPrintf("[snd] create '%s' -> %d (silent: no file backing yet)\n", name, id);
+  return jv_i(id);
+}
+
+static jvalue h_snd_new_id(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_i(g_next_sound_id++);
+}
+
+static jvalue h_snd_true(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jni_h_true;
+}
+
+static jvalue h_snd_play(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)m;
+  if (g_sound_played++ < 12)
+    debugPrintf("[snd] play %d\n", a ? (int)a[0].i : -1);
+  return jni_h_true;
+}
+
+static jvalue h_snd_volume(JObj *self, const jvalue *a, const JMethod *m) {
+  (void)self, (void)a, (void)m;
+  return jv_i(100);
+}
+
 /* ------------------------------------------------ the Java-side singletons
  * The engine never keeps a Java object it was handed: it reads the wrapper
  * layer's static fields. getWrapperData() is
@@ -737,6 +783,21 @@ const JMethodDef jni_method_defs[] = {
     {"com/com2us/wrapper/utility/CUtility", NULL, NULL, jni_h_zero},
     {"com/com2us/wrapper/game/CGameManager", NULL, NULL, jni_h_zero},
     {"com/com2us/wrapper/function/CFunctionTaskRunner", NULL, NULL, jni_h_zero},
+    {"com/com2us/wrapper/media/CSoundManager", "createSoundId", NULL, h_snd_new_id},
+    {"com/com2us/wrapper/media/CSoundManager", "soundCreate", NULL, h_snd_create},
+    {"com/com2us/wrapper/media/CSoundManager", "soundPrepare", NULL, h_snd_true},
+    {"com/com2us/wrapper/media/CSoundManager", "soundPlay", NULL, h_snd_play},
+    {"com/com2us/wrapper/media/CSoundManager", "soundStop", NULL, h_snd_true},
+    {"com/com2us/wrapper/media/CSoundManager", "soundPause", NULL, h_snd_true},
+    {"com/com2us/wrapper/media/CSoundManager", "soundResume", NULL, h_snd_true},
+    {"com/com2us/wrapper/media/CSoundManager", "soundDestroy", NULL, h_snd_true},
+    {"com/com2us/wrapper/media/CSoundManager", "soundSetVolume", NULL, h_snd_true},
+    {"com/com2us/wrapper/media/CSoundManager", "soundGetVolume", NULL, h_snd_volume},
+    {"com/com2us/wrapper/media/CSoundManager", "getVolume", NULL, h_snd_volume},
+    {"com/com2us/wrapper/media/CSoundManager", "setVolume", NULL, h_snd_true},
+    {"com/com2us/wrapper/media/CSoundManager", "getCurrentPlaying", NULL, jni_h_zero},
+    {"com/com2us/wrapper/media/CSoundManager", "stopAll", NULL, jni_h_void},
+    {"com/com2us/wrapper/media/CSoundManager", "stopCurrent", NULL, jni_h_void},
     {"com/com2us/wrapper/media/CSoundManager", NULL, NULL, jni_h_zero},
     {"com/com2us/wrapper/WrapperUserDefined", NULL, NULL, jni_h_zero},
 

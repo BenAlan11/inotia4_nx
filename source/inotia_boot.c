@@ -67,13 +67,25 @@ static void (*real_tex_image)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLe
                               const void *);
 static void (*real_bind_texture)(GLenum, GLuint);
 
+/* Every 250 draws says so, so a frame that draws hundreds of primitives leaves
+ * a trail: the last line then separates "died while drawing" from "died before
+ * drawing" without another build. */
+static void draw_tick(void) {
+  if (g_gl_draw % 250 == 0) {
+    debugPrintf("[gfx] draw #%u\n", g_gl_draw);
+    log_flush_ring();
+  }
+}
+
 static void cnt_draw_arrays(GLenum m, GLint f, GLsizei c) {
   g_gl_draw++;
+  draw_tick();
   if (real_draw_arrays)
     real_draw_arrays(m, f, c);
 }
 static void cnt_draw_elements(GLenum m, GLsizei c, GLenum t, const void *i) {
   g_gl_draw++;
+  draw_tick();
   if (real_draw_elements)
     real_draw_elements(m, c, t, i);
 }
