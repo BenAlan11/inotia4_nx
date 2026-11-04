@@ -1,0 +1,46 @@
+# build output and toolchains (re-create with build.py / tools/)
+build/
+dist/
+tools/dkp_rootfs/
+tools/libnx-master/
+tools/libnx.zip
+tools/xpack-*.zip
+tools/*.bin
+tools/__pycache__/
+
+# the game itself is not ours to publish: APK dump, its libraries and saves
+data/
+apk_new/
+ref/
+ref_inoita/
+save_backup/
+tmp_dl/
+tmp_snap/
+logs/
+
+# experiment copies of the sources
+wip/
+
+# logs, screenshots, one-off debug crops
+*.log
+*.ppm
+*.png
+*.tmp
+
+# scratch downloads / dumps
+inoita-game.tar.gz
+stb.zip
+tmp_instant*.txt
+tmp_*.txt
+eden_out.txt
+icon.jpg
+emu.md
+
+# large snapshots stay on disk; the current one plus the sources is the backup
+snapshots/save-fix-20261103.zip
+snapshots/save-fix-20261103-v2.zip
+snapshots/save-slot-20261104-1846.zip
+snapshots/save-slot-20261104-1946.zip
+snapshots/known-good-20261103-1958/*.nro
+snapshots/known-good-20261104-1846/*.nro
+snapshots/known-good-20261104-1946/*.nro

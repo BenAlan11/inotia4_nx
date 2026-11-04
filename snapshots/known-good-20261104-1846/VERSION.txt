@@ -1,0 +1,19 @@
+Inotia 4 for Nintendo Switch -- known good snapshot
+
+build stamp : 2026-11-04 18:46:08
+nro md5     : 2a6d92db69db83f485a664fe1beef2fc
+nro size    : 9056375 bytes
+verified    : 2026-11-04 18:52, Eden (eden-cli), production config
+
+What this version is known to do:
+  * save slots: creating in a row lands in that row
+    (slot 1 -> save0.dat ... slot 3 -> save2.dat)
+  * deleting a save asks the engine's own confirm box; 是 removes it
+  * returning to the title and pressing START opens the save list again
+  * class screen: taps that land on the save page underneath are dropped
+  * text: $X colour runs work (blue/gold emphasis is back), &N breaks lines
+  * offline boot no longer leaves a stray box over the third save row's bin
+
+Restore:
+  copy inotia4_nx.nro over <sdmc>/switch/inotia4/inotia4_nx.nro
+  (the matching sources are in snapshots/save-slot-20261104-1846.zip)

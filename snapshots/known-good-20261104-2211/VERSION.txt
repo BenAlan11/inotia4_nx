@@ -1,0 +1,26 @@
+Inotia 4 for Nintendo Switch -- known good snapshot
+
+build stamp : 2026-11-04 22:10:51
+nro md5     : a8adfa63d39a19bf308d8dd942146860
+nro size    : 9060471 bytes
+verified    : 2026-11-04 22:12, Eden (eden-cli), production config, user-confirmed
+
+Verified by the player on this build:
+  * in-game tutorial hint: the white line sits INSIDE its black highlight bar
+    (bar 80,152-1057,172; text ink ~154..171)
+  * save slots: create in a row -> lands in that row (slot 1 -> save0.dat ...)
+  * delete asks the engine's own confirm box; "yes" removes it
+  * back to title, START opens the save list again
+  * text: $X colour runs, &N line breaks, baselines of colour runs aligned
+  * no freeze anywhere (HUD numbers draw: the stall was a diagnostic log
+    calling the engine's SGL_GetTextSize)
+
+Font:
+  card font is the original DroidSansFallback.ttf (3.72 MB, 50951 glyphs),
+  shipped here as font.ttf. Without it the port falls back to the console's
+  shared font; measurements then differ from the device the game shipped on.
+
+Restore:
+  copy inotia4_nx.nro over <sdmc>/switch/inotia4/inotia4_nx.nro
+  copy font.ttf       to   <sdmc>/switch/inotia4/font.ttf
+  (sources: snapshots/save-slot-20261104-2211.zip)
