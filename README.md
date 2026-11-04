@@ -689,6 +689,23 @@ framework, not in the APK, and cannot be dropped onto a Switch. The port answers
 the engine's text entry points itself; matching the *font* is what makes its
 measurements and our glyphs agree.
 
+## Backup
+
+Sources, snapshots and the notes in `.workbuddy/memory/` are mirrored to
+<https://github.com/BenAlan11/inotia4_nx> (branch `main`). Game data, the APK
+dump, toolchains and saves are not published there.
+
+On this machine `git push` cannot reach `github.com` (the egress proxy only
+forwards `api.github.com`), so updates go through the REST API:
+
+```
+GH_TOKEN=... python tools/gh_push.py BenAlan11/inotia4_nx main
+```
+
+It creates blobs, trees and a commit through the Git data API and moves the
+branch, which produces exactly the tree `git push` would have produced. The
+commit continues the remote branch's history when one exists.
+
 ## Testing on the second screen
 
 Launches are placed on monitor 2 so they never cover or minimise whatever is on
