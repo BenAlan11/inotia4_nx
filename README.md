@@ -543,6 +543,60 @@ y / colour in that strip) are what to read on the next run: the quad should stay
 `col 0.00 0.00 0.00 0.70` frame after frame, and the plate line should end in a
 light colour.
 
+### 2026-11-06: balloon ink and the hint plate
+
+Two fixes that both came from reading what the engine actually calls, rather
+than matching rectangles on a screenshot.
+
+**The battle shouts were red instead of black.** A text control carries its pen
+colour at `+0x14`, and `X_TEXTCTRL_DrawTextControl` (0x1447a8) hands that word
+straight to `GRPX_SetFontColor`. The engine packs it as
+`(a<<24)|(b<<16)|(g<<8)|r` -- `X_TEXTCTRL_GetColorFromCode`'s table at 0xbb9c8
+has `$R` = 0xFF0000FF and `$B` = 0xFF000000, and `X_TEXTCTRL_InitTextControl`
+writes that same 0xFF000000 (opaque **black**) as the default. Our
+`text_draw_engine()` takes `0xRRGGBBAA`. White survives either reading, which is
+why the whole UI looked right, but the default black read as R=255,G=0,B=0 --
+bright red ink on the white balloon. `tctrl_colour()` now byte-swaps the word
+(`__builtin_bswap32`) for both `nx_textctrl_draw()` and `desc_draw_block()`.
+The textctrl path deliberately does **not** apply `text_colour()`'s
+"black becomes white" rule, or the shouts would just turn white instead.
+
+**The plain tips' 60% black plate stayed 20 px tall.** `SGL_grpFillRect`
+(0x12b484) is the single exit for every solid rectangle:
+`GRPX_FillRect`, `GRPX_FillRectAlpha` and `GRPX_FillRectRGBAlpha` all tail-call
+it from 0x122568 / 0x122624 / 0x1226b0, and it submits one
+`glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)` at 0x12b63c. The runtime return address
+in the log (`bar: quad 80,152-1057,172 ... ra 0x4ceb35f640`) is exactly
+`SGL_grpFillRect+0x1bc` once the module base 0x4ceb234000 is subtracted.
+`UI_DrawTextBackground` (0x143b30) passes `w3 = 0x22 = 34` to
+`GRPX_FillRectRGBAlpha`, so 34 px is the engine's own text-background height;
+the hint plates are submitted at 20. The old `bar_expand()` worked only for the
+tutorial hint, because it requires the quad's `GL_CURRENT_COLOR` to be black and
+the plain tips reach the rectangle through a tinted path.
+
+The fix overrides `SGL_grpFillRect` with `nx_sgl_fillrect()`: short (14..26 px),
+wide (>= 200 px), translucent plates in the hint band are grown around their
+centre to `cfg.bar_h` (34) *before* the real function builds its vertices, so no
+text quad or nine-slice art can be caught by mistake. The bounded
+`fillrect: x,y wxh col caller 0x<vaddr>` log records the actual parameters and
+the calling function. `TIPBOX_Draw` (0x1dd050) only draws the string and runs
+the timer; `UI_DrawBorderRect` (0x14314c) is the 24 px nine-slice window, not
+this tip.
+
+The first version of that override accepted *any* short, wide, translucent
+plate, which broke the quest page: its title bar is three 476x15 / 476x18 /
+476x15 strips at y 164/179/197 in brown (`0xe5315069`) and grey (`0x7f6f6f6f`),
+and growing and shifting them stacked a grey plate over the quest text. The
+condition is now the exact signature of the hint plate -- `h == 20`, `w >= 200`,
+pure black with a non-trivial alpha (`0xAA000000`, e.g. `0x99000000`) -- which
+none of the quest strips share. Lesson worth keeping for the next subsystem:
+narrow a hook by the *drawing signature*, not by how the artefact looks in a
+screenshot.
+
+Still open from the previous build: a *short* battle shout ("杀了他") shows a
+white plate behind the bubble, because its 35 px nine-slice corners are drawn
+into a 160x45 box and overlap by 25 px.
+
 ### 2026-11-06: names, thoughts and the save rows
 
 Three colour decisions, all of them consequences of the engine's UI palette
@@ -909,7 +963,8 @@ and one zip with the sources that produced it. Restoring a known state is
 
 | Snapshot | Build | NRO md5 | Verified for |
 |---|---|---|---|
-| `snapshots/known-good-20261106-1905/` + `save-slot-20261106-1905.zip` | 2026-11-06 19:02:50 | `683ed6302f8af0c1a8267f02e616e695` | **current default**: everything below, plus the dialogue's speaker name in gold in *every* layout, inner thoughts in grey, and the save slots' map name in the character page's gold (#C6B992) -- see *2026-11-06: names, thoughts and the save rows* |
+| `snapshots/known-good-20261106-1945/` + `save-slot-20261106-1945.zip` | 2026-11-06 20:05:16 | `379dcfbb92a4f630d7eaca49fa85bcf8` | **current default**: everything below, plus black (not red) ink on the battle shouts, the plain tips' 60% black plate grown to 34 px at the rectangle's source, and the quest page free of the grey plate the first attempt introduced -- see *2026-11-06: balloon ink and the hint plate* |
+| `snapshots/known-good-20261106-1905/` + `save-slot-20261106-1905.zip` | 2026-11-06 19:02:50 | `683ed6302f8af0c1a8267f02e616e695` | everything below, plus the dialogue's speaker name in gold in *every* layout, inner thoughts in grey, and the save slots' map name in the character page's gold (#C6B992) -- see *2026-11-06: names, thoughts and the save rows* |
 | `snapshots/known-good-20261106-1240/` + `save-slot-20261106-1240.zip` | 2026-11-06 12:37:57 | `294defaf72ff3b8b4e3dfa3c699eaead` | everything below, plus the skill page's numbers and buttons: the value after `技能点:` is white again, and `学习` / `取消快捷键` (and the item page's description buttons) take the touch -- see *2026-11-06: the description panel's buttons* |
 | `snapshots/known-good-20261106-1213/` + `save-slot-20261106-1213.zip` | 2026-11-06 12:13:26 | `b6827148678568ff8967a4c4399dad4b` | the skill description page: it scrolls again (the finger travel drives the page's own scroll control), it is laid out as one text flow so the next-level block and the value comparison no longer overlap, and text controls longer than 256 bytes are no longer truncated (the blue `5秒` at the end of the first block) -- see *2026-11-06: the skill description page* |
 | `snapshots/known-good-20261105-1909/` + `save-slot-20261105-1909.zip` | 2026-11-05 19:04:15 | `c2d3533bf35a92b33747da80ba2089b5` | everything below, plus the quest popup laying its text out like the original (wrapped at the popup's own content width, colour runs carried across the wrap, `&N` as a hard break, `$A` red title, the control height that drives the popup's vertical layout) -- see *2026-11-05: the quest popup* |

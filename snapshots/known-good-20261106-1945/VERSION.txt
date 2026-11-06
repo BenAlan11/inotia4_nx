@@ -1,0 +1,62 @@
+Inotia 4 for Nintendo Switch -- known good snapshot
+
+build stamp : 2026-11-06 20:05:16 (rebuilt after the quest-page regression)
+nro md5     : 379dcfbb92a4f630d7eaca49fa85bcf8
+nro size    : 9162871 bytes
+config      : config.prod.ini (bar_h = 34, log_level = 1, string_draw = 1)
+verified    : 2026-11-06 19:48 by play testing (black ink + 34 px plate);
+              the quest-page regression fix below is verified from the log and
+              awaits one visual re-check on the console.
+
+NOTE: the 19:45:13 build (md5 05e3b1e1...) had a regression and is NOT a
+known-good state. It grew every short wide translucent rectangle to 34 px,
+which also caught the quest page's three title strips. This NRO replaces it.
+
+Changes since 20261106-1905:
+
+  * battle shouts are black ink again. A text control's +0x14 colour word is
+    the one X_TEXTCTRL_DrawTextControl (0x1447a8) passes to GRPX_SetFontColor,
+    packed (a<<24)|(b<<16)|(g<<8)|r. X_TEXTCTRL_InitTextControl writes
+    0xFF000000 (opaque BLACK) as the default and X_TEXTCTRL_GetColorFromCode's
+    table at 0xbb9c8 confirms the byte order ($R = 0xFF0000FF, $B =
+    0xFF000000). text_draw_engine() takes 0xRRGGBBAA, so black was read as
+    R=255,G=0,B=0 -- red text on the white balloon. tctrl_colour() now
+    byte-swaps the word for nx_textctrl_draw() and desc_draw_block(). The
+    textctrl path does NOT apply text_colour()'s black->white lift.
+
+  * the plain tips' 60% black plate is now 34 px tall. SGL_grpFillRect
+    (0x12b484) is the single exit for every solid rectangle (GRPX_FillRect /
+    FillRectAlpha / FillRectRGBAlpha tail-call it); the runtime return address
+    in "bar: quad 80,152-1057,172 ... ra 0x4ceb35f640" is SGL_grpFillRect+0x1bc.
+    UI_DrawTextBackground (0x143b30) asks GRPX_FillRectRGBAlpha for h = 0x22,
+    so 34 px is the engine's own text background, while the hint plates were
+    submitted at 20. bar_expand() only matched quads with a black
+    GL_CURRENT_COLOR, which the tinted plain tips never have. The override
+    nx_sgl_fillrect() grows short wide translucent plates around their centre
+    to cfg.bar_h at the rectangle's source, before the real function builds
+    its four vertices. Bounded "fillrect:" log records parameters + caller
+    vaddr.
+
+  * REGRESSION FIX in this rebuild: the first attempt accepted any short, wide,
+    translucent rectangle and broke the quest page -- its title bar is three
+    476x15 / 476x18 / 476x15 strips at y 164/179/197 in brown (0xe5315069) and
+    grey (0x7f6f6f6f); growing and shifting them stacked a grey plate over the
+    quest text. The condition is now exactly the hint plate: h == 20, w >= 200,
+    and a pure-black colour with a non-trivial alpha (0xAA000000, e.g.
+    0x99000000). The quest strips share none of those.
+
+Known open item (engine-side art, not port code):
+
+  * a SHORT battle shout ("杀了他") shows a white plate behind the bubble, its
+    four corners sticking out. The balloon background is a nine-slice with 35 px
+    corners drawn into a 160x45 box: the corners overlap by 25 px and the middle
+    tiles that would cover their square edges are only 10..20 px wide. Wide
+    shouts are unaffected because their middle tile covers the overlap.
+
+Diagnostics in this build (all bounded; log_level = 0 silences them):
+  dlg:, bal:, df:/dfq:, bar:, hbar:, elbar:, fillrect:, gold:, page:, popup:
+
+Restore:
+  copy inotia4_nx.nro over <sdmc>/switch/inotia4/inotia4_nx.nro
+  copy config.ini       to   <sdmc>/switch/inotia4/config.ini
+  (font.ttf, 原机 DroidSansFallback, see the save-slot zip in snapshots/)

@@ -1651,6 +1651,28 @@ static const char *tctrl_lookup(void *ctrl) {
   return NULL;
 }
 
+/* The colour a text control carries at +0x14 is the word the engine hands
+ * straight to GRPX_SetFontColor (X_TEXTCTRL_DrawTextControl at 0x1447a8:
+ * ldr w0,[x20,#0x14]; bl GRPX_SetFontColor). It is packed the way the
+ * engine's own rasteriser reads it byte-wise, (a<<24)|(b<<16)|(g<<8)|r --
+ * X_TEXTCTRL_GetColorFromCode's table at 0xbb9c8 proves it: $R is 0xFF0000FF
+ * (red), $W is 0xFFFFFFFF, and the base colour $B / the default written by
+ * X_TEXTCTRL_InitTextControl is 0xFF000000 (opaque BLACK).
+ *
+ * text_draw_engine() wants 0xRRGGBBAA, so the two are byte-reversed relative
+ * to each other. White (0xFFFFFFFF) survives either reading, which is why
+ * almost every UI line looked right; black (0xFF000000) read as R=255,G=0,B=0
+ * and that is exactly why the NPC shouts -- black ink on a white balloon in
+ * the original -- came out bright red. */
+static unsigned tctrl_colour(void *ctrl) {
+  const unsigned raw = *(volatile unsigned *)((char *)ctrl + 0x14);
+  if ((raw & 0xff000000u) == 0xff000000u)
+    return __builtin_bswap32(raw);      /* 0xAABBGGRR -> 0xRRGGBBAA */
+  if (raw <= 0xffffffu)
+    return (raw << 8) | 0xffu;          /* 0xRRGGBB -> 0xRRGGBBAA */
+  return raw;
+}
+
 static void (*textctrl_destroy_real)(void *);
 static void nx_textctrl_destroy(void *ctrl) {
   tctrl_forget(ctrl);
@@ -1806,9 +1828,7 @@ static int desc_draw_block(void *ctrl, int x, int y) {
   if (!s || !*s || w < 100 || w > 420)
     return 0;
   const int px = cfg.text_px > 0 ? cfg.text_px : 20;
-  unsigned color = *(volatile unsigned *)((char *)ctrl + 0x14);
-  if (color <= 0xffffffu)
-    color = (color << 8) | 0xffu;
+  unsigned color = tctrl_colour(ctrl);
   /* the UI palette every control colour is read from is all zeroes in this
    * port, so "black" here means "no colour was ever stored" -- same rule as
    * the other text drawers */
@@ -2042,9 +2062,10 @@ static void nx_textctrl_draw(void *ctrl, int x, int y) {
   }
 
   const int align = *(volatile int *)((char *)ctrl + 0x0c);
-  unsigned color = *(volatile unsigned *)((char *)ctrl + 0x14);
-  if (color <= 0xffffffu)
-    color = (color << 8) | 0xffu;          /* 0xRRGGBB -> 0xRRGGBBAA */
+  /* Engine colour word -> the 0xRRGGBBAA our renderer takes. Do NOT apply
+   * text_colour() here: this control carries the real pen colour, and the
+   * balloons really are black ink on a white plate. */
+  unsigned color = tctrl_colour(ctrl);
 
   /* The description page is drawn over several controls in one frame (one per
    * level plus a comparison block), and only the first of them is the 358-wide
@@ -2061,6 +2082,16 @@ static void nx_textctrl_draw(void *ctrl, int x, int y) {
 
   const int px = cfg.text_px > 0 ? cfg.text_px : 20;
   const int box_w = *(volatile int *)((char *)ctrl + 0x04);
+  {
+    /* Confirmation that a shout's control really carries the engine's black
+     * 0xFF000000 and that we turned it into opaque black ink. */
+    static int ink_logs;
+    if (ink_logs < 10 && box_w > 0 && box_w <= 320 && y >= 240) {
+      ink_logs++;
+      debugPrintf("balloon ink: raw %08x -> %08x '%s'\n",
+                  *(volatile unsigned *)((char *)ctrl + 0x14), color, str);
+    }
+  }
   /* The popup's 410 is the OUTER box: the engine draws its text at rect + 20,
    * so the text area is 40 narrower. Wrapping at the full 410 fits 20
    * characters where the original fits 18 ("...命令：刺杀格里" / "普顿伯爵。"). */
@@ -4432,6 +4463,77 @@ void nx_glDrawElements(GLenum mode, GLsizei count, GLenum type,
     }
   }
   glDrawElements(mode, count, type, indices);
+}
+
+/* Every solid rectangle the engine draws leaves through SGL_grpFillRect
+ * (0x12b484): GRPX_FillRect, GRPX_FillRectAlpha and GRPX_FillRectRGBAlpha all
+ * tail-call it from 0x122568 / 0x122624 / 0x1226b0, and it submits one
+ * glDrawArrays(GL_TRIANGLE_STRIP, 0, 4) at 0x12b63c with the vertices
+ * (x,y)-(x+w,y+h). The tutorial hint's 60% black plate is exactly such a
+ * call -- its runtime return address is SGL_grpFillRect+0x1bc.
+ *
+ * The plain ("no exclamation mark") tips were never lifted: the GL-layer
+ * bar_expand below only sees quads whose GL_CURRENT_COLOR is black, and those
+ * tips reach the same rectangle through a tinted path. Fix it at the source
+ * of the rectangle instead. The engine's own text background asks for 0x22
+ * = 34 px (UI_DrawTextBackground, 0x143bdc passes w3=0x22 to
+ * GRPX_FillRectRGBAlpha), so 34 is the height the original draws; the hint
+ * plates are submitted at 20. */
+static void (*sgl_fillrect_real)(long, long, long, long, unsigned long);
+
+static void nx_sgl_fillrect(long x, long y, long w, long h,
+                            unsigned long color) {
+  const unsigned c = (unsigned)color;
+  {
+    /* Dedup by geometry+colour: one line per distinct plate, with the
+     * caller's vaddr so the next round never has to guess which function
+     * asked for a 20 px plate. */
+    static struct { long x, y, w, h; unsigned c; } seen[24];
+    static int n, logs;
+    if (logs < 60 && w > 200 && h >= 8 && h <= 60) {
+      int dup = 0;
+      for (int i = 0; i < n; i++)
+        if (seen[i].x == x && seen[i].y == y && seen[i].w == w &&
+            seen[i].h == h && seen[i].c == c) { dup = 1; break; }
+      if (!dup) {
+        const unsigned long ra =
+            (unsigned long)__builtin_return_address(0) -
+            (unsigned long)game_mod.load_virtbase;
+        if (n < (int)(sizeof(seen) / sizeof(*seen))) {
+          seen[n].x = x; seen[n].y = y; seen[n].w = w; seen[n].h = h;
+          seen[n].c = c; n++;
+        }
+        logs++;
+        debugPrintf("fillrect: %ld,%ld %ldx%ld col %08x caller 0x%lx\n",
+                    x, y, w, h, c, ra);
+      }
+    }
+  }
+  /* ONLY the 60% translucent BLACK hint plate, submitted at exactly 20 px.
+   * The engine packs its colour as 0xAA000000 -- log evidence:
+   *   fillrect: 80,152 977x20 col 99000000 caller 0x20c434   (tutorial hint)
+   *   fillrect: 0,152 1137x20 col 99000000 caller 0x1d83d0   (plain tip)
+   * A wider "short, wide, translucent" test was tried first and broke the
+   * quest page: its title bar is three 476x15/18/15 strips at y 164/179/197
+   * in brown (0xe5315069) and grey (0x7f6f6f6f). Growing and shifting those
+   * stacked a grey plate over the quest text. Pure black (RGB = 0) with a
+   * non-trivial alpha is the one property those strips do not share. */
+  const int black60 = ((c & 0x00ffffffu) == 0u) &&
+                      ((c >> 24) != 0u) && ((c >> 24) != 0xffu);
+  if (cfg.bar_h > 0 && h == 20 && w >= 200 && black60 &&
+      y >= 80 && y <= 280) {
+    static int fix_logs;
+    if (fix_logs < 12) {
+      fix_logs++;
+      debugPrintf("fillrect: hint plate %ld,%ld %ldx%ld -> h %d (col %08x)\n",
+                  x, y, w, h, cfg.bar_h, c);
+    }
+    const int grow = cfg.bar_h - (int)h;
+    y -= grow / 2;      /* grow around the plate's centre, as bar_expand does */
+    h = cfg.bar_h;
+  }
+  if (sgl_fillrect_real)
+    sgl_fillrect_real(x, y, w, h, color);
 }
 
 /* The tutorial hint's highlight bar, as the engine submits it:
@@ -6940,6 +7042,17 @@ int main(int argc, char **argv) {
     };
     so_set_overrides(strimg_overrides,
                      (int)(sizeof(strimg_overrides) / sizeof(*strimg_overrides)));
+  }
+  /* Same mechanism, for the solid-rectangle exit: keep the engine's own
+   * implementation around so nx_sgl_fillrect only changes the height. */
+  sgl_fillrect_real = (void (*)(long, long, long, long, unsigned long))
+      so_try_find_addr_rx(&game_mod, "SGL_grpFillRect");
+  {
+    static const so_override rect_overrides[] = {
+      { "SGL_grpFillRect", (void *)nx_sgl_fillrect },
+    };
+    so_set_overrides(rect_overrides,
+                     (int)(sizeof(rect_overrides) / sizeof(*rect_overrides)));
   }
   bridge_to_save_list = bridge_to_save_list_impl;
   so_set_overrides(flow_overrides,

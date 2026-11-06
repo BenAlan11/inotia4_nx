@@ -122,3 +122,21 @@
   已从索引移除（磁盘上仍在）；`.gitignore` 现在是通配 + 否定规则：
   `snapshots/known-good-*/inotia4_nx.nro`、`snapshots/save-slot-*.zip` 全忽略，
   再 `!` 放行 `1240` 的两个。
+
+## 引擎通用事实（后续非文字系统适配也会用到，2026-11-06）
+- **颜色字序**：引擎的 32 位颜色是 `(a<<24)|(b<<16)|(g<<8)|r`（内存字节序 RGBA，
+  证据 `X_TEXTCTRL_GetColorFromCode` 表 0xbb9c8：`$R`=0xFF0000FF、`$B`=0xFF000000）；
+  我们的 `text_draw_engine()` 吃 `0xRRGGBBAA`。文本控件 `+0x14` 交给
+  `GRPX_SetFontColor` 前必须 `__builtin_bswap32()`，否则黑色变红、金色变蓝。
+- **矩形出口**：`SGL_grpFillRect`(0x12b484) 是所有纯色填充的唯一出口
+  （`GRPX_FillRect`/`FillRectAlpha`/`FillRectRGBAlpha` 尾调用它），
+  在 0x12b63c 提交 `glDrawArrays(6,0,4)`。要改矩形几何/颜色，**优先 override
+  这个导出函数**（`so_set_overrides` + `so_try_find_addr_rx` 存 real），
+  不要在 `nx_glDrawArrays` 里按坐标/颜色猜 quad —— 会误伤文字 quad。
+  ⚠️ 即便在这一层，条件也要按**绘图签名**收窄：曾把「短+宽+半透明」当提示条，
+  结果命中任务页标题栏的三条 476x15/18/15（棕色 `e5315069`、灰 `7f6f6f6f`），
+  叠成灰块盖住文字。提示条的精确签名是 `h==20 && 纯黑半透明(0xAA000000)`。
+- **调试定位技巧**：`bar: quad ... ra <运行时地址>` 减去日志里的
+  `libgame.so: virt = 0x...` 就是调用点的 vaddr，再用 `tools/disas_at.py`
+  找最近导出符号；比反复改阈值猜测快得多。
+- 用户明确要求：**修复要靠读绘图逻辑，不要靠量坐标/猜阈值**。
