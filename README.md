@@ -543,6 +543,48 @@ y / colour in that strip) are what to read on the next run: the quad should stay
 `col 0.00 0.00 0.00 0.70` frame after frame, and the plate line should end in a
 light colour.
 
+### 2026-11-06: names, thoughts and the save rows
+
+Three colour decisions, all of them consequences of the engine's UI palette
+reading as zeroes here (`COLOR_Initialize` never runs), so the drawer has to
+decide every colour from what is being drawn.
+
+**The speaker's name in every dialogue layout.** `is_gold_text()` looked for the
+name in a y band (425..445). That band is the *tall* dialogue box, the one with a
+portrait: name at 434, body at 487. The plain bottom bar lays the same pair out at
+527/574, so `黑暗教团士兵` and `贝勒塞士兵` came out with the name font (big) but
+in white, while `凯恩` and `卓拉德` -- which appear in the tall box -- were gold.
+The rule is now positional only in the loose sense: a string drawn with font
+index 2 (the name font) that has a body line 0..160 px below it, in this frame or
+the one before. That is true for both layouts and for neither the character
+page's own name (nothing below it) nor the map banner.
+
+**Inner thoughts in grey.** `（嗯？什么声音？好像听到有人在说话…）` is drawn in
+`0xAAAAAA`. Measured off the original plate, the thought line is `#A4..` against
+the speech `#E7..` on the same background. The trigger is the first character
+(`（` U+FF08 or an ASCII `(`) on a line drawn in the dialogue area (y >= 400).
+
+**The save slots' map name.** It used to get the warm gold measured off the
+dialogue plate (`#FAC8A0`), which reads orange on the save page's blue-grey rows.
+The player asked for the character page's `#C6B992` instead. `is_gold_text()` now
+returns *which* gold a string gets:
+
+```
+enum { GOLD_NONE, GOLD_WARM, GOLD_COOL };
+```
+
+and the drawer just reads it, so the character page, the save rows and the
+dialogue can no longer drift apart the way they did when each call site derived
+"cool" for itself.
+
+**Balloons.** A short shout's control height was raised to 50 to make its
+nine-slice corners fit; that made the bubble visibly too tall, because the bubble
+is drawn from exactly that field. Reverted -- the measured height is used
+verbatim. The white plate behind a *short* shout is still open, see the snapshot's
+VERSION.txt: it is the four 35 px corner tiles of a nine-slice drawn into a 45 px
+box, and it only shows when the box is narrow enough that the middle tiles
+(10..20 px) cannot cover their square edges.
+
 ### 2026-11-06: the description panel's buttons
 
 The panel on the right of the skill and item windows draws its text fine but its
@@ -867,7 +909,8 @@ and one zip with the sources that produced it. Restoring a known state is
 
 | Snapshot | Build | NRO md5 | Verified for |
 |---|---|---|---|
-| `snapshots/known-good-20261106-1240/` + `save-slot-20261106-1240.zip` | 2026-11-06 12:37:57 | `294defaf72ff3b8b4e3dfa3c699eaead` | **current default**: everything below, plus the skill page's numbers and buttons: the value after `技能点:` is white again, and `学习` / `取消快捷键` (and the item page's description buttons) take the touch -- see *2026-11-06: the description panel's buttons* |
+| `snapshots/known-good-20261106-1905/` + `save-slot-20261106-1905.zip` | 2026-11-06 19:02:50 | `683ed6302f8af0c1a8267f02e616e695` | **current default**: everything below, plus the dialogue's speaker name in gold in *every* layout, inner thoughts in grey, and the save slots' map name in the character page's gold (#C6B992) -- see *2026-11-06: names, thoughts and the save rows* |
+| `snapshots/known-good-20261106-1240/` + `save-slot-20261106-1240.zip` | 2026-11-06 12:37:57 | `294defaf72ff3b8b4e3dfa3c699eaead` | everything below, plus the skill page's numbers and buttons: the value after `技能点:` is white again, and `学习` / `取消快捷键` (and the item page's description buttons) take the touch -- see *2026-11-06: the description panel's buttons* |
 | `snapshots/known-good-20261106-1213/` + `save-slot-20261106-1213.zip` | 2026-11-06 12:13:26 | `b6827148678568ff8967a4c4399dad4b` | the skill description page: it scrolls again (the finger travel drives the page's own scroll control), it is laid out as one text flow so the next-level block and the value comparison no longer overlap, and text controls longer than 256 bytes are no longer truncated (the blue `5秒` at the end of the first block) -- see *2026-11-06: the skill description page* |
 | `snapshots/known-good-20261105-1909/` + `save-slot-20261105-1909.zip` | 2026-11-05 19:04:15 | `c2d3533bf35a92b33747da80ba2089b5` | everything below, plus the quest popup laying its text out like the original (wrapped at the popup's own content width, colour runs carried across the wrap, `&N` as a hard break, `$A` red title, the control height that drives the popup's vertical layout) -- see *2026-11-05: the quest popup* |
 | `snapshots/known-good-20261105-1524/` + `save-slot-20261105-1524.zip` | 2026-11-05 15:17:01 | `912e55d61c6c0a0ad69e6069c4141153` | the gold text system (dialogue name and character page, sized from the engine's font index), one baseline per size, the save slot's map name gold and the shop button no longer freezing |

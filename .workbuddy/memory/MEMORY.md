@@ -69,11 +69,20 @@
   若落点在说明面板矩形内、且**不在滚动视口内**，手动转发 0x17/0x18/0x19 给面板。
   视口必须排除（否则引擎拖动 + 我们的滚动 = 双倍速）。日志标记 `ui: desc panel ... forwarded`。
 
-## 已知良好基线（2026-11-06 12:40，当前默认）
-- `build/inotia4_nx.nro` md5 `294defaf72ff3b8b4e3dfa3c699eaead`，build 12:37:57，9154679 字节
-- 快照：`snapshots/known-good-20261106-1240/`（NRO + VERSION.txt + config.ini）
-  + `snapshots/save-slot-20261106-1240.zip`（35 文件：src/README/config/tools/记忆/NRO/font.ttf）
-- 用户实测：说明页可拖、三块不重叠、技能点数值白、两个按钮都能按
+## 已知良好基线（2026-11-06 19:05，当前默认）
+- `build/inotia4_nx.nro` md5 `683ed6302f8af0c1a8267f02e616e695`，build 19:02:50，9158775 字节
+- 快照：`snapshots/known-good-20261106-1905/`（NRO + VERSION.txt + config.ini）
+  + `snapshots/save-slot-20261106-1905.zip`（35 文件：src/README/config/tools/记忆/NRO/font.ttf）
+- 用户实测：对话说话人名字全版式金色、括号心里话灰、存档页地图名 #C6B992
+- 上一版 1240（说明页滚动/排版/按钮）仍是历史记录，NRO 已不放进仓库
+
+## 对话文字颜色判定（2026-11-06）
+- `is_gold_text()` 返回 **GOLD_WARM / GOLD_COOL**，抽屉只读这个值：
+  - COOL `#C6B992`：角色页标签/名字块、存档行地图名
+  - WARM `#FAC8A0`：对话说话人、能力点/技能点
+- 说话人名字靠**关系**判定：字体 index 2 且下方 0..160px 内有正文行（两种版式都适用）
+- 括号 `（`/`(` 开头的正文行 → `0xAAAAAA`（心里话）
+- ⚠️ 气泡控件高度**不要改**：气泡底板就按这个高度画，改高会让气泡视觉变大
 
 ## GitHub 备份（2026-11-04）
 - 本地已 `git init`（分支 main），一个提交 `960ef85`，375 文件 / 58MB：

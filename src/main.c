@@ -308,6 +308,34 @@ static int colour_array_rgba(unsigned *out);
  * decides the colour from what is being drawn. */
 /* frame in which the dialogue body was last drawn (see is_gold_text) */
 static unsigned g_dialog_body_frame;
+/* where that body line sits, and where the last name-font string was drawn.
+ * The dialogue's two layouts put the pair in different places (the plain bottom
+ * bar has the name at ~527 and the body at ~574, the one with a portrait at
+ * ~434 / ~487), so the name is recognised by sitting just above the body
+ * rather than by a fixed y band -- the band is what left 黑暗教团士兵 and
+ * 贝勒塞士兵 big and white while 凯恩 was gold. */
+/* bumped once per main-loop pass; times the duplicate-push guard and the
+ * "is this string from this frame" decisions */
+static unsigned g_frame_no;
+
+static int g_dialog_body_y;
+/* The battle speech balloon is a small text control (X_TEXTCTRL) low on the
+ * screen: remember where the last one was drawn so the quad probe can look at
+ * exactly that patch of the frame (see the "bal:" lines). */
+static int g_balloon_x, g_balloon_y, g_balloon_w;
+/* The next N draw calls are dumped once (see the "df:"/"dfq:" lines): the
+ * balloon's extra plate is somewhere in that list, and a complete inventory is
+ * the only way to see which piece is a plain rectangle slightly larger than the
+ * bubble. A countdown, not a frame number: the frame the balloon is drawn in is
+ * not the frame our counter thinks it is. */
+static int g_dump_left, g_dump_armed;
+static unsigned g_balloon_frame;
+static int g_dialog_name_y;
+static unsigned g_dialog_name_frame;
+/* which gold a string gets: the warm one measured off the dialogue plate, or the
+ * cooler #C6B992 the character page and the save rows use */
+enum { GOLD_NONE = 0, GOLD_WARM = 1, GOLD_COOL = 2 };
+static int g_gold_kind;
 static void (*net_store_set_state)(long);
 /* both are kept only so the log can show the state; nothing forces them */
 static void (*fn_hub_cb)(void *env, void *thiz, void *json, long a, long b);
@@ -1225,6 +1253,85 @@ static long batch_x0, batch_y0, batch_x1, batch_y1;
  * logging below needs the real meaning. */
 static void drawpart_logged(void *tex, long x, long y, long p3, long p4,
                             long w, long h, long p7, long p8) {
+  if (g_dump_left > 0) {
+    g_dump_left--;
+    debugPrintf("df: f%u tex %p dst %ld,%ld %ldx%ld src %ld,%ld\n", g_frame_no,
+                tex, x, y, w, h, p3, p4);
+  }
+  /* The balloon's art is rasterised in software, not submitted as a quad, so the
+   * "bal:" probe cannot see it. Log the pieces that land on the balloon's own
+   * control rect -- the nine-slice that paints the extra white plate has to be
+   * one of them, and its src rect says whether the atlas coordinates are the
+   * reason it comes out as a flat block. */
+  if (g_balloon_frame && g_frame_no - g_balloon_frame <= 2) {
+    static struct { long x, y, w, h, sx, sy; } bseen[16];
+    static int bn2, bd_logs;
+    if (bd_logs < 40 && x + w > g_balloon_x - 140 &&
+        x < g_balloon_x + g_balloon_w + 140 && y + h > g_balloon_y - 90 &&
+        y < g_balloon_y + 90) {
+      int dup = 0;
+      for (int i = 0; i < bn2; i++)
+        if (bseen[i].x == x && bseen[i].y == y && bseen[i].w == w &&
+            bseen[i].h == h && bseen[i].sx == p3 && bseen[i].sy == p4) {
+          dup = 1;
+          break;
+        }
+      if (!dup) {
+        if (bn2 < (int)(sizeof(bseen) / sizeof(*bseen))) {
+          bseen[bn2].x = x; bseen[bn2].y = y; bseen[bn2].w = w;
+          bseen[bn2].h = h; bseen[bn2].sx = p3; bseen[bn2].sy = p4;
+          bn2++;
+        }
+        bd_logs++;
+        debugPrintf("dq: tex %p dst %ld,%ld %ldx%ld src %ld,%ld (box %d,%d %dw)\n",
+                    tex, x, y, w, h, p3, p4, g_balloon_x, g_balloon_y,
+                    g_balloon_w);
+      }
+    }
+  }
+  /* The short tips ("部分技能或道具需要…") may not be a vertex quad at all --
+   * bar_expand never fires for them, so the height stays at 20. Log any software
+   * piece that lands in the same strip: if the bar comes through here, its height
+   * has to be changed in this function instead. */
+  {
+    static struct { long x, y, w, h; } hseen[8];
+    static int hn, hb_logs;
+    /* A bar drawn as a nine-slice arrives as several narrow pieces, so the
+     * filter cannot ask for the full width. 60 px wide, in the strip. */
+    if (hb_logs < 40 && w > 60 && y > 120 && y < 230) {
+      int dup = 0;
+      for (int i = 0; i < hn; i++)
+        if (hseen[i].x == x && hseen[i].y == y && hseen[i].w == w &&
+            hseen[i].h == h) {
+          dup = 1;
+          break;
+        }
+      if (!dup) {
+        if (hn < (int)(sizeof(hseen) / sizeof(*hseen))) {
+          hseen[hn].x = x; hseen[hn].y = y; hseen[hn].w = w; hseen[hn].h = h;
+          hn++;
+        }
+        hb_logs++;
+        debugPrintf("hbar: tex %p dst %ld,%ld %ldx%ld src %ld,%ld\n", tex, x, y,
+                    w, h, p3, p4);
+      }
+    }
+  }
+  /* A destination rect with a negative side is not art: it is a nine-slice
+   * asked to fit a box smaller than its own corners (the balloon is 35 px tall
+   * with 35 px corners, so the middle rows come out as 35x-25). The software
+   * blitter turns that into a filled patch, which is the extra white plate the
+   * player sees behind a battle shout. Dropping those pieces leaves the corner
+   * art untouched. */
+  if (w <= 0 || h <= 0) {
+    static int neg_logs;
+    if (neg_logs < 8) {
+      neg_logs++;
+      debugPrintf("dq: dropped degenerate piece dst %ld,%ld %ldx%ld\n", x, y, w,
+                  h);
+    }
+    return;
+  }
   if (cfg.draw_log && g_draw_frame >= (unsigned)cfg.draw_log_frame) {
     drawpart_calls++;
     if (drawpart_calls <= (unsigned)cfg.draw_log)
@@ -1389,8 +1496,8 @@ static int textctrl_logs;
  * original text is gone (reading +0x20 as a string gave 5 bytes of image
  * header, which is why the boxes came out as tofu). Keep a copy of the text
  * when it is set, and draw from that copy. */
-/* bumped once per main-loop pass; times the duplicate-push guard */
-static unsigned g_frame_no;
+/* bumped once per main-loop pass; times the duplicate-push guard
+ * (defined up with the other frame globals so the early probes can use it) */
 
 /* ---- what our own drawers have already put on screen -------------------- */
 /* The engine asks for a string image of a line once the typewriter has
@@ -1587,7 +1694,7 @@ static void nx_textctrl_set(void *ctrl, const char *text, int len, int a3,
    * short string on a wide control from being treated as a narrow box. The
    * height is refreshed on every set, because the same control carries a
    * different description for every skill the player selects. */
-  if (ctrl && probe_mem_ok(ctrl, 0x24) && text && *text && len >= 100 &&
+  if (ctrl && probe_mem_ok(ctrl, 0x24) && text && *text && len >= 40 &&
       len <= 420 && *(volatile int *)((char *)ctrl + 4) == len) {
     const int px = cfg.text_px > 0 ? cfg.text_px : 20;
     const int wrap_w = (len == 410) ? len - 40 : len;   /* see nx_textctrl_draw */
@@ -1600,6 +1707,11 @@ static void nx_textctrl_set(void *ctrl, const char *text, int len, int a3,
           lines++;
     }
     const int lh = px * 13 / 10;
+    /* KEEP THIS THE MEASURED HEIGHT. Raising it for the balloons (a 70 px box
+     * would fit their 35 px nine-slice corners without overlap) made them
+     * visibly too tall -- the bubble is drawn from this field, so the box is
+     * what the player sees. The white plate behind a short shout is handled at
+     * the draw site instead (see the nine-slice note in drawpart_logged). */
     *(volatile int *)((char *)ctrl + 8) = lines * lh;
     {
       static int set_logs;
@@ -1982,6 +2094,20 @@ static void nx_textctrl_draw(void *ctrl, int x, int y) {
   else if (align == 1)
     dx -= w;
 
+  if (box_w > 0 && box_w <= 320 && y >= 240) {
+    g_balloon_x = dx;
+    g_balloon_y = y;
+    g_balloon_w = box_w;
+    g_balloon_frame = g_frame_no;
+    /* Armed from a *short* shout ("杀了他"): the white plate only shows up
+     * when the bubble is small, so a dump taken from a long one is useless. */
+    if (!g_dump_armed && box_w <= 110) {
+      g_dump_armed = 1;
+      g_dump_left = 700;
+      debugPrintf("dump: armed for short balloon box %d at %d,%d\n", box_w, dx,
+                  y);
+    }
+  }
   {
     /* What each popup control wraps to: the box width the engine gave it, the
      * line count, and the wrapped text with '|' for the breaks. Keyed on the
@@ -2149,6 +2275,40 @@ static unsigned long (*sub_str_real)(unsigned long, unsigned long,
  * The engine's version renders each glyph through the Android font object, so
  * with no Java behind it every line came out blank while the 确认 label (drawn
  * from the game's own font.fnt atlas) showed up fine. */
+/* Bounded dump of what the dialogue area is handed: the raw string, colour
+ * codes included, for every distinct y -- logged again whenever the line grows,
+ * because the body is typed out and the only version that matters is the last
+ * one. It is how "should 少年 be red?" gets answered from the data instead of
+ * from the picture: a "$R" in the string means the emphasis is ours to draw. */
+static void dlg_probe(const char *who, const char *s, int x, int y, int px,
+                      unsigned col) {
+  static struct { int y; unsigned n; } rows[16];
+  static int n;
+  static int logs;
+  if (y < 380 || !s || !*s || logs >= 60)
+    return;
+  const unsigned len = (unsigned)strlen(s);
+  int i;
+  for (i = 0; i < n; i++)
+    if (rows[i].y == y)
+      break;
+  if (i < n) {
+    const int grew = len >= rows[i].n + 6;
+    const int code = strchr(s, '$') && len != rows[i].n;
+    if (!grew && !code)
+      return;
+    rows[i].n = len;
+  } else if (n < (int)(sizeof(rows) / sizeof(*rows))) {
+    rows[n].y = y;
+    rows[n].n = len;
+    n++;
+  } else {
+    return;
+  }
+  logs++;
+  debugPrintf("dlg: %s y%d x%d px%d col %08x '%s'\n", who, y, x, px, col, s);
+}
+
 static unsigned long nx_sub_string(unsigned long a0, unsigned long a1,
                                    unsigned long a2, unsigned long a3,
                                    unsigned long a4, unsigned long a5,
@@ -2181,8 +2341,28 @@ static unsigned long nx_sub_string(unsigned long a0, unsigned long a1,
                    ((unsigned)(cc[1] * 255.0f) << 16) |
                    ((unsigned)(cc[2] * 255.0f) << 8) | 0xffu;
   color = text_colour(color);
-  if ((int)a3 >= 470 && (int)a3 <= 500)
-    g_dialog_body_frame = g_frame_no;
+  /* Inner thoughts are written in parentheses and the original draws the whole
+   * line dimmer than speech (#A4.. measured off the plate against the body's
+   * #E7..); the port painted both white. Only the dialogue is affected -- a
+   * stat row never starts with a bracket. */
+  if ((int)a3 >= 400 &&
+      (((unsigned char)str[0] == 0xEF && (unsigned char)str[1] == 0xBC &&
+        (unsigned char)str[2] == 0x88) ||          /* （ U+FF08 */
+       (str[0] == '(' && str[1]))) {
+    color = 0xAAAAAAFFu;
+  }
+  /* Any line this low is dialogue body text. It used to be only the 470..500
+   * band, which is the layout with a portrait -- the plain bottom bar puts the
+   * body at ~574, so nothing below it was ever recognised. */
+  if ((int)a3 >= 400) {
+    if (g_dialog_body_frame != g_frame_no) {
+      g_dialog_body_frame = g_frame_no;
+      g_dialog_body_y = (int)a3;
+    } else if ((int)a3 < g_dialog_body_y) {
+      g_dialog_body_y = (int)a3;
+    }
+  }
+  dlg_probe("sub", str, (int)a2, (int)a3, px, color);
   plate_probe("sub", str, (int)a2, (int)a3, color);
 
   if (sub_logs < 60) {
@@ -4198,6 +4378,45 @@ static unsigned frame_draw_index;
  * Log it the same way as glDrawArrays. */
 void nx_glDrawElements(GLenum mode, GLsizei count, GLenum type,
                        const void *indices) {
+  /* The hint bar is not submitted through glDrawArrays -- neither probe ever saw
+   * it -- so the indexed path is watched as well. Same geometry filter as the
+   * array probe: a wide quad in the strip the hint bars live in. */
+  if (count >= 3 && count <= 64 && vptr) {
+    static int el_bar_logs;
+    if (el_bar_logs < 40) {
+      const int comps = vsize > 1 ? vsize : 2;
+      const int vsz = (vtype == GL_SHORT) ? 2 : 4;
+      const int vstep = vstride ? vstride : comps * vsz;
+      float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+      /* indexed draws only have `count` vertices to look at */
+      for (GLsizei i = 0; i < count; i++) {
+        const unsigned char *q =
+            (const unsigned char *)vptr + (size_t)i * vstep;
+        float vx = 0, vy = 0;
+        if (vtype == GL_FLOAT) { vx = ((const float *)q)[0]; vy = ((const float *)q)[1]; }
+        else if (vtype == GL_SHORT) { vx = ((const short *)q)[0]; vy = ((const short *)q)[1]; }
+        else if (vtype == GL_FIXED) { vx = (float)((const int32_t *)q)[0]/65536.0f; vy = (float)((const int32_t *)q)[1]/65536.0f; }
+        else { vx = (float)((const int32_t *)q)[0]; vy = (float)((const int32_t *)q)[1]; }
+        if (vx < x0) x0 = vx;
+        if (vx > x1) x1 = vx;
+        if (vy < y0) y0 = vy;
+        if (vy > y1) y1 = vy;
+      }
+      if (x1 - x0 > 200.0f && x1 - x0 < 1120.0f && y0 > 120.0f &&
+          y1 < 230.0f) {
+        GLint bt = 0;
+        GLfloat c[4] = { 0, 0, 0, 0 };
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt);
+        glGetFloatv(GL_CURRENT_COLOR, c);
+        el_bar_logs++;
+        debugPrintf("elbar: quad %.0f,%.0f-%.0f,%.0f tex %d %s col %.2f %.2f "
+                    "%.2f %.2f blend %d n=%d\n",
+                    x0, y0, x1, y1, (int)bt,
+                    text_is_our_texture((unsigned)bt) ? "OURS" : "engine", c[0],
+                    c[1], c[2], c[3], (int)glIsEnabled(GL_BLEND), (int)count);
+      }
+    }
+  }
   if (cfg.gl_probe && count >= 3 && count <= 64) {
     static int el_logs;
     if (el_logs < 400) {
@@ -4246,8 +4465,13 @@ static int bar_expand(GLenum mode, GLint first, GLsizei count) {
     if (vy > y1) y1 = vy;
   }
   const float w = x1 - x0, h = y1 - y0, cy = (y0 + y1) * 0.5f;
-  if (w < 780.0f || w > 1080.0f || h < 8.0f || h > 40.0f || cy < 120.0f ||
-      cy > 220.0f)
+  /* The bar is sized to its line, so its width is not a constant: the tutorial's
+   * "!" hint spans 80..1057 (977 px) while the plain tips are ~600 px. Keying on
+   * the wide one left every shorter hint at the engine's 20 px height. What does
+   * not vary is the strip it lives in (cy 120..220) and the colour, which the
+   * caller checks below. */
+  if (w < 250.0f || w > 1080.0f || h < 8.0f || h > 40.0f || cy < 90.0f ||
+      cy > 230.0f)
     return 0;
   GLfloat col[4] = { 1, 1, 1, 1 };
   glGetFloatv(GL_CURRENT_COLOR, col);
@@ -4260,7 +4484,7 @@ static int bar_expand(GLenum mode, GLint first, GLsizei count) {
   }
   glVertexPointer(2, GL_FLOAT, 0, bar_verts);
   static int logs;
-  if (logs < 4) {
+  if (logs < 12) {
     logs++;
     debugPrintf("bar: expanded %.0f,%.0f-%.0f,%.0f to height %d\n", x0, y0, x1,
                 y1, cfg.bar_h);
@@ -4280,9 +4504,40 @@ void nx_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
    * the line's y, and knowing which engine call submits it (and with what
    * rectangle) is the only way to place the text inside it instead of guessing
    * pixel offsets. Cheap: only matching quads print. */
+  if (g_dump_left > 0 && count >= 3 && count <= 64 && vptr) {
+    {
+      g_dump_left--;
+      const int comps = vsize > 1 ? vsize : 2;
+      const int vsz = (vtype == GL_SHORT) ? 2 : 4;
+      const int vstep = vstride ? vstride : comps * vsz;
+      float qx0 = 1e9f, qy0 = 1e9f, qx1 = -1e9f, qy1 = -1e9f;
+      for (GLsizei i = 0; i < count; i++) {
+        const unsigned char *q = (const unsigned char *)vptr + (size_t)(first + i) * vstep;
+        float qx = 0, qy = 0;
+        if (vtype == GL_FLOAT) { qx = ((const float *)q)[0]; qy = ((const float *)q)[1]; }
+        else if (vtype == GL_SHORT) { qx = ((const short *)q)[0]; qy = ((const short *)q)[1]; }
+        else if (vtype == GL_FIXED) { qx = (float)((const int32_t *)q)[0]/65536.0f; qy = (float)((const int32_t *)q)[1]/65536.0f; }
+        else { qx = (float)((const int32_t *)q)[0]; qy = (float)((const int32_t *)q)[1]; }
+        if (qx < qx0) qx0 = qx;
+        if (qx > qx1) qx1 = qx;
+        if (qy < qy0) qy0 = qy;
+        if (qy > qy1) qy1 = qy;
+      }
+      GLint bt4 = 0;
+      GLfloat c4[4] = { 0, 0, 0, 0 };
+      glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt4);
+      glGetFloatv(GL_CURRENT_COLOR, c4);
+      debugPrintf("dfq: f%u %.0f,%.0f %.0fx%.0f tex %d %s col %.2f %.2f %.2f %.2f "
+                  "blend %d n=%d\n",
+                  qx0, qy0, qx1 - qx0, qy1 - qy0, (int)bt4,
+                  text_is_our_texture((unsigned)bt4) ? "OURS" : "engine",
+                  c4[0], c4[1], c4[2], c4[3], (int)glIsEnabled(GL_BLEND),
+                  (int)count);
+    }
+  }
   if (count >= 3 && count <= 64 && vptr) {
     static int bar_logs;
-    if (bar_logs < 24) {
+    if (bar_logs < 60) {
       const int comps = vsize > 1 ? vsize : 2;
       const int vsz = (vtype == GL_SHORT) ? 2 : 4;
       const int vstep = vstride ? vstride : comps * vsz;
@@ -4320,16 +4575,67 @@ void nx_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
                       (int)glIsEnabled(GL_BLEND));
         }
       }
-      if (x1 - x0 > 780.0f && x1 - x0 < 1080.0f && y0 > 100.0f && y1 < 260.0f) {
-        bar_logs++;
+      /* The battle speech balloon gets an extra white plate behind it, and the
+       * plate's size is what says where it comes from: the balloon's own art is
+       * wider than the text box, an atlas quad is exactly the text line. Every
+       * quad intersecting the balloon's control rect prints once, with its
+       * texture and colour -- "OURS" would mean our glyph atlas, "engine" the
+       * balloon's own nine-slice. */
+      if (g_balloon_frame && g_frame_no - g_balloon_frame <= 2) {
+        static struct { int x, y, w, h, t; } seen[24];
+        static int bn, bal_logs;
+        const float bx0 = (float)(g_balloon_x - 130);
+        const float bx1 = (float)(g_balloon_x + g_balloon_w + 130);
+        const float by0 = (float)(g_balloon_y - 80);
+        const float by1 = (float)(g_balloon_y + 80);
+        if (bal_logs < 60 && x1 > bx0 && x0 < bx1 && y1 > by0 && y0 < by1) {
+          GLint bt3 = 0;
+          GLfloat c3[4] = { 0, 0, 0, 0 };
+          glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt3);
+          glGetFloatv(GL_CURRENT_COLOR, c3);
+          const int bw = (int)(x1 - x0), bh = (int)(y1 - y0);
+          int dup = 0;
+          for (int i = 0; i < bn; i++)
+            if (seen[i].x == (int)x0 && seen[i].y == (int)y0 &&
+                seen[i].w == bw && seen[i].h == bh && seen[i].t == (int)bt3) {
+              dup = 1;
+              break;
+            }
+          if (!dup) {
+            if (bn < (int)(sizeof(seen) / sizeof(*seen))) {
+              seen[bn].x = (int)x0;
+              seen[bn].y = (int)y0;
+              seen[bn].w = bw;
+              seen[bn].h = bh;
+              seen[bn].t = (int)bt3;
+              bn++;
+            }
+            bal_logs++;
+            debugPrintf("bal: quad %.0f,%.0f %.0fx%.0f tex %d %s col %.2f "
+                        "%.2f %.2f %.2f blend %d n=%d (box %d,%d %dw)\n",
+                        x0, y0, x1 - x0, y1 - y0, (int)bt3,
+                        text_is_our_texture((unsigned)bt3) ? "OURS" : "engine",
+                        c3[0], c3[1], c3[2], c3[3], (int)glIsEnabled(GL_BLEND),
+                        count, g_balloon_x, g_balloon_y, g_balloon_w);
+          }
+        }
+      }
+      /* The strip the hint bars live in, by geometry only: the bar may be a
+       * dark *texture* rather than a black colour, and a colour test would then
+       * reject exactly the case that is being chased. y 130..210 keeps the list
+       * rows (y 216+) out. */
+      if (x1 - x0 > 200.0f && x1 - x0 < 1100.0f && y0 > 80.0f &&
+          y1 < 240.0f) {
         GLint bt = 0;
         GLfloat c[4] = { 0, 0, 0, 0 };
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt);
         glGetFloatv(GL_CURRENT_COLOR, c);
-        debugPrintf("bar: quad %.0f,%.0f-%.0f,%.0f tex %d col %.2f %.2f %.2f "
+        bar_logs++;
+        debugPrintf("bar: quad %.0f,%.0f-%.0f,%.0f tex %d %s col %.2f %.2f %.2f "
                     "%.2f blend %d ra %p\n",
-                    x0, y0, x1, y1, (int)bt, c[0], c[1], c[2], c[3],
-                    (int)glIsEnabled(GL_BLEND),
+                    x0, y0, x1, y1, (int)bt,
+                    text_is_our_texture((unsigned)bt) ? "OURS" : "engine",
+                    c[0], c[1], c[2], c[3], (int)glIsEnabled(GL_BLEND),
                     __builtin_return_address(0));
       }
     }
@@ -5783,35 +6089,49 @@ static int is_char_label(const char *s) {
 }
 
 static int is_gold_text(const char *s, int x, int y) {
+  g_gold_kind = GOLD_NONE;
   if (is_char_label(s)) {
     g_char_page_frame = g_frame_no;
+    g_gold_kind = GOLD_COOL;             /* the character page's #C6B992 */
     return 1;
   }
   /* 能力点:0 / 技能点:0: the pair at the top right of the page is gold, the
    * pair under the portrait sits on a light bar and is black there (handled by
    * the drawer, which returns early for those). */
-  if ((!strncmp(s, "能力点", 9) || !strncmp(s, "技能点", 9)) && x >= 550)
+  if ((!strncmp(s, "能力点", 9) || !strncmp(s, "技能点", 9)) && x >= 550) {
+    g_gold_kind = GOLD_WARM;
     return 1;
+  }
   /* The character page's name block (Lv / class / name) is gold too, but the
    * in-game map name banner is drawn at almost the same place -- (498,294)
    * against (505,228)/(466,253)/(506,283) -- and must stay white, so the block
    * stops just above it. */
-  if (x >= 430 && x <= 620 && y >= 195 && y <= 288)
+  if (x >= 430 && x <= 620 && y >= 195 && y <= 288) {
+    g_gold_kind = GOLD_COOL;
     return 1;
+  }
   /* the save slot's map name: third text line of a row (rows at 90/256/422),
    * in the row's own text column -- the character page's stat values sit at
-   * x ~750 on the same heights and must stay white. */
+   * x ~750 on the same heights and must stay white. The player asked for the
+   * same gold as the character page here (#C6B992), not the warm dialogue one. */
   if (x > 600 && x < 800 &&
-      (abs(y - 181) <= 8 || abs(y - 347) <= 8 || abs(y - 513) <= 8))
+      (abs(y - 181) <= 8 || abs(y - 347) <= 8 || abs(y - 513) <= 8)) {
+    g_gold_kind = GOLD_COOL;
     return 1;
-  /* the dialogue speaker's name: only while a body line is on screen */
-  if (y >= 425 && y <= 445 && x <= 900 && g_frame_no - g_dialog_body_frame <= 2) {
+  }
+  /* the dialogue speaker's name: a name-font string with the body drawn a line
+   * or two below it, in this frame or the one before (the body is typed out, so
+   * both are redrawn every frame). See g_dialog_body_y. */
+  if (g_dialog_name_frame == g_frame_no && y == g_dialog_name_y && x <= 900 &&
+      g_dialog_body_frame + 2 >= g_frame_no && g_dialog_body_y > y &&
+      g_dialog_body_y - y <= 160) {
     const size_t n = strlen(s);
-    if (n == 0 || n > 15)
+    if (n == 0 || n > 24)
       return 0;
     for (size_t i = 0; i < n; i++)
       if (s[i] >= '0' && s[i] <= '9')
         return 0;
+    g_gold_kind = GOLD_WARM;             /* #FAC8A0 off the dialogue plate */
     return 1;
   }
   return 0;
@@ -6015,8 +6335,17 @@ static unsigned long nx_grpx_draw_string(unsigned long a0, unsigned long a1,
   } else if ((int)a4 == 2) {
     px = px * 2;                         /* cfg.text_px still pins the body size */
   }
+  /* The name font (index 2) is used by the dialogue speaker and by the
+   * character page's own name; remember where this one landed so is_gold_text
+   * can tell whether a body line sits right below it. */
+  if ((int)a4 == 2) {
+    g_dialog_name_y = (int)a2;
+    g_dialog_name_frame = g_frame_no;
+  }
   const int gold = is_gold_text(str, (int)a1, (int)a2);
-  const int dialog_name = gold && (int)a2 >= 425 && (int)a2 <= 445;
+  const int dialog_name = gold && g_gold_kind == GOLD_WARM &&
+                          g_dialog_name_frame == g_frame_no &&
+                          (int)a2 == g_dialog_name_y;
 
   GLfloat cc[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
   glGetFloatv(GL_CURRENT_COLOR, cc);
@@ -6043,6 +6372,7 @@ static unsigned long nx_grpx_draw_string(unsigned long a0, unsigned long a1,
    * put 力量's number in place but also dragged DEF and M.DMG out of the value
    * column on the character page.) */
   const int draw_x = align_x(str, -1, (int)a1, (int)a3, px);
+  dlg_probe("grpx", str, draw_x, (int)a2, px, color);
   /* The skill page's title bar ("技能点: 0") is drawn in this band; its value
    * is what the player says is unreadable, so record the colour the drawer is
    * handed for anything short drawn up there. */
@@ -6073,11 +6403,10 @@ static unsigned long nx_grpx_draw_string(unsigned long a0, unsigned long a1,
   } else if (gold) {
     static int name_logs;
     /* The character page's panel is blue-grey, so the warm #FAC8A0 measured off
-     * the original dialogue plate reads reddish on it; that page gets a cooler,
-     * darker gold instead (#C6B992 on screen). */
-    const int cool = is_char_label(str) ||
-                     ((int)a1 >= 430 && (int)a1 <= 620 &&
-                      (int)a2 >= 195 && (int)a2 <= 292);
+     * the original dialogue plate reads reddish on it; that page -- and the save
+     * rows' map name -- gets the cooler, darker gold instead (#C6B992 on
+     * screen). is_gold_text decides which, so the two can never drift apart. */
+    const int cool = (g_gold_kind == GOLD_COOL);
     /* #FAC8A0 measured off the Android screenshot, packed the way text.c wants
      * it: that renderer stores each texel as (a<<24)|(r<<16)|(g<<8)|b in a
      * little-endian uint32, so the bytes it uploads are B,G,R,A and the red and

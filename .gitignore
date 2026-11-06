@@ -48,5 +48,5 @@ tmp_*.py
 snapshots/known-good-*/inotia4_nx.nro
 snapshots/save-slot-*.zip
 snapshots/save-fix-*.zip
-!snapshots/known-good-20261106-1240/inotia4_nx.nro
-!snapshots/save-slot-20261106-1240.zip
+!snapshots/known-good-20261106-1905/inotia4_nx.nro
+!snapshots/save-slot-20261106-1905.zip

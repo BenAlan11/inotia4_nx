@@ -1,0 +1,53 @@
+Inotia 4 for Nintendo Switch -- known good snapshot
+
+build stamp : 2026-11-06 19:02:50
+nro md5     : 683ed6302f8af0c1a8267f02e616e695
+nro size    : 9158775 bytes
+config      : config.prod.ini (bar_h = 34, log_level = 1, string_draw = 1)
+verified    : 2026-11-06 19:05 by play testing
+
+Changes since 20261106-1240:
+
+  * the dialogue speaker's name is gold in every dialogue layout, not only in
+    the one with a portrait. is_gold_text() used to look for a name at y 425..445
+    -- that is the tall box (name 434, body 487); the plain bottom bar puts the
+    same pair at 527/574, so 黑暗教团士兵 and 贝勒塞士兵 were drawn with the name
+    font but in white. The name is now recognised by the relation instead: a
+    string drawn with font index 2 (the name font) with a body line between 0 and
+    160 px below it, in this frame or the one before.
+
+  * inner thoughts are grey. A dialogue body line that starts with "（" is drawn
+    in 0xAAAAAA instead of white, which is what the original does (measured #A4..
+    against the speech #E7.. on the same plate).
+
+  * the save slots' map name uses the character page's gold (#C6B992) instead of
+    the warm dialogue gold (#FAC8A0). is_gold_text() now returns which of the two
+    a string gets (GOLD_WARM / GOLD_COOL) instead of the caller re-deriving it,
+    so the two can no longer drift apart.
+
+  * balloons keep the height they always had. Raising a short balloon's control
+    height (a 70 px box would fit its 35 px nine-slice corners) made the bubble
+    visibly too tall, so the measured height is used verbatim again.
+
+Known open items (both are engine-side art, not port code):
+
+  * a SHORT battle shout ("杀了他") shows a white plate behind the bubble, its
+    four corners sticking out. The balloon background is a nine-slice with 35 px
+    corners drawn into a 160x45 box: the corners overlap by 25 px and the middle
+    tiles that would cover their square edges are only 10..20 px wide. Wide
+    shouts are unaffected because their middle tile covers the overlap.
+
+  * the plain tips (no "!" icon, e.g. "从掉在地上的道具上方走过…") keep their own
+    box height. That box is NOT the tutorial hint's black quad, so bar_h does not
+    reach it: TIPBOX_Draw (0x1dd050) draws only the string, and the gold-bordered
+    box comes from UI_DrawBorderRect (0x14314c), which takes its height as a
+    parameter and is dispatched through a function-pointer table (0x24c48) with
+    no static call site to hook.
+
+Diagnostics in this build (all bounded; log_level = 0 silences them):
+  dlg:, bal:, df:/dfq: (one shot), bar:, hbar:, elbar:, dump: armed ...
+
+Restore:
+  copy inotia4_nx.nro over <sdmc>/switch/inotia4/inotia4_nx.nro
+  copy config.ini       to   <sdmc>/switch/inotia4/config.ini
+  (font.ttf, 原机 DroidSansFallback, see the save-slot zip in snapshots/)
