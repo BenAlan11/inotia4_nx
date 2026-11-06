@@ -1,0 +1,17 @@
+Inotia 4 for Nintendo Switch -- known good snapshot
+
+build stamp : 2026-11-05 09:27:40
+nro md5     : 792f3671d9db0f9279150d50b7dfb270
+nro size    : 9060471 bytes
+config      : config.prod.ini with bar_h = 34
+verified    : 2026-11-05 09:45
+
+Changes since 20261104-2211:
+  * the tutorial hint's black highlight bar is drawn 34 px tall instead of the
+    engine's 20 (config `bar_h`), by expanding that one quad around its centre
+    in the draw path. Log line: "bar: expanded 80,152-1057,172 to height 34".
+  * nothing else changed; text position and rendering are as in 2211.
+
+Restore:
+  copy inotia4_nx.nro over <sdmc>/switch/inotia4/inotia4_nx.nro
+  copy config.prod.ini  to   <sdmc>/switch/inotia4/config.ini

@@ -36,11 +36,17 @@ eden_out.txt
 icon.jpg
 emu.md
 
-# large snapshots stay on disk; the current one plus the sources is the backup
-snapshots/save-fix-20261103.zip
-snapshots/save-fix-20261103-v2.zip
-snapshots/save-slot-20261104-1846.zip
-snapshots/save-slot-20261104-1946.zip
-snapshots/known-good-20261103-1958/*.nro
-snapshots/known-good-20261104-1846/*.nro
-snapshots/known-good-20261104-1946/*.nro
+# scratch scripts / dumps used while reverse engineering one screen
+tmp_*.py
+.workbuddy/makeskill.txt
+.workbuddy/eden_ctl.py
+.workbuddy/poke.py
+.workbuddy/*.png
+
+# large snapshots stay on disk; only the CURRENT known-good's NRO and zip are
+# in the repo, every older one keeps its VERSION.txt (a few KB) and nothing else
+snapshots/known-good-*/inotia4_nx.nro
+snapshots/save-slot-*.zip
+snapshots/save-fix-*.zip
+!snapshots/known-good-20261106-1240/inotia4_nx.nro
+!snapshots/save-slot-20261106-1240.zip

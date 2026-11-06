@@ -54,5 +54,17 @@ void text_set_viewport(int w, int h);
 /* the engine's layout size (1137x640 here): text coordinates are in these
  * units, not framebuffer pixels */
 void text_set_engine_size(int w, int h);
+/* main.c: re-specify the client arrays the engine last set, after this module
+ * drew from its own (see nx_restore_client_arrays) */
+void nx_restore_client_arrays(void);
+/* 0 = do not push the engine's following lines down by the extra wrapped lines
+ * (a page that positions its own blocks); 1 = the default */
+void text_set_wrap_extra(int on);
+/* filled rectangle in engine units (for the description page's scroll thumb) */
+void text_fill_rect(int x, int y, int w, int h, unsigned color);
+/* clip every glyph quad to this box (engine units); x1 <= x0 turns it off */
+void text_set_clip(int x0, int y0, int x1, int y1);
+/* wrap `utf8` at `box_w` px, inserting '\n'; returns the line count */
+int  text_wrap_to_box(const char *utf8, int box_w, int px, char *dst, int cap);
 
 #endif

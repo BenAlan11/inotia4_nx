@@ -63,6 +63,7 @@ void config_defaults(void) {
   cfg.draw_text     = 1;       /* the engine's own glyph rasteriser needs Android */
   cfg.text_trace    = 0;       /* off: only the screens being chased need it */
   cfg.textctrl_dy   = 0;       /* 0: centre the ink on the anchor the engine gives */
+  cfg.bar_h        = 0;        /* 0: draw the engine's highlight bar unchanged */
   cfg.string_draw   = 1;       /* fill the engine's glyph atlas with FreeType
                                   text (prologue / tutorial / NPC name plate) */
   cfg.suppress_dup_push = 0;   /* off: the engine legitimately re-pushes the scene */
@@ -170,6 +171,7 @@ void config_load(const char *path) {
     else if (!strcasecmp_compat(key, "text_px"))        cfg.text_px        = atoi(val);
     else if (!strcasecmp_compat(key, "text_wrap_w"))    cfg.text_wrap_w    = atoi(val);
     else if (!strcasecmp_compat(key, "text_px_scale"))  cfg.text_px_scale  = atoi(val);
+    else if (!strcasecmp_compat(key, "bar_h"))          cfg.bar_h          = atoi(val);
     else if (!strcasecmp_compat(key, "text_fixed_px"))  cfg.text_fixed_px  = atoi(val);
     else if (!strcasecmp_compat(key, "calib"))          cfg.calib         = atoi(val);
     else if (!strcasecmp_compat(key, "redraw_probe"))   cfg.redraw_probe  = atoi(val);

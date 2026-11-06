@@ -1,0 +1,42 @@
+Inotia 4 for Nintendo Switch -- known good snapshot
+
+build stamp : 2026-11-05 19:04:15
+nro md5     : c2d3533bf35a92b33747da80ba2089b5
+nro size    : 9076855 bytes
+config      : config.prod.ini (bar_h = 34, log_level = 1, string_draw = 1)
+verified    : 2026-11-05 19:09 by play testing (quest accept popup)
+
+Changes since 20261105-1524:
+  * the quest accept popup lays its text out the way the original does.
+    - The body was one unwrapped line running past the frame: nx_textctrl_draw
+      computed the wrapped text and then drew the raw string. It now draws the
+      wrapped one.
+    - The wrap width is the popup's own content box: UIPopupMsg_SetText passes
+      410 as the OUTER width and the engine draws text at rect + 20, so the
+      usable width is 370 -- which fits 18 characters a line, the same break
+      points as the original.
+    - "$<letter>" colour codes are carried across a wrap instead of being
+      measured as two glyphs, and the colour in force at the break follows the
+      text onto the next line (刺杀格里 / 普顿伯爵 stays red).
+    - "&N" is the engine's line break; text_wrap_to_box treated it as two
+      characters and broke the second paragraph after 13 characters. It is a
+      hard newline now.
+    - The popup title uses "$A", which had no colour and fell back to white.
+      It is the same red as "$R" (the original's <刺杀格里普顿伯爵>).
+  * the popup's vertical layout: UIPopupMsg_GetTextHeight() reads the text
+    control's +0x08, which the engine fills from a string image its Android
+    rasteriser would have produced. That never happens here, so the height was
+    0 and the engine drew the body on the title's baseline with the title
+    half outside the frame. nx_textctrl_set now fills +0x08 with the wrapped
+    line count x line height -- only for the popup (width 410); every other
+    control keeps 0, because the engine's own vertical centring compensates
+    there (filling it moved the tutorial hint up by half a line).
+  * the "。" that ended the first paragraph was being drawn but pushed down
+    out of sight: every colour run was y-aligned by its own ink ascent, and a
+    run holding only "。" has almost none. All runs of a line now draw at the
+    same y -- render() pads each glyph box to the face metrics, so they
+    already share a baseline.
+
+Restore:
+  copy inotia4_nx.nro over <sdmc>/switch/inotia4/inotia4_nx.nro
+  copy config.prod.ini  to   <sdmc>/switch/inotia4/config.ini

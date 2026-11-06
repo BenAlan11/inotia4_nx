@@ -413,6 +413,14 @@ static int64_t dispatch_int(const char *name, const char *sig, JVal *a, int n) {
     return (int)(audio_sfx_volume() * 100.0f);
   if (!strcmp(name, "getBGMVolume")) return (int)(audio_bgm_volume() * 100.0f);
   if (!strcmp(name, "soundPlay") || !strcmp(name, "playSound")) {
+    /* Which UI handler ran is otherwise invisible: the skill page's two
+     * buttons are told apart by the id they play (learn 0x12, cancel-shortcut
+     * 2). Limited, so a burst of taps cannot flood the log. */
+    static int sfx_logs;
+    if (sfx_logs < 40 && n >= 1) {
+      sfx_logs++;
+      debugPrintf("sfx: play %d\n", (int)a[0].i);
+    }
     if (n >= 1 && cb_sound_play)
       cb_sound_play((int)a[0].i, n >= 2 ? (float)a[1].f : 1.0f, 0);
     return 0;
@@ -482,6 +490,24 @@ static int64_t dispatch_int(const char *name, const char *sig, JVal *a, int n) {
 
 static void dispatch_void(const char *name, const char *sig, JVal *a, int n) {
   (void)sig;
+
+  /* ---- Hive IAP (InAppV4) -------------------------------------------------
+   * The engine's CS_IapV4* layer calls methods on the Java InAppV4 object, and
+   * the object hands results back by calling the native callbacks it was given.
+   * marketConnect(J) receives InAppV4MarketListCB as that J argument; the real
+   * Java connects to Google/OneStore and then calls it with the market list.
+   * Here the connection is instantaneous and the list is a single entry, which
+   * is what makes the store think a market is available. */
+  if (!strcmp(name, "marketConnect")) {
+    typedef void (*market_cb)(long result, const char *list, int len,
+                              const void *extra);
+    const long cb_addr = n > 0 ? (long)a[0].i : 0;
+    static const int market_code = 3;
+    debugPrintf("iap: marketConnect(cb %lx)\n", (unsigned long)cb_addr);
+    if (cb_addr)
+      ((market_cb)(uintptr_t)cb_addr)(0, "google", 6, &market_code);
+    return;
+  }
 
   if (!strcmp(name, "drawText") || !strcmp(name, "drawTextInRect")) {
     /* handled below in the text block */

@@ -249,6 +249,67 @@ static Fn_I2i fn_http_cb;          /* CWrapperHttp.nativeConnectCB(handle, resul
  * so g_vm stayed NULL and the first CS_ call in startClet branched into
  * nothing -- the hang that kept the screen black even with the game loop up. */
 static void (*fn_activeuser_init)(void *env, void *thiz, void *obj);
+/* InAppV4 (Hive IAP) caches the JavaVM at 0x6e4928 and two global refs right
+ * after it, exactly like ActiveUser does for its own: CS_IapV4MarketConnect and
+ * friends read g_jvm from there and call the Java object's methods through it.
+ * Nothing called this export, so the pointer stayed NULL and the shop button
+ * jumped to address 4 (pc 0x4, lr CS_IapV4MarketConnect+0x44). */
+static void (*fn_iap_init)(void *env, void *thiz, void *obj);
+/* InAppV4ProductInfoCB(result, ?, count, records): the native handler the Java
+ * IAP layer calls with the product list (see the store section below). */
+static void (*iap_product_cb)(int result, void *unk, int count, void *recs);
+/* the store's state machine: NetworkStore_Process dispatches on state 1..13 and
+ * only state 4 draws the product list, and only when the network process type is
+ * 1 (which the Hive flow sets when its server answers). Both are engine exports,
+ * so the offline path can just set them. */
+static void (*net_set_process_type)(long);
+/* UIDesc_DrawTextScroll: the description page's scroll draw (see nx_desc_text_scroll) */
+static void (*desc_scroll_real)(void *, int);
+static unsigned clip_frame;
+static int clip_active, clip_top, clip_x1, clip_y1;
+static unsigned str_hash(const char *s);
+extern int input_take_drag_dy(void);
+extern int input_drag_start(float *x, float *y);
+/* ControlObject_GetAbsoluteRect(obj, out) -- out is {x, y, w, h} in engine units.
+ * The out pointer travels in x8 (the ARM64 indirect result register), which a
+ * plain C call cannot express, so it is invoked through a one-instruction
+ * trampoline. */
+static void (*ctrl_abs_rect)(void *, void *);
+static void abs_rect_call(void *obj, int *out) {
+  register void *r0 __asm__("x0") = obj;
+  register int *r8 __asm__("x8") = out;
+  __asm__ __volatile__("blr %2"
+                       : "+r"(r0)
+                       : "r"(r8), "r"(ctrl_abs_rect)
+                       : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x9", "x10",
+                         "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x30",
+                         "memory", "cc");
+}
+/* ControlObject_GetData(obj) -- the control's own state block */
+static void *(*ctrl_get_data)(void *);
+/* COLOR_nValue[] is the UI palette every GRP/INSTANTMSG/EVT colour is read from,
+ * and COLOR_Initialize (which fills it) is never called here -- the table reads
+ * as zero, so those paths hand out black. It cannot simply be called at boot
+ * either: it goes through the SGL context, which does not exist yet, and the
+ * boot hangs. It only feeds the engine's own software layer (invisible in this
+ * port), so the visible colours are handled where they are drawn instead. */
+/* the dialog speaker's name: a short string on its own line above the body text
+ * (y ~434 in the 1137x640 layout, body at ~487), drawn through
+ * GRPX_DrawStringWithFont. In the original it is #FAC8A0 and its glyphs are 66 px
+ * against the body's 39, i.e. ~1.7x -- here it was drawn white at the body size,
+ * which reads as a second line of dialogue rather than a name. */
+static int is_gold_text(const char *s, int x, int y);
+/* per-vertex colour array (see colour_array_rgba) */
+static int colour_array_rgba(unsigned *out);
+/* COLOR_nValue[] (the UI palette every GRP/EVT colour is read from) is all
+ * zeroes here: COLOR_Initialize is the only thing that fills it and it hangs in
+ * this port -- before the engine's own init and after nativeStart alike -- so
+ * there is no engine-side colour to read back. Everything below therefore
+ * decides the colour from what is being drawn. */
+/* frame in which the dialogue body was last drawn (see is_gold_text) */
+static unsigned g_dialog_body_frame;
+static void (*net_store_set_state)(long);
+/* both are kept only so the log can show the state; nothing forces them */
 static void (*fn_hub_cb)(void *env, void *thiz, void *json, long a, long b);
 
 typedef struct {
@@ -285,6 +346,14 @@ static void resolve_entries(void) {
     { "Java_com_com2us_module_activeuser_ActiveUser_jniInitialize",
       (void **)&fn_activeuser_init, 1 },
     { "Java_com_com2us_peppermint_HubBridge_callCSHubInitialize", (void **)&fn_hub_init, 1 },
+    { "Java_com_com2us_module_inappv4_InAppV4_jniInAppV4Initialize",
+      (void **)&fn_iap_init, 1 },
+    { "InAppV4ProductInfoCB", (void **)&iap_product_cb, 1 },
+    { "Network_SetProcessType", (void **)&net_set_process_type, 1 },
+    { "UIDesc_DrawTextScroll", (void **)&desc_scroll_real, 1 },
+    { "ControlObject_GetAbsoluteRect", (void **)&ctrl_abs_rect, 1 },
+    { "ControlObject_GetData", (void **)&ctrl_get_data, 1 },
+    { "NetworkStore_SetState", (void **)&net_store_set_state, 1 },
     { "Java_com_com2us_wrapper_network_CWrapperHttp_nativeConnectCB", (void **)&fn_http_cb, 1 },
     { "Java_com_com2us_peppermint_HubBridge_hubCallbackWithJSON", (void **)&fn_hub_cb, 1 },
   };
@@ -1406,17 +1475,34 @@ static int our_text_recent(const char *plain, unsigned window) {
   return 0;
 }
 
+/* Defined further down, next to the pen-colour hooks: the drawer overrides need
+ * them and those hooks need the text entry point signature, which is declared
+ * later. */
+static unsigned text_colour(unsigned color);
+static void plate_probe(const char *who, const char *str, int x, int y,
+                        unsigned color);
+
 #define TCTRL_SLOTS 96
+/* The description pages are long: one skill block is a title plus six wrapped
+ * lines, roughly 380 bytes of UTF-8, and the value at the very end ("剑之灵魂
+ * 持续时间： 5秒") is exactly what a short buffer cuts off first. 1 KB matches
+ * what the text renderer itself can take in one go. */
 static struct {
   void *ctrl;
   int len;
-  char text[256];
+  char text[1024];
 } g_tctrl[TCTRL_SLOTS];
 static int g_tctrl_next;
 
 static void tctrl_store(void *ctrl, const char *text, int len) {
   if (!ctrl || !text || len <= 0)
     return;
+  /* `len` is the control's box WIDTH, not a byte count (X_TEXTCTRL_SetTextControl
+   * takes (ctrl, str, width, align, mode, colour)), so it must not cap the copy:
+   * the string is NUL-terminated and, for a description block, longer than the
+   * box is wide (the tail of it was being dropped -- "剑之灵魂持续时间： 5秒"
+   * lost the value). */
+  len = (int)strlen(text);
   if (len > (int)sizeof(g_tctrl[0].text) - 1)
     len = (int)sizeof(g_tctrl[0].text) - 1;
   for (int i = 0; i < TCTRL_SLOTS; i++) {
@@ -1465,12 +1551,345 @@ static void nx_textctrl_destroy(void *ctrl) {
     textctrl_destroy_real(ctrl);
 }
 
+/* description page: the viewport has to last for the whole frame (see
+ * nx_textctrl_draw) */
+static unsigned clip_frame;
+static int clip_active, clip_top, clip_x1, clip_y1;
+static unsigned str_hash(const char *s);
+extern int input_take_drag_dy(void);
+extern int input_drag_start(float *x, float *y);
+
 static void (*textctrl_set_real)(void *, const char *, int, int, int, int);
 static void nx_textctrl_set(void *ctrl, const char *text, int len, int a3,
                             int a4, int a5) {
   tctrl_store(ctrl, text, len);
   if (textctrl_set_real)
     textctrl_set_real(ctrl, text, len, a3, a4, a5);
+  /* The control's height (its +0x08 field) is the string image's height, and
+   * every popup that lays itself out from UIPopupMsg_GetTextHeight() reads it.
+   * The engine gets that height from a string image its Android rasteriser
+   * would have produced, which never happens here, so it stayed 0 -- and the
+   * quest popup, which places its separator and body from the title's height,
+   * drew the body on the title's baseline. Fill it in from the same measurement
+   * we draw with, wrapped at the control's own width (the third argument is
+   * that width, not a byte count: X_TEXTCTRL_SetTextControl(ctrl, str, width,
+   * align, mode, colour)). */
+  /* Only the narrow content boxes: the popup (410) and the description pages
+   * (358). Their layout is driven by this height -- the popup puts the body
+   * below the title, UIDesc_DrawTextScroll puts the next level's block below
+   * this one -- and it is 0 here. The wide controls (the tutorial hint's label
+   * at 937, the character page at 700) are laid out with 0 and the engine's own
+   * vertical centring compensates, so filling those moved their text up by half
+   * a line.
+   *
+   * `len` is the box WIDTH on this path, not a byte count: the test is that it
+   * agrees with the width the control itself carries (+0x04), which keeps a
+   * short string on a wide control from being treated as a narrow box. The
+   * height is refreshed on every set, because the same control carries a
+   * different description for every skill the player selects. */
+  if (ctrl && probe_mem_ok(ctrl, 0x24) && text && *text && len >= 100 &&
+      len <= 420 && *(volatile int *)((char *)ctrl + 4) == len) {
+    const int px = cfg.text_px > 0 ? cfg.text_px : 20;
+    const int wrap_w = (len == 410) ? len - 40 : len;   /* see nx_textctrl_draw */
+    char wrapped[1024];
+    int lines = 1;
+    if (text_wrap_to_box(text, wrap_w, px, wrapped, (int)sizeof(wrapped)) > 1) {
+      lines = 1;
+      for (const char *q = wrapped; *q; q++)
+        if (*q == '\n')
+          lines++;
+    }
+    const int lh = px * 13 / 10;
+    *(volatile int *)((char *)ctrl + 8) = lines * lh;
+    {
+      static int set_logs;
+      if (set_logs < 12 && len >= 300) {
+        set_logs++;
+        debugPrintf("text: control height %d (%d line(s), box %d) '%.16s'\n",
+                    lines * lh, lines, len, text);
+      }
+    }
+  }
+}
+
+/* ---- the description page -------------------------------------------------
+ *
+ * UIDesc_DrawTextScroll(ctrl, scroll) is the draw callback of the page's scroll
+ * control. The engine lays the page out in three parts and positions each one
+ * from the previous part's HEIGHT FIELD (ctrl+0x08):
+ *
+ *   A  rect.y + scroll                  ctrlA = 0x2b4a38, height [0x2b4a40]
+ *   --  dashed separator at A.y + A.height + 10
+ *   B  A.y + A.height + 20              ctrlB = 0x2b5230, height [0x2b5238]
+ *   --  value comparison at B.y + B.height + 5  (UISkill_DrawDescAbility)
+ *
+ * Those heights come from the string image the Android rasteriser would have
+ * produced, so here they are whatever we last measured -- and a block that is
+ * hidden without zeroing its height reserves empty space and pushes everything
+ * below it out of the panel (the comparison block ended up under the buttons).
+ *
+ * The page is therefore drawn here as one text flow: our own wrapped measurement
+ * decides where every part starts, and the engine only draws the value
+ * comparison rows (labels, numbers and the ▶ sprites) at the y we hand it.
+ * The scroll offset still comes from the control (`scroll`), so dragging works
+ * exactly as it does for the skill tree. */
+static void (*desc_scroll_real)(void *, int);
+static void (*desc_ability_fn)(void *, int, int, int, int);
+static void (*hdot_fn)(int, int, int, unsigned);
+/* ControlObject_GetAbsoluteRect(obj, out) -- out is {x, y, w, h} in engine units */
+static void (*ctrl_abs_rect)(void *, void *);
+/* ControlObject_GetData(obj) -- the control's own state block */
+static void *(*ctrl_get_data)(void *);
+static long (*grpx_line_height)(int);
+
+/* The description page's scroll control. UIDesc_ResetSkillScrollControlRect
+ * builds it and UIDesc_Draw drives it, both through this global; the same
+ * control serves the item and mercenary description pages. */
+#define DESC_SCROLL_GLOBAL 0x2b5a30
+
+/* bumped whenever a description page actually draws, so the drag is only fed to
+ * that page's control while the page is on screen (the control object itself
+ * outlives every screen) */
+static unsigned desc_page_frame;
+
+/* One line's height, identical to what text.c advances by when it draws a
+ * wrapped string (size + size/4), so a measured block and the glyphs inside it
+ * agree to the pixel. */
+static int desc_line_h(int px) { return px + px / 4; }
+
+/* Wrapped line count of a text control's own string, at the width it was given
+ * (ctrl+0x04). 0 when the control holds nothing -- which is exactly when the
+ * engine must not reserve any space for it. */
+static int desc_block_lines(void *ctrl) {
+  if (!ctrl || !probe_mem_ok(ctrl, 0x24))
+    return 0;
+  const char *s = tctrl_lookup(ctrl);
+  const int w = *(volatile int *)((char *)ctrl + 4);
+  if (!s || !*s || w < 100 || w > 420)
+    return 0;
+  const int px = cfg.text_px > 0 ? cfg.text_px : 20;
+  char wrapped[1024];
+  int lines = 1;
+  if (text_wrap_to_box(s, w, px, wrapped, (int)sizeof(wrapped)) > 1)
+    for (const char *q = wrapped; *q; q++)
+      if (*q == '\n')
+        lines++;
+  return lines;
+}
+
+static int desc_block_height(void *ctrl) {
+  const int lines = desc_block_lines(ctrl);
+  if (lines <= 0)
+    return 0;
+  const int px = cfg.text_px > 0 ? cfg.text_px : 20;
+  return lines * desc_line_h(px);
+}
+
+/* Draw one block: the control's string, wrapped at its own box, with the
+ * string's own colour codes ($R/$S/…) resolved by the text renderer. Returns
+ * the height it occupied. */
+static int desc_draw_block(void *ctrl, int x, int y) {
+  const char *s = tctrl_lookup(ctrl);
+  const int w = *(volatile int *)((char *)ctrl + 4);
+  if (!s || !*s || w < 100 || w > 420)
+    return 0;
+  const int px = cfg.text_px > 0 ? cfg.text_px : 20;
+  unsigned color = *(volatile unsigned *)((char *)ctrl + 0x14);
+  if (color <= 0xffffffu)
+    color = (color << 8) | 0xffu;
+  /* the UI palette every control colour is read from is all zeroes in this
+   * port, so "black" here means "no colour was ever stored" -- same rule as
+   * the other text drawers */
+  color = text_colour(color);
+  char wrapped[1024];
+  const char *line = s;
+  int lines = 1;
+  if (text_wrap_to_box(s, w, px, wrapped, (int)sizeof(wrapped)) > 1) {
+    line = wrapped;
+    lines = 1;
+    for (const char *q = wrapped; *q; q++)
+      if (*q == '\n')
+        lines++;
+  }
+  /* text_draw_engine carries a "how far the engine's own next line has to be
+   * pushed down" accumulator for the screens that hand it one line at a time.
+   * This block is a whole paragraph in ONE call, so that accumulator must not
+   * be live here: left on, the seven wrapped lines of the current-level block
+   * pushed the next-level block down by seven line heights (the empty band the
+   * player saw) and straight onto the value comparison. */
+  text_set_wrap_extra(0);
+  text_draw_engine(line, -1, x, y, px, color);
+  text_set_wrap_extra(1);
+  return lines * desc_line_h(px);
+}
+
+/* UIDesc_DrawTextScroll replacement -- the page as one text flow (see the
+ * layout note above). Everything is drawn at rect.y + scroll, clipped to the
+ * scroll control's own rectangle, and the value comparison is handed to the
+ * engine at the y this flow ends at. */
+static void nx_desc_text_scroll(void *ctrl, int scroll) {
+  unsigned char *vb = (unsigned char *)game_mod.load_virtbase;
+  if (!ctrl || !vb || !probe_mem_ok(ctrl, 0x24)) {
+    if (desc_scroll_real)
+      desc_scroll_real(ctrl, scroll);
+    return;
+  }
+  long r[4] = { 645, 193, 358, 297 };
+  if (ctrl_abs_rect)
+    abs_rect_call(ctrl, (int *)r);
+  const int vx = (int)r[0];
+  const int vy = (int)r[1];
+  const int vw = (int)r[2];
+  const int vh = (int)r[3];
+  if (vw < 100 || vw > 700 || vh < 60 || vh > 700) {
+    if (desc_scroll_real)
+      desc_scroll_real(ctrl, scroll);
+    return;
+  }
+  desc_page_frame = g_frame_no;
+
+  void *ca = (void *)(vb + 0x2b4a38);       /* current level block  */
+  void *cb = (void *)(vb + 0x2b5230);       /* next level block     */
+  /* the modes the engine splits into A / separator / B (bit i set in 0x1c) */
+  const unsigned mode = *(volatile unsigned char *)(vb + 0x2b5a48);
+  const int skill_layout = (mode <= 5) && ((1u << mode) & 0x1cu);
+
+  int y = vy + scroll;
+  const int y_a = y;
+  int y_dash = 0, y_b = 0, y_ab = -1;
+  text_set_engine_size(input_engine_screen_w(), input_engine_screen_h());
+  text_set_clip(vx, vy, vx + vw, vy + vh);
+
+  const int ha = desc_draw_block(ca, vx, y);
+  if (skill_layout && ha > 0) {
+    /* dashed separator, then the next level's block */
+    y += ha + 10;
+    y_dash = y;
+    if (hdot_fn)
+      hdot_fn(vx + 5, y, vw - 10, 0xFF8CAECEu);
+    y += 10;
+    y_b = y;
+    const int hb = desc_draw_block(cb, vx, y);
+    y += hb + 5;
+    y_ab = y;
+    /* the value comparison (labels, current ▶ next, mana cost). The engine
+     * draws it row by row through the same text drawer; only its top y is
+     * ours. */
+    if (*(volatile int *)(vb + 0x2b5e70) >= 1 && desc_ability_fn) {
+      const int fh = grpx_line_height ? (int)grpx_line_height(0) : 26;
+      desc_ability_fn(*(void **)(vb + 0x2b5a50), vx, y, vw, fh + 4);
+    }
+  } else if (!skill_layout) {
+    /* item / mercenary pages: one block, nothing else */
+  }
+  text_set_clip(0, 0, 0, 0);
+  text_set_wrap_extra(1);
+
+  /* The engine's own scroll range was built from these same two height fields,
+   * so keep them equal to what was just drawn; the range and the bottom of the
+   * page then agree. */
+  if (probe_mem_ok(ca, 0x24))
+    *(volatile int *)((char *)ca + 8) = ha;
+  if (probe_mem_ok(cb, 0x24))
+    *(volatile int *)((char *)cb + 8) = desc_block_height(cb);
+  {
+    static int n;
+    if (n < 40) {
+      n++;
+      debugPrintf("desc: f%u rect %ld,%ld %ldx%ld scroll %d | A y%d h%d | "
+                  "dash %d | B y%d h%d | ability %d\n", g_frame_no, r[0], r[1],
+                  r[2], r[3], scroll, y_a, ha, y_dash, y_b,
+                  desc_block_height(cb), y_ab);
+    }
+  }
+}
+
+/* ---- the page's scroll control -------------------------------------------
+ *
+ * ControlScroll_Draw sets the clip, calls the draw callback it keeps at
+ * data+0xa0 with the current position, then draws the bar. The page's input
+ * never reaches that control in this port (its ControlScroll_ControlEventProc
+ * is only reachable through the control tree's virtual dispatch, and nothing
+ * here produces the press/move pair it needs), so the finger travel is fed
+ * straight into the position instead -- the engine then does the rest exactly
+ * as it does for the skill tree. Called once per frame, before the engine
+ * draws. */
+static void desc_scroll_tick(void) {
+  const int dy = input_take_drag_dy();      /* drained every frame on purpose */
+  unsigned char *base = (unsigned char *)game_mod.load_virtbase;
+  if (!base || !ctrl_get_data)
+    return;
+  void *sc = *(void **)(base + DESC_SCROLL_GLOBAL);
+  if (!sc || !probe_mem_ok(sc, 0x20))
+    return;
+  void *sd = ctrl_get_data(sc);
+  if (!sd || !probe_mem_ok(sd, 0xb0))
+    return;
+  /* Take the page's draw callback over: the engine's version lays the page out
+   * from string-image heights that do not exist here, which is what put the
+   * next level's block and the value comparison on top of each other. */
+  void *ours = (void *)nx_desc_text_scroll;
+  if (*(void **)((char *)sd + 0xa0) != ours) {
+    *(void **)((char *)sd + 0xa0) = ours;
+    static int tl;
+    if (tl < 4) {
+      tl++;
+      debugPrintf("desc: draw callback installed (%p)\n", ours);
+    }
+  }
+  if (dy == 0)
+    return;
+  if (desc_page_frame == 0 || g_frame_no - desc_page_frame > 3)
+    return;                                 /* no description page on screen */
+  const int content = *(volatile int *)((char *)sd + 0x18);
+  const int view = *(volatile int *)((char *)sd + 0x10);
+  if (content <= view)
+    return;                                 /* nothing to scroll on this page */
+  const int state = (int)*(volatile unsigned char *)((char *)sd + 0x58);
+  /* only a drag that started on the page, so dragging the skill tree next to it
+   * does not move the description too */
+  float fx = 0.0f, fy = 0.0f;
+  if (!input_drag_start(&fx, &fy) || !ctrl_abs_rect)
+    return;
+  long r[4] = { 0, 0, 0, 0 };
+  abs_rect_call(sc, (int *)r);
+  const int sw = cfg.screen_width > 0 ? cfg.screen_width : 1920;
+  const int sh = cfg.screen_height > 0 ? cfg.screen_height : 1080;
+  int ew = input_engine_screen_w();
+  int eh = input_engine_screen_h();
+  if (ew <= 0)
+    ew = 1137;
+  if (eh <= 0)
+    eh = 640;
+  const int mx = (int)(fx * (float)ew / (float)sw);
+  const int my = (int)(fy * (float)eh / (float)sh);
+  if (r[2] <= 0 || r[3] <= 0 || mx < r[0] || mx >= r[0] + r[2] || my < r[1] ||
+      my >= r[1] + r[3]) {
+    static int ol;
+    if (ol < 8) {
+      ol++;
+      debugPrintf("desc: drag from (%d,%d) outside (%ld,%ld %ldx%ld), page "
+                  "keeps its scroll\n", mx, my, r[0], r[1], r[2], r[3]);
+    }
+    return;
+  }
+  long pos = *(volatile long *)((char *)sd + 0x50);
+  const long lo = -(long)(content - view);
+  pos += (long)((float)dy * (float)eh / (float)sh);
+  if (pos > 0)
+    pos = 0;
+  if (pos < lo)
+    pos = lo;
+  *(volatile long *)((char *)sd + 0x50) = pos;
+  {
+    static int dl;
+    if (dl < 20) {
+      dl++;
+      debugPrintf("desc: drag dy %d state %d -> scroll %ld of %ld "
+                  "(content %d view %d)\n", dy, state, (long)pos, -lo, content,
+                  view);
+    }
+  }
 }
 
 static void nx_textctrl_draw(void *ctrl, int x, int y) {
@@ -1515,15 +1934,82 @@ static void nx_textctrl_draw(void *ctrl, int x, int y) {
   if (color <= 0xffffffu)
     color = (color << 8) | 0xffu;          /* 0xRRGGBB -> 0xRRGGBBAA */
 
+  /* The description page is drawn over several controls in one frame (one per
+   * level plus a comparison block), and only the first of them is the 358-wide
+   * scroll control. The viewport therefore has to survive the whole frame, not
+   * just one control's draw -- otherwise the later blocks, which the engine
+   * positions below the visible area, paint outside the panel. */
+  if (clip_frame != g_frame_no) {
+    clip_frame = g_frame_no;
+    clip_active = 0;
+    clip_top = 0;
+    text_set_clip(0, 0, 0, 0);
+    text_set_wrap_extra(1);
+  }
+
   const int px = cfg.text_px > 0 ? cfg.text_px : 20;
-  const int w = text_width_engine(str, -1, px);
   const int box_w = *(volatile int *)((char *)ctrl + 0x04);
+  /* The popup's 410 is the OUTER box: the engine draws its text at rect + 20,
+   * so the text area is 40 narrower. Wrapping at the full 410 fits 20
+   * characters where the original fits 18 ("...命令：刺杀格里" / "普顿伯爵。"). */
+  const int wrap_w = (box_w == 410) ? box_w - 40 : box_w;
+  /* The control wraps its own string image at `box_w`, but the string it hands
+   * us is one unwrapped line -- drawing it as it comes is what pushed the quest
+   * popup's body out past its frame (box 410, line 24 characters). Break it
+   * here, at the same width. */
+  char wrapped[1024];
+  const char *line = str;
+  if (wrap_w > 0 &&
+      text_wrap_to_box(str, wrap_w, px, wrapped, (int)sizeof(wrapped)) > 1)
+    line = wrapped;
+  int w = 0;
+  {
+    const char *p = line;
+    while (p && *p) {
+      const char *nl = strchr(p, '\n');
+      const int n = nl ? (int)(nl - p) : (int)strlen(p);
+      const int lw = text_width_engine(p, n, px);
+      if (lw > w)
+        w = lw;
+      if (!nl)
+        break;
+      p = nl + 1;
+    }
+  }
   int dx = x;
   if (align == 2)
     dx -= w / 2;
   else if (align == 1)
     dx -= w;
 
+  {
+    /* What each popup control wraps to: the box width the engine gave it, the
+     * line count, and the wrapped text with '|' for the breaks. Keyed on the
+     * draw position so a per-frame redraw only logs once. */
+    static struct { int x, y, box; } seen[10];
+    static int n;
+    int known = 0;
+    for (int i = 0; i < n; i++)
+      if (seen[i].x == dx && seen[i].y == y && seen[i].box == box_w) {
+        known = 1;
+        break;
+      }
+    if (!known && n < (int)(sizeof(seen) / sizeof(*seen)) &&
+        y >= 100 && y <= 340 && strlen(str) > 10) {
+      char flat[512];
+      int o = 0;
+      for (const char *q = line; *q && o < (int)sizeof(flat) - 2; q++)
+        flat[o++] = (*q == '\n') ? '|' : *q;
+      flat[o] = 0;
+      seen[n].x = dx; seen[n].y = y; seen[n].box = box_w; n++;
+      debugPrintf("popup: at %d,%d box %d align %d px %d lines %d '%s'\n", dx, y,
+                  box_w, align, px,
+                  line == wrapped ? text_wrap_to_box(str, wrap_w, px, wrapped,
+                                                     (int)sizeof(wrapped))
+                                  : 1,
+                  flat);
+    }
+  }
   if (textctrl_logs < 60) {
     textctrl_logs++;
     debugPrintf("gl: textctrl at %d,%d (box %d wide) align %d col %06x -> %d px\n",
@@ -1553,10 +2039,58 @@ static void nx_textctrl_draw(void *ctrl, int x, int y) {
    * bar is a quad at (80,152)-(1057,172), 20 px tall, centred on the very y it
    * hands this call (162). Drawing the glyphs with their top at y therefore
    * hangs the whole line half a line below the bar -- the "the text does not
-   * sit inside its box" the player kept pointing at. Centre the ink instead. */
+   * sit inside its box" the player kept pointing at. Centre the ink instead.
+   *
+   * The popup is the exception: its text controls are the ones the engine makes
+   * with UIPopupMsg_SetText(msg, len, 410), and 410 is the content box width it
+   * passes there. That box has its own 20 px padding, and the engine's vertical
+   * centring collapses to nothing for it (it centres in the control height,
+   * which is the string image's and is 0 here), so the title ended up half
+   * outside the frame and the body sat on the title's baseline. */
+  const int popup = (box_w == 410);
+  const int desc = (box_w == 358);
   const int ink = text_ink_height(str, px);
-  const int dy = cfg.textctrl_dy ? cfg.textctrl_dy : -(ink > 0 ? ink / 2 : 0);
-  text_draw_engine(str, -1, dx, y + dy, px, color);
+  int dy = cfg.textctrl_dy ? cfg.textctrl_dy : -(ink > 0 ? ink / 2 : 0);
+  if (popup || desc)
+    /* The engine anchors these at the top of their box (the popup's content
+     * area, the description page's scroll viewport); centring the ink on that
+     * y lifted them by half a line, which put the description's first line
+     * under the panel's top edge. */
+    dy = 0;
+  /* The description pages are a scroll viewport. The engine draws their text at
+   * rect.y + scroll (UIDesc_DrawTextScroll gets that scroll from the scroll
+   * control's position, data+0x50), and it expects the result to be clipped to
+   * the viewport -- it gets that for free from the pre-clipped string image it
+   * would have drawn. We paint the glyphs ourselves, so the clip is set here,
+   * from the scroll control's own rectangle. */
+  if (desc) {
+    desc_page_frame = g_frame_no;
+    long r[4] = { 645, 193, 358, 297 };
+    void *sc = *(void **)((uintptr_t)game_mod.load_virtbase + 0x2b5a30);
+    if (sc && ctrl_abs_rect && probe_mem_ok(sc, 0x20))
+      abs_rect_call(sc, (int *)r);
+    if (r[2] < 100 || r[2] > 700 || r[3] < 60 || r[3] > 700) {
+      /* the control has no usable rectangle yet (first frame of the page) */
+      r[0] = dx;
+      r[1] = 193;
+      r[2] = 358;
+      r[3] = 297;
+    }
+    clip_active = 1;
+    clip_frame = g_frame_no;
+    clip_top = (int)r[1];
+    clip_y1 = clip_top + (int)r[3];
+    text_set_clip((int)r[0], clip_top, (int)r[0] + (int)r[2], clip_y1);
+  }
+  /* `line` is `str` wrapped at the control's own box width; drawing `str` here
+   * is what left the quest popup's body running past its frame. The engine's
+   * own scroll offset is already inside `y` (it comes from the page's scroll
+   * position), so nothing is shifted here. */
+  text_draw_engine(line, -1, dx, y + dy, px, color);
+  /* the display region belongs to this draw only -- keeping it for the rest of
+   * the frame hid every other label on the page (技能点: 0 among them) */
+  text_set_clip(0, 0, 0, 0);
+  text_set_wrap_extra(1);
 }
 
 /* Broader probes: the hint box's label is visible but its body is not, and
@@ -1644,8 +2178,12 @@ static unsigned long nx_sub_string(unsigned long a0, unsigned long a1,
   GLfloat cc[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
   glGetFloatv(GL_CURRENT_COLOR, cc);
   unsigned color = ((unsigned)(cc[0] * 255.0f) << 24) |
-                         ((unsigned)(cc[1] * 255.0f) << 16) |
-                         ((unsigned)(cc[2] * 255.0f) << 8) | 0xffu;
+                   ((unsigned)(cc[1] * 255.0f) << 16) |
+                   ((unsigned)(cc[2] * 255.0f) << 8) | 0xffu;
+  color = text_colour(color);
+  if ((int)a3 >= 470 && (int)a3 <= 500)
+    g_dialog_body_frame = g_frame_no;
+  plate_probe("sub", str, (int)a2, (int)a3, color);
 
   if (sub_logs < 60) {
     sub_logs++;
@@ -2072,10 +2610,54 @@ static void dump_control(void *obj) {
   }
 }
 
+/* depth of the dispatch recursion (see the forwarding rule below) */
+static int colevent_depth;
+static int colevent_forwarding;
+
 static long nx_ControlObject_EventProc(void *obj, long code, void *data,
                                        long extra) {
-  const long r = colevent_real ? colevent_real(obj, code, data, extra) : 0;
-  if (colevent_logs < 400) {
+  colevent_depth++;
+  long r = colevent_real ? colevent_real(obj, code, data, extra) : 0;
+  /* The description panel (the right-hand side of the skill / item windows) is
+   * a SIBLING of the window's big content panel, and that panel's rectangle is
+   * the whole window (1137x431) -- so the dispatch walks it first, gets 0 back
+   * for a press that no item slot claimed, and reaches the end of the child
+   * list without ever trying the description. Its two buttons are therefore
+   * unreachable ("取消快捷键 does nothing"). When the whole dispatch comes back
+   * empty and the press is inside the description panel but OUTSIDE its scroll
+   * viewport (the viewport is driven by the port itself), hand the event to the
+   * panel here. */
+  if (r == 0 && colevent_depth == 1 && !colevent_forwarding &&
+      (code == 0x17 || code == 0x18 || code == 0x19) && data) {
+    unsigned char *vb = (unsigned char *)game_mod.load_virtbase;
+    void *dp = vb ? *(void **)(vb + 0x2b5a28) : NULL;
+    const long *pt = (const long *)data;
+    if (dp && dp != obj && p_abs_rect) {
+      const CtrlRect dpr = p_abs_rect(dp);
+      if (dpr.w >= 100 && dpr.h >= 60 && pt[0] >= dpr.x &&
+          pt[0] < dpr.x + dpr.w && pt[1] >= dpr.y && pt[1] < dpr.y + dpr.h &&
+          !(pt[0] >= 645 && pt[0] < 1003 && pt[1] >= 193 && pt[1] < 493)) {
+        colevent_forwarding = 1;
+        r = colevent_real(dp, code, data, extra);
+        colevent_forwarding = 0;
+        {
+          static int fl;
+          if (fl < 12) {
+            fl++;
+            debugPrintf("ui: desc panel %p rect %ld,%ld %ldx%ld forwarded "
+                        "code %04lx at (%ld,%ld) -> %ld\n", dp, dpr.x, dpr.y,
+                        dpr.w, dpr.h, code, pt[0], pt[1], r);
+          }
+        }
+      }
+    }
+  }
+  colevent_depth--;
+  /* Presses and releases only: which control claims a tap is decided here, and
+   * the skill page's two buttons sit under the description's scroll rect, so
+   * "the button does nothing" is answered by this list (the first line with
+   * result 1 is the control that ate the tap). */
+  if ((code == 0x17 || code == 0x18) && colevent_logs < 200) {
     colevent_logs++;
     const unsigned cid = p_ctrl_id ? p_ctrl_id(obj) : 0;
     CtrlRect cr = { 0, 0, 0, 0 };
@@ -3583,6 +4165,30 @@ void nx_glTexCoordPointer(GLint size, GLenum type, GLsizei stride,
   glTexCoordPointer(size, type, stride, ptr);
 }
 
+/* Put the engine's own client arrays back.
+ *
+ * Our text drawer submits its quad from arrays that live on its stack, and the
+ * engine's SGL GRP drawers submit through one global array without ever
+ * re-specifying the pointer (SGL_grpFillRect writes four vertices into a fixed
+ * buffer and calls glDrawArrays). So if a text quad leaves its own pointer
+ * behind, the next such fill reads the dead stack frame: a 4-vertex strip with
+ * whatever numbers are there, drawn in the fill's colour -- a black 70% quad
+ * that can cover the whole screen for that frame. The NPC name plate's backing
+ * bar is exactly such a fill, which is why the picture twitched only when an
+ * NPC was close enough to show the plate.
+ *
+ * vptr/tptr and friends are what the engine last asked for (nx_glVertexPointer
+ * records them; text.c calls the real GL entry points, so they still hold the
+ * engine's values). */
+void nx_restore_client_arrays(void) {
+  if (vptr)
+    glVertexPointer(vsize > 1 ? vsize : 2, vtype ? vtype : GL_FIXED, vstride,
+                    vptr);
+  if (tptr)
+    glTexCoordPointer(tsize > 1 ? tsize : 2, ttype ? ttype : GL_FIXED, tstride,
+                      tptr);
+}
+
 static unsigned frame_draw_index;
 
 
@@ -3607,6 +4213,59 @@ void nx_glDrawElements(GLenum mode, GLsizei count, GLenum type,
     }
   }
   glDrawElements(mode, count, type, indices);
+}
+
+/* The tutorial hint's highlight bar, as the engine submits it:
+ *   bar: quad 80,152-1057,172  tex 31  col 0 0 0 0.60  blend 1
+ * one wide quad, 20 px tall, centred on the line's anchor. In the original the
+ * bar overhangs the glyphs a little; `bar_h` asks for a different height and
+ * this expands the quad around its own centre for that single draw. Anything
+ * else -- text, panels, the map -- is left exactly as it is. */
+static float bar_verts[128];
+
+static int bar_expand(GLenum mode, GLint first, GLsizei count) {
+  (void)mode;
+  if (cfg.bar_h <= 0 || !vptr || count < 3 || count > 64)
+    return 0;
+  const int comps = vsize > 1 ? vsize : 2;
+  const int vsz = (vtype == GL_SHORT) ? 2 : 4;
+  const int vstep = vstride ? vstride : comps * vsz;
+  float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+  float xs[64], ys[64];
+  for (GLsizei i = 0; i < count; i++) {
+    const unsigned char *q = (const unsigned char *)vptr + (size_t)(first + i) * vstep;
+    float vx = 0, vy = 0;
+    if (vtype == GL_FLOAT) { vx = ((const float *)q)[0]; vy = ((const float *)q)[1]; }
+    else if (vtype == GL_SHORT) { vx = ((const short *)q)[0]; vy = ((const short *)q)[1]; }
+    else if (vtype == GL_FIXED) { vx = (float)((const int32_t *)q)[0]/65536.0f; vy = (float)((const int32_t *)q)[1]/65536.0f; }
+    else { vx = (float)((const int32_t *)q)[0]; vy = (float)((const int32_t *)q)[1]; }
+    xs[i] = vx; ys[i] = vy;
+    if (vx < x0) x0 = vx;
+    if (vx > x1) x1 = vx;
+    if (vy < y0) y0 = vy;
+    if (vy > y1) y1 = vy;
+  }
+  const float w = x1 - x0, h = y1 - y0, cy = (y0 + y1) * 0.5f;
+  if (w < 780.0f || w > 1080.0f || h < 8.0f || h > 40.0f || cy < 120.0f ||
+      cy > 220.0f)
+    return 0;
+  GLfloat col[4] = { 1, 1, 1, 1 };
+  glGetFloatv(GL_CURRENT_COLOR, col);
+  if (col[0] > 0.2f || col[1] > 0.2f || col[2] > 0.2f)
+    return 0;                       /* the bar is the black translucent strip */
+  const float k = (float)cfg.bar_h / h;
+  for (GLsizei i = 0; i < count; i++) {
+    bar_verts[i * 2 + 0] = xs[i];
+    bar_verts[i * 2 + 1] = cy + (ys[i] - cy) * k;
+  }
+  glVertexPointer(2, GL_FLOAT, 0, bar_verts);
+  static int logs;
+  if (logs < 4) {
+    logs++;
+    debugPrintf("bar: expanded %.0f,%.0f-%.0f,%.0f to height %d\n", x0, y0, x1,
+                y1, cfg.bar_h);
+  }
+  return 1;
 }
 
 void nx_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
@@ -3639,6 +4298,27 @@ void nx_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
         if (vx > x1) x1 = vx;
         if (vy < y0) y0 = vy;
         if (vy > y1) y1 = vy;
+      }
+      /* anything drawn in the top strip: that is where the NPC name plate sits,
+       * and whatever submits it is what we still have not identified */
+      {
+        static int top_logs;
+        /* the two HUD corner plates are drawn every frame and would eat the
+         * whole budget before anything interesting appears */
+        const int corner = (x1 < 130.0f) || (x0 > 990.0f);
+        if (top_logs < 150 && !corner && y1 < 110.0f && (x1 - x0) > 40.0f) {
+          top_logs++;
+          GLint bt2 = 0;
+          GLfloat c2[4] = { 0, 0, 0, 0 };
+          glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt2);
+          glGetFloatv(GL_CURRENT_COLOR, c2);
+          debugPrintf("top: quad %.0f,%.0f-%.0f,%.0f tex %d %s col %.2f %.2f "
+                      "%.2f %.2f blend %d\n",
+                      x0, y0, x1, y1, (int)bt2,
+                      text_is_our_texture((unsigned)bt2) ? "OURS" : "engine",
+                      c2[0], c2[1], c2[2], c2[3],
+                      (int)glIsEnabled(GL_BLEND));
+        }
       }
       if (x1 - x0 > 780.0f && x1 - x0 < 1080.0f && y0 > 100.0f && y1 < 260.0f) {
         bar_logs++;
@@ -3891,10 +4571,20 @@ void nx_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
    * hands down black at 60% alpha over a black backing bar -- black on black.
    * Those same plates are a black bar with light text everywhere else in the
    * game, so lift a near-black tint to white and keep the engine's alpha. Only
-   * quads drawn from an atlas this port filled are touched. */
+   * quads drawn from an atlas this port filled are touched.
+   *
+   * "Drawn from" means texturing is on. A quad with GL_TEXTURE_2D disabled
+   * ignores the bound texture entirely, but the binding itself is still there --
+   * and if that leftover id happens to be one of our atlases this used to
+   * repaint the quad white. The NPC name plate's backing bar is exactly such a
+   * quad: GRPX_FillRectRGBAlpha draws it as an untextured 4-vertex strip in
+   * black at 70%, right after whatever the previous draw left bound. Whenever
+   * that leftover was a filled atlas the bar came out white instead of black,
+   * and as the frame's draw order shifted it flipped between the two -- the
+   * plate visibly flashing as the player walks up to an NPC. */
   GLfloat saved_col[4] = {1, 1, 1, 1};
   int col_forced = 0;
-  if (g_filled_n && count == 4) {
+  if (g_filled_n && count == 4 && glIsEnabled(GL_TEXTURE_2D)) {
     GLint bt3 = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt3);
     if (is_filled_atlas((GLuint)bt3)) {
@@ -3920,7 +4610,10 @@ void nx_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     glDisable(GL_BLEND);
   if (cfg.tex_replace)
     glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-  glDrawArrays(mode, first, count);
+  const int bar_done = bar_expand(mode, first, count);
+  glDrawArrays(mode, bar_done ? 0 : first, count);
+  if (bar_done)
+    glVertexPointer(vsize > 1 ? vsize : 2, vtype, vstride, vptr);
   if (col_forced)
     glColor4f(saved_col[0], saved_col[1], saved_col[2], saved_col[3]);
 }
@@ -4647,6 +5340,66 @@ static int text_px_for_group(void *group) {
   return 20;
 }
 
+/* GRP_DrawString(str, x, y, ?) is the *software* text drawer: it ends in
+ * GRP_PutHanChar/GRP_PutAsciiChar, which composite glyphs from the engine's own
+ * font into the CS_GRP frame buffer. That buffer is uploaded and blitted by
+ * SGL_FrameBufferToScreen -- a path this port never enters (no full-screen
+ * white quad, no glCopyTexImage2D anywhere in a run), so everything drawn
+ * through it is invisible here: the HUD money counter, the message log, the
+ * button labels. Drawing the string ourselves puts it on screen.
+ *
+ * Note the NPC name plate is NOT one of these: INSTANTMSG_Draw uses the
+ * "Porting" variant, which goes through GRPX_DrawStringWithFont and therefore
+ * through nx_grpx_draw_string. */
+static int grp_str_logs;
+
+static unsigned long nx_grp_draw_string_simple(
+    unsigned long a0, unsigned long a1, unsigned long a2, unsigned long a3,
+    unsigned long a4, unsigned long a5, unsigned long a6, unsigned long a7) {
+  (void)a4; (void)a5; (void)a6; (void)a7;
+  const char *str = (const char *)(uintptr_t)a0;
+  /* log before the guards: if we never see this line the call is not reaching
+   * the override at all, and that is a different problem from a bad pointer. */
+  if (grp_str_logs < 30) {
+    grp_str_logs++;
+    const int ok = str && probe_mem_ok(str, 1);
+    debugPrintf("gl: GRP_DrawString ENTRY a0=%p a1=%lu a2=%lu a3=%lu ok=%d "
+                "first=%02x\n", (void *)str, a1, a2, a3, ok,
+                ok ? (unsigned)(unsigned char)str[0] : 0u);
+  }
+  if (!str || !probe_mem_ok(str, 1) || !*str || !cfg.draw_text)
+    return 0;
+
+  GLfloat cc[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+  glGetFloatv(GL_CURRENT_COLOR, cc);
+  unsigned color = ((unsigned)(cc[0] * 255.0f) << 24) |
+                   ((unsigned)(cc[1] * 255.0f) << 16) |
+                   ((unsigned)(cc[2] * 255.0f) << 8) | 0xffu;
+  unsigned arr_color;
+  if (colour_array_rgba(&arr_color)) {
+    static int arr_logs;
+    if (arr_logs < 12) {
+      arr_logs++;
+      debugPrintf("colour-array: '%s' at %d,%d -> %08x (gl %08x)\n", str,
+                  (int)a1, (int)a2, arr_color, color);
+    }
+    color = arr_color;
+  }
+  color = text_colour(color);
+  const int px = cfg.text_px > 0 ? cfg.text_px : 20;
+  plate_probe("grp", str, (int)a1, (int)a2, color);
+
+  if (grp_str_logs < 20) {
+    grp_str_logs++;
+    debugPrintf("gl: GRP_DrawString '%s' at %ld,%ld (a3 %lu) col %08x px %d\n",
+                str, (long)(int)a1, (long)(int)a2, a3, color, px);
+  }
+  text_set_engine_size(input_engine_screen_w(), input_engine_screen_h());
+  text_set_caller("grp-draw");
+  text_draw_engine(str, -1, (int)a1, (int)a2, px, color);
+  return 0;
+}
+
 static unsigned long nx_grp_draw_string(unsigned long a0, unsigned long a1,
                                         unsigned long a2, unsigned long a3,
                                         unsigned long a4, unsigned long a5,
@@ -4669,6 +5422,8 @@ static unsigned long nx_grp_draw_string(unsigned long a0, unsigned long a1,
   unsigned color = ((unsigned)(cc[0] * 255.0f) << 24) |
                          ((unsigned)(cc[1] * 255.0f) << 16) |
                          ((unsigned)(cc[2] * 255.0f) << 8) | 0xffu;
+  color = text_colour(color);
+  plate_probe("sglgrp", str, x, y, color);
 
   {
     /* does the engine hand us pre-broken lines, or one long line? */
@@ -4870,11 +5625,20 @@ TEXT_PROBE(GRPX_DrawSubString)
 TEXT_PROBE(GRPX_DrawSubStringWithFont)
 TEXT_PROBE(GRPX_DrawSubStringWithFontAppend)
 TEXT_PROBE(GRPX_DrawStringImage)
-TEXT_PROBE(GRP_DrawString)
 TEXT_PROBE(IMGFONT_DrawString)
 TEXT_PROBE(CS_grpDrawStringByUTF8)
 TEXT_PROBE(CSFB_grpDrawString)
 TEXT_PROBE(CSOGL_grpDrawString)
+
+TEXT_PROBE(UI_DrawPaperNameTag)
+TEXT_PROBE(NPCBOX_DrawName)
+TEXT_PROBE(EVTSYSTEM_DrawDialogName)
+TEXT_PROBE(UI_DrawBalloonRect)
+TEXT_PROBE(UI_DrawBalloonRectEx)
+
+TEXT_PROBE(INSTANTMSG_DrawNPCName)
+TEXT_PROBE(INSTANTMSG_DrawNameFrame)
+TEXT_PROBE(INSTANTMSGPorting_DrawNameFrame)
 
 TEXT_PROBE(X_TEXTCTRL_CreateImgString)
 
@@ -4890,12 +5654,213 @@ static const so_override text_probe_overrides[] = {
   { "GRPX_DrawSubStringWithFontAppend",
     (void *)textprobe_GRPX_DrawSubStringWithFontAppend },
   { "GRPX_DrawStringImage", (void *)textprobe_GRPX_DrawStringImage },
-  { "GRP_DrawString", (void *)textprobe_GRP_DrawString },
+  { "GRP_DrawString", (void *)nx_grp_draw_string_simple },
+  { "UI_DrawPaperNameTag", (void *)textprobe_UI_DrawPaperNameTag },
+  { "NPCBOX_DrawName", (void *)textprobe_NPCBOX_DrawName },
+  { "EVTSYSTEM_DrawDialogName", (void *)textprobe_EVTSYSTEM_DrawDialogName },
+  { "UI_DrawBalloonRect", (void *)textprobe_UI_DrawBalloonRect },
+  { "UI_DrawBalloonRectEx", (void *)textprobe_UI_DrawBalloonRectEx },
+  { "INSTANTMSG_DrawNPCName", (void *)textprobe_INSTANTMSG_DrawNPCName },
+  { "INSTANTMSG_DrawNameFrame", (void *)textprobe_INSTANTMSG_DrawNameFrame },
+  { "INSTANTMSGPorting_DrawNameFrame",
+    (void *)textprobe_INSTANTMSGPorting_DrawNameFrame },
   { "IMGFONT_DrawString", (void *)textprobe_IMGFONT_DrawString },
   { "CS_grpDrawStringByUTF8", (void *)textprobe_CS_grpDrawStringByUTF8 },
   { "CSFB_grpDrawString", (void *)textprobe_CSFB_grpDrawString },
   { "CSOGL_grpDrawString", (void *)textprobe_CSOGL_grpDrawString },
 };
+
+/* ------------------------------------------------------------------------- */
+/* text colour: never black                                                   */
+/* ------------------------------------------------------------------------- */
+/* Every string in this game is light on a dark plate, so a near-black colour is
+ * never a text colour -- it is a fill that did not restore what it found. The
+ * NPC name plate is the case that made this visible: its backing bar is painted
+ * with glColor(0,0,0,0.7) and the colour is left behind, so the name was drawn
+ * black on black ("the plate is there, the text is not"). The engine's own pen
+ * colour is no help here either -- it reads the same black out of its palette
+ * table:
+ *
+ *   plate: grpx '黑暗教团士兵' at 508,43 col 000000ff (gl 000000ff pen 1)
+ *
+ * So the rule is one line: a colour whose RGB sums below 24 is drawn white. */
+static int is_black(unsigned color) {
+  const unsigned r = (color >> 24) & 0xffu;
+  const unsigned g = (color >> 16) & 0xffu;
+  const unsigned b = (color >> 8) & 0xffu;
+  return r + g + b < 24;
+}
+
+/* Text colour carried by a vertex colour array.
+ *
+ * Some of the engine's UI text is not tinted through glColor at all: the drawer
+ * enables GL_COLOR_ARRAY and hands the colour per vertex, so GL_CURRENT_COLOR
+ * stays white and every one of those lines came out white here. The save slot's
+ * map name (gold) and the character page's 能力点/技能点 on the light bar (black)
+ * are both drawn that way.
+ *
+ * GLES1 cannot ask "what colour will this quad be", so the first entry of the
+ * array is read and used; a text quad is one colour throughout. */
+static int colour_array_rgba(unsigned *out) {
+  if (!out || !glIsEnabled(GL_COLOR_ARRAY))
+    return 0;
+  GLint size = 4, stride = 0;
+  GLenum type = GL_FLOAT;
+  void *ptr = NULL;
+  glGetIntegerv(GL_COLOR_ARRAY_SIZE, &size);
+  glGetIntegerv(GL_COLOR_ARRAY_TYPE, &type);
+  glGetIntegerv(GL_COLOR_ARRAY_STRIDE, &stride);
+  glGetPointerv(GL_COLOR_ARRAY_POINTER, &ptr);
+  if (!ptr || size < 3)
+    return 0;
+  const int unit = (type == GL_FLOAT) ? 4 : (type == GL_UNSIGNED_BYTE) ? 1 : 4;
+  if (stride <= 0)
+    stride = size * unit;
+  (void)stride;
+  float c[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+  for (int i = 0; i < 4; i++) {
+    if (i >= size) {
+      c[i] = (i == 3) ? 1.0f : 0.0f;
+      continue;
+    }
+    const unsigned char *q = (const unsigned char *)ptr + (size_t)i * unit;
+    if (type == GL_FLOAT)
+      c[i] = *(const float *)q;
+    else if (type == GL_UNSIGNED_BYTE)
+      c[i] = (float)(*(const unsigned char *)q) / 255.0f;
+    else if (type == GL_FIXED)
+      c[i] = (float)(*(const int32_t *)q) / 65536.0f;
+  }
+  *out = ((unsigned)(c[0] * 255.0f + 0.5f) << 24) |
+         ((unsigned)(c[1] * 255.0f + 0.5f) << 16) |
+         ((unsigned)(c[2] * 255.0f + 0.5f) << 8) | 0xffu;
+  return 1;
+}
+
+/* Black is never a text colour here, so it is lifted to white.
+ *
+ * The NPC name plate is the case that made this necessary: its backing bar is
+ * painted with glColor(0,0,0,0.7) and the colour is left behind, so the name
+ * was drawn black on black. The engine's own pen colour does not help -- it
+ * reads the same black out of a palette table that is zero in this port:
+ *
+ *   plate: grpx '黑暗教团士兵' at 508,43 col 000000ff
+ *   plate: grpx '杂货商人'     at 528,43 col ffffffff   (after this rule)
+ *
+ * It is drawn once per frame, so there is no separate shadow to keep dark: what
+ * looks like one is the antialiasing of the single quad. */
+static unsigned text_colour(unsigned color) {
+  return is_black(color) ? 0xFFFFFFFFu : color;
+}
+
+/* The label gold (#FAC8A0). The original uses it for the dialogue speaker's
+ * name, the save slot's map name and the character page's labels; this port drew
+ * all of them white because the colour never arrives through the GL state (the
+ * engine's UI palette COLOR_nValue[] reads as zero here, and the save row's tint
+ * comes from a per-vertex colour array we do not read).
+ *
+ * Three shapes are recognised, all of them things the game only ever draws in
+ * that gold:
+ *   - the speaker's name: a short line at y ~434, left of the potion counter;
+ *   - the character page's labels: fixed strings;
+ *   - the save slot's map name: the third line of a row, at x ~703. */
+/* The speaker's name is only the short line above a live dialogue -- the
+ * character page's own labels sit at the same height (智力 and EVD are at y 434
+ * too), and keying on the position alone made those 1.7x too big. */
+static unsigned g_char_page_frame;   /* last frame a stat label was drawn */
+
+static int is_char_label(const char *s) {
+  static const char *const labels[] = {
+    "力量", "敏捷", "体力", "智力", "精力",
+    "HP", "MP", "EXP",
+    "DMG", "M.DMG", "CRT", "H.RATE", "C.DMG",
+    "DEF", "P.RES", "M.RES", "EVD", "W.D.R", "S.D.R",
+  };
+  for (unsigned i = 0; i < sizeof(labels) / sizeof(*labels); i++)
+    if (!strcmp(s, labels[i]))
+      return 1;
+  return 0;
+}
+
+static int is_gold_text(const char *s, int x, int y) {
+  if (is_char_label(s)) {
+    g_char_page_frame = g_frame_no;
+    return 1;
+  }
+  /* 能力点:0 / 技能点:0: the pair at the top right of the page is gold, the
+   * pair under the portrait sits on a light bar and is black there (handled by
+   * the drawer, which returns early for those). */
+  if ((!strncmp(s, "能力点", 9) || !strncmp(s, "技能点", 9)) && x >= 550)
+    return 1;
+  /* The character page's name block (Lv / class / name) is gold too, but the
+   * in-game map name banner is drawn at almost the same place -- (498,294)
+   * against (505,228)/(466,253)/(506,283) -- and must stay white, so the block
+   * stops just above it. */
+  if (x >= 430 && x <= 620 && y >= 195 && y <= 288)
+    return 1;
+  /* the save slot's map name: third text line of a row (rows at 90/256/422),
+   * in the row's own text column -- the character page's stat values sit at
+   * x ~750 on the same heights and must stay white. */
+  if (x > 600 && x < 800 &&
+      (abs(y - 181) <= 8 || abs(y - 347) <= 8 || abs(y - 513) <= 8))
+    return 1;
+  /* the dialogue speaker's name: only while a body line is on screen */
+  if (y >= 425 && y <= 445 && x <= 900 && g_frame_no - g_dialog_body_frame <= 2) {
+    const size_t n = strlen(s);
+    if (n == 0 || n > 15)
+      return 0;
+    for (size_t i = 0; i < n; i++)
+      if (s[i] >= '0' && s[i] <= '9')
+        return 0;
+    return 1;
+  }
+  return 0;
+}
+
+/* The character page's stat values are pure white in the original; the engine
+ * hands the drawer a slightly dimmed grey (0xd8). They are the numeric column on
+ * the right of each row (x >= 950, y 440..640), so only that column is lifted. */
+static int is_stat_value(const char *s, int x, int y) {
+  /* y 140, not 150: the "技能点: 0" / "能力点: 0" strip sits at y 147, and its
+   * number was the one string on these pages that never got whitened -- it fell
+   * through to the dim brown the engine hands over (0x684f30) and was
+   * unreadable on the plate. The label above it is a separate draw and stays
+   * gold. */
+  if (y < 140 || y > 640 || x < 200 || x > 1100)
+    return 0;
+  int digits = 0;
+  for (const char *p = s; *p; p++) {
+    const char c = *p;
+    if (c >= '0' && c <= '9') { digits = 1; continue; }
+    if (c == '/' || c == '%' || c == '.' || c == ':' || c == ' ')
+      continue;
+    return 0;
+  }
+  return digits;
+}
+
+/* One line for every distinct (drawer, y, colour) seen in the top strip, so a
+ * run names the path that draws the NPC name plate and the colour it ends up
+ * with. Bounded: at most a dozen lines. */
+static void plate_probe(const char *who, const char *str, int x, int y,
+                        unsigned color) {
+  static struct { const char *who; int x, y; unsigned c; } seen[12];
+  static int n;
+  if (y < 30 || y > 120)
+    return;
+  for (int i = 0; i < n; i++)
+    if (seen[i].who == who && seen[i].x == x && seen[i].y == y &&
+        seen[i].c == color)
+      return;
+  if (n >= (int)(sizeof(seen) / sizeof(*seen)))
+    return;
+  seen[n].who = who;
+  seen[n].x = x;
+  seen[n].y = y;
+  seen[n].c = color;
+  n++;
+  debugPrintf("plate: %s '%s' at %d,%d col %08x\n", who, str, x, y, color);
+}
 
 /* GRPX_DrawStringWithFont(text, x, y, encoding, font_index) is the level above
  * SGL_grpDrawStringWithFont and the one the game actually calls. It is hooked
@@ -4944,10 +5909,22 @@ static long nx_get_text_size(const void *font, const char *str, int enc,
   if (out_w && probe_mem_ok(out_w, 4))
     *out_w = w;
   if (out_h && probe_mem_ok(out_h, 4))
-    *out_h = px;
+    *out_h = px * 13 / 10;          /* line height, not the glyph size */
   if (measure_logs < 40) {
     measure_logs++;
     debugPrintf("gl: GetTextSize(%p, \"%s\") -> %d x %d\n", font, str, w, px);
+  }
+  {
+    /* the quest popup lays its box out from these metrics; log the ones that
+     * belong to it so the size it asks for can be compared with the size the
+     * text is drawn at */
+    static int popup_logs;
+    if (popup_logs < 12 && str && (strstr(str, "刺杀") || strstr(str, "获得") ||
+                                   strstr(str, "复命"))) {
+      popup_logs++;
+      debugPrintf("popup: GetTextSize '%s' font %p px %d -> w %d h %d\n", str,
+                  font, px, w, px);
+    }
   }
   return 0;
 }
@@ -4970,7 +5947,7 @@ static long nx_get_text_size_in_rect(const void *font, const char *str, int len,
   if (out_w && probe_mem_ok(out_w, 4))
     *out_w = w;
   if (out_h && probe_mem_ok(out_h, 4))
-    *out_h = px;
+    *out_h = px * 13 / 10;          /* line height, not the glyph size */
   return 0;
 }
 
@@ -4999,6 +5976,17 @@ static unsigned long nx_grpx_draw_string(unsigned long a0, unsigned long a1,
   if (!cfg.draw_text)
     return 0;
 
+  {
+    /* the font table only exists once the engine has drawn something, so the
+     * per-index heights are read here, not at init (that call hangs) */
+    static int font_logs;
+    if (font_logs < 1 && grpx_font_height) {
+      font_logs++;
+      debugPrintf("main: font heights 0..4 = %ld %ld %ld %ld %ld\n",
+                  grpx_font_height(0), grpx_font_height(1), grpx_font_height(2),
+                  grpx_font_height(3), grpx_font_height(4));
+    }
+  }
   int px = cfg.text_px;
   if (px <= 0 && !cfg.text_fixed_px && grpx_font_height) {
     /* GRPX_GetFontHeight is the LINE height (26 for this font) and includes the
@@ -5011,12 +5999,30 @@ static unsigned long nx_grpx_draw_string(unsigned long a0, unsigned long a1,
   if (px <= 0)
     px = 20;
 
+  /* The engine carries the size in the font index (x4), not in a height we have
+   * to guess: font 0 is the small line ("Lv. 1"), font 1 is body text (labels,
+   * the 力量/敏捷 rows) and font 2 is the name font, used for the dialogue
+   * speaker and for the character's own name. Reading it here is why the
+   * dialogue name and the character name can be big while 敏捷 next to them
+   * stays at body size -- the position rules that tried to do this by pixel
+   * range also caught 敏捷, which sits at the same height as the name. */
+  if (cfg.text_px <= 0) {
+    switch ((int)a4) {
+    case 0: px = px * 3 / 4; break;      /* small */
+    case 2: px = px * 2; break;          /* name */
+    default: break;                      /* 1: body */
+    }
+  } else if ((int)a4 == 2) {
+    px = px * 2;                         /* cfg.text_px still pins the body size */
+  }
+  const int gold = is_gold_text(str, (int)a1, (int)a2);
+  const int dialog_name = gold && (int)a2 >= 425 && (int)a2 <= 445;
+
   GLfloat cc[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
   glGetFloatv(GL_CURRENT_COLOR, cc);
   unsigned color = ((unsigned)(cc[0] * 255.0f) << 24) |
-                         ((unsigned)(cc[1] * 255.0f) << 16) |
-                         ((unsigned)(cc[2] * 255.0f) << 8) | 0xffu;
-
+                   ((unsigned)(cc[1] * 255.0f) << 16) |
+                   ((unsigned)(cc[2] * 255.0f) << 8) | 0xffu;
   if (grpx_draw_logs < 400) {
     grpx_draw_logs++;
     /* NOT grpx_measure(): that calls the engine's own SGL_GetTextSize through a
@@ -5037,11 +6043,80 @@ static unsigned long nx_grpx_draw_string(unsigned long a0, unsigned long a1,
    * put 力量's number in place but also dragged DEF and M.DMG out of the value
    * column on the character page.) */
   const int draw_x = align_x(str, -1, (int)a1, (int)a3, px);
+  /* The skill page's title bar ("技能点: 0") is drawn in this band; its value
+   * is what the player says is unreadable, so record the colour the drawer is
+   * handed for anything short drawn up there. */
+  {
+    static int hdr_logs;
+    if (hdr_logs < 30 && (int)a2 >= 100 && (int)a2 <= 200 && draw_x >= 550 &&
+        draw_x <= 1050 && strlen(str) <= 12) {
+      hdr_logs++;
+      debugPrintf("hdr: '%s' at %d,%d font %lu col %08x\n", str, draw_x,
+                  (int)a2, a4, color);
+    }
+  }
+  /* the character page's name block (Lv / class / name) sits a little low in
+   * its frame -- the engine anchors it on the box bottom */
+  int draw_y = (int)a2;
+  if (draw_x >= 430 && draw_x <= 620 && (int)a2 >= 195 && (int)a2 <= 292)
+    draw_y -= 8;
+
+  /* the backing bar leaves glColor at black; black glyphs on it are invisible */
+  color = text_colour(color);
+  if ((!strncmp(str, "能力点", 9) || !strncmp(str, "技能点", 9)) &&
+      (int)a1 < 550) {
+    /* on the light bar under the portrait: black, and text_colour()'s
+     * "never black" rule has to be bypassed for it */
+    color = 0x000000FFu;
+  } else if (is_stat_value(str, draw_x, (int)a2)) {
+    color = 0xFFFFFFFFu;
+  } else if (gold) {
+    static int name_logs;
+    /* The character page's panel is blue-grey, so the warm #FAC8A0 measured off
+     * the original dialogue plate reads reddish on it; that page gets a cooler,
+     * darker gold instead (#C6B992 on screen). */
+    const int cool = is_char_label(str) ||
+                     ((int)a1 >= 430 && (int)a1 <= 620 &&
+                      (int)a2 >= 195 && (int)a2 <= 292);
+    /* #FAC8A0 measured off the Android screenshot, packed the way text.c wants
+     * it: that renderer stores each texel as (a<<24)|(r<<16)|(g<<8)|b in a
+     * little-endian uint32, so the bytes it uploads are B,G,R,A and the red and
+     * blue channels swap on the way into the texture. Passing 0xFAC8A0FF here
+     * drew the name blue. */
+    /* #C6B992: a dark gold with the red pulled down so it does not read warm on
+     * the character page's blue-grey panel, dark enough to stay a gold rather
+     * than drift to white (the tone the player settled on). #FAC8A0 is the warm
+     * gold measured off the original dialogue plate. Plain 0xRRGGBBAA now that
+     * text.c packs the texel the way the texture reads it. */
+    color = cool ? 0xC6B992FFu : 0xFAC8A0FFu;
+    if (name_logs < 8) {
+      name_logs++;
+      debugPrintf("gold: '%s' at %d,%d px %d%s\n", str, draw_x, (int)a2, px,
+                  dialog_name ? " (dialog name)" : "");
+    }
+  }
+  plate_probe("grpx", str, draw_x, draw_y, color);
+  {
+    /* character page: short strings in its left/centre columns */
+    static struct { char t[24]; int x, y; unsigned c; } seen[24];
+    static int n;
+    if ((int)a2 >= 170 && (int)a2 <= 560 && draw_x >= 380 && draw_x <= 900 &&
+        strlen(str) < 20) {
+      int known = 0;
+      for (int i = 0; i < n; i++)
+        if (!strcmp(seen[i].t, str) && seen[i].y == (int)a2) { known = 1; break; }
+      if (!known && n < (int)(sizeof(seen) / sizeof(*seen))) {
+        snprintf(seen[n].t, sizeof(seen[n].t), "%s", str);
+        seen[n].x = draw_x; seen[n].y = (int)a2; seen[n].c = color; n++;
+        debugPrintf("page: '%s' at %d,%d col %08x\n", str, draw_x, (int)a2, color);
+      }
+    }
+  }
 
   text_set_caller("grpx");
   our_text_note(str);
   text_set_caller("grpx");
-  text_draw_engine(str, -1, draw_x, (int)a2, px, color);
+  text_draw_engine(str, -1, draw_x, draw_y, px, color);
   return 0;
 }
 
@@ -5072,6 +6147,7 @@ static const so_override mercury_overrides[] = {
   { "GRPX_DrawString",                     (void *)log_grpx_plain },
   { "X_TEXTCTRL_CreateImgString",           (void *)nx_textctrl_create_imgstring },
   { "X_TEXTCTRL_DrawTextControl",          (void *)nx_textctrl_draw },
+  { "UIDesc_DrawTextScroll",               (void *)nx_desc_text_scroll },
   { "X_TEXTCTRL_SetTextControl",           (void *)nx_textctrl_set },
   { "X_TEXTCTRL_DestroyTextControl",       (void *)nx_textctrl_destroy },
   { "MW_Graphic_DrawString",               (void *)probe_mw },
@@ -5134,6 +6210,102 @@ static const so_override save_overrides[] = {
   { "C2SHubSaveDataCheckExistFromServer", (void *)del_check_logged },
   { "SAVE_FileDelete",              (void *)file_del_logged },
   { "UIPopupMsg_ButtonOKExe",       (void *)nx_popup_ok },
+};
+
+/* ------------------------------------------------------------------------- */
+/* the in-game store, offline                                                 */
+/* ------------------------------------------------------------------------- */
+/* Tapping the cart runs UIPlay_CallInAppShopProc, which enters the engine's own
+ * store UI (NetworkStore_Enter) and then asks the IAP layer to connect:
+ *
+ *   InApp_SelectTarget -> CS_IapV4MarketConnect -> Java marketConnect(J)
+ *     J = InAppV4MarketListCB, the native callback the Java side calls back.
+ *   InAppV4MarketListCB(0, "google", 6, code) -> CS_IapV4GetProductInfo
+ *   -> Java getProductInfo(J) with InAppV4ProductInfoCB
+ *   InAppV4ProductInfoCB(0, ?, n, records) -> the product table the store draws
+ *
+ * The Java object did not exist here (the shell that creates it is ours), so the
+ * first virtual call landed on address 4 and the console stalled. It is now
+ * created at boot (fn_iap_init), and jni_fake answers marketConnect. The product
+ * list is the part that has to come from somewhere, so it is built here from the
+ * engine's own expected-id table (the one InAppV4ProductInfoCB compares each
+ * record against) with placeholder prices.
+ *
+ * Record layout, recovered from csGetProductInfoCB's stores into the 104-byte
+ * record it allocates per product:
+ *   +0x00 productType   +0x08 id (this is what the engine matches)
+ *   +0x18 currency      +0x20 price (double)
+ *   +0x28 displayPrice  +0x30 an int (coinsReward)
+ */
+static void *g_store_products;     /* kept alive: the engine may hold pointers */
+
+#define STORE_REC_SIZE 0x68
+#define STORE_MAX_PRODUCTS 32
+
+static unsigned long store_product_info(unsigned long a0, unsigned long a1,
+                                        unsigned long a2, unsigned long a3,
+                                        unsigned long a4, unsigned long a5,
+                                        unsigned long a6, unsigned long a7) {
+  (void)a0; (void)a1; (void)a2; (void)a3;
+  (void)a4; (void)a5; (void)a6; (void)a7;
+  if (!iap_product_cb)
+    return 0;
+  /* the engine's own list of product ids: GOT slot 0x29fb48 holds a pointer to
+   * an array of char* built from the APK's product names */
+  char **ids = *(char ***)((uintptr_t)game_mod.load_virtbase + 0x29fb48);
+  int n = 0;
+  while (ids && ids[n] && n < STORE_MAX_PRODUCTS)
+    n++;
+  if (n <= 0) {
+    debugPrintf("store: no expected product ids, product info not built\n");
+    return 0;
+  }
+  if (!g_store_products) {
+    unsigned char *recs = calloc((size_t)n, STORE_REC_SIZE);
+    if (!recs)
+      return 0;
+    for (int i = 0; i < n; i++) {
+      unsigned char *r = recs + (size_t)i * STORE_REC_SIZE;
+      char buf[64];
+      *(char **)(r + 0x00) = strdup("inapp");          /* productType */
+      *(char **)(r + 0x08) = strdup(ids[i]);           /* id            */
+      *(char **)(r + 0x18) = strdup("CNY");            /* currency      */
+      *(double *)(r + 0x20) = 6.0;                     /* price         */
+      snprintf(buf, sizeof(buf), "\xC2\xA5%.2f", 6.0);   /* ¥6.00         */
+      *(char **)(r + 0x28) = strdup(buf);              /* displayPrice  */
+      *(int *)(r + 0x30) = 0;                          /* coinsReward   */
+    }
+    g_store_products = recs;
+    debugPrintf("store: built %d product record(s), first id '%s'\n", n, ids[0]);
+  }
+  iap_product_cb(0, NULL, n, g_store_products);
+  /* The callback's own tail call is C2S_HubBeginWithFlow, which ends in
+   * Network_SendData(0x42, ...): the store is driven by the game's own server
+   * protocol (Network_SendData -> server -> Network_NextInterrup -> next state),
+   * so it cannot leave its "connecting" state offline and never builds a page.
+   * Forcing NetworkStore_SetState() here does not help -- the state handlers read
+   * the received-item list, which is only filled from those server replies. */
+  {
+    void *recs = *(void **)((uintptr_t)game_mod.load_virtbase + 0x2d8508);
+    debugPrintf("store: received list %p count %ld\n", recs,
+                recs ? *(long *)recs : -1L);
+  }
+  return 0;
+}
+
+/* Every state change goes through here, so the log shows exactly who moves the
+ * store forward (or back to 0). */
+static void (*store_set_state_real)(long);
+static void store_set_state_logged(long st) {
+  debugPrintf("store: state %ld\n", st);
+  if (store_set_state_real)
+    store_set_state_real(st);
+}
+
+static const so_override store_overrides[] = {
+  /* the only piece of the IAP chain that has to be answered locally */
+  { "CS_IapV4GetProductInfo",       (void *)store_product_info },
+  { "NetworkStore_SetState",        (void *)store_set_state_logged },
 };
 
 /* ------------------------------------------------------------------------- */
@@ -5447,6 +6619,10 @@ int main(int argc, char **argv) {
                    (int)(sizeof(mercury_overrides) / sizeof(*mercury_overrides)));
   so_set_overrides(save_overrides,
                    (int)(sizeof(save_overrides) / sizeof(*save_overrides)));
+  store_set_state_real = (void (*)(long))so_try_find_addr_rx(
+      &game_mod, "NetworkStore_SetState");
+  so_set_overrides(store_overrides,
+                   (int)(sizeof(store_overrides) / sizeof(*store_overrides)));
   if (cfg.text_trace) {
     static const struct { const char *name; txt_fn *slot; } bind[] = {
       { "SGL_grpDrawStringWithFont2", &textprobe_SGL_grpDrawStringWithFont2_real },
@@ -5460,7 +6636,15 @@ int main(int argc, char **argv) {
       { "GRPX_DrawSubStringWithFontAppend",
         &textprobe_GRPX_DrawSubStringWithFontAppend_real },
       { "GRPX_DrawStringImage", &textprobe_GRPX_DrawStringImage_real },
-      { "GRP_DrawString", &textprobe_GRP_DrawString_real },
+      { "UI_DrawPaperNameTag", &textprobe_UI_DrawPaperNameTag_real },
+      { "NPCBOX_DrawName", &textprobe_NPCBOX_DrawName_real },
+      { "EVTSYSTEM_DrawDialogName", &textprobe_EVTSYSTEM_DrawDialogName_real },
+      { "UI_DrawBalloonRect", &textprobe_UI_DrawBalloonRect_real },
+      { "UI_DrawBalloonRectEx", &textprobe_UI_DrawBalloonRectEx_real },
+      { "INSTANTMSG_DrawNPCName", &textprobe_INSTANTMSG_DrawNPCName_real },
+      { "INSTANTMSG_DrawNameFrame", &textprobe_INSTANTMSG_DrawNameFrame_real },
+      { "INSTANTMSGPorting_DrawNameFrame",
+        &textprobe_INSTANTMSGPorting_DrawNameFrame_real },
       { "IMGFONT_DrawString", &textprobe_IMGFONT_DrawString_real },
       { "CS_grpDrawStringByUTF8", &textprobe_CS_grpDrawStringByUTF8_real },
       { "CSFB_grpDrawString", &textprobe_CSFB_grpDrawString_real },
@@ -5502,6 +6686,16 @@ int main(int argc, char **argv) {
       so_try_find_addr_rx(&game_mod, "GRPX_DrawSubStringWithFont2");
   grpx_font_height = (long (*)(int))so_try_find_addr_rx(&game_mod,
                                                         "GRPX_GetFontHeight");
+  grpx_line_height = grpx_font_height;
+  desc_ability_fn = (void (*)(void *, int, int, int, int))so_try_find_addr_rx(
+      &game_mod, "UISkill_DrawDescAbility");
+  hdot_fn = (void (*)(int, int, int, unsigned))so_try_find_addr_rx(
+      &game_mod, "UI_DrawHDotLine");
+  desc_scroll_real = (void (*)(void *, int))so_try_find_addr_rx(
+      &game_mod, "UIDesc_DrawTextScroll");
+  debugPrintf("main: desc page layout: ability %p dash %p scroll %p\n",
+              (void *)desc_ability_fn, (void *)hdot_fn,
+              (void *)desc_scroll_real);
   grp_draw_real = (unsigned long (*)(unsigned long, unsigned long,
                                      unsigned long, unsigned long,
                                      unsigned long, unsigned long,
@@ -5684,6 +6878,13 @@ static void engine_main(void *arg) {
   } else {
     debugPrintf("main: no ActiveUser.jniInitialize export\n");
   }
+  if (fn_iap_init) {
+    void *iap = jni_make_object("inappv4");
+    fn_iap_init(fake_env, iap, iap);
+    debugPrintf("main: InAppV4.jniInitialize done\n");
+  } else {
+    debugPrintf("main: no InAppV4.jniInitialize export\n");
+  }
 
   /* ---- Android boot sequence, in the order MainActivity.onCreate ran it ---- */
 
@@ -5824,6 +7025,9 @@ static void engine_main(void *arg) {
     /* atlas work for the previous frame; kept out of the draw callbacks */
     strimg_pending_tick();
     input_update();
+    /* the description pages scroll through their own control; the finger travel
+     * is fed to it here, before the engine draws the page this frame */
+    desc_scroll_tick();
     /* The class screen only exists in the new-game flow, and the decision to
      * create a character or to resume one is taken later, by STATE_EnterGame:
      * it tests GAMESTATE_bNewGame and, with the flag clear, picks up whatever

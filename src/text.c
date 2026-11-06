@@ -439,6 +439,22 @@ static TextCache *render(const char *utf8, int px, unsigned color) {
   if (nc == 0 || width <= 0)
     return NULL;
 
+  /* Line the glyphs up on the font's baseline, not on each string's own ink.
+   * The box used to be exactly the ink of this string, and the quad is drawn
+   * with its top at the y the engine gives -- so a digits-only string ("0" next
+   * to 能力点:) has no descender and a smaller ascent, and it came out sitting
+   * higher than the CJK label next to it at the very same y. Padding the box to
+   * the face's ascender/descender puts every string of one size on one
+   * baseline. */
+  {
+    const int face_asc = (int)(face->size->metrics.ascender >> 6);
+    const int face_desc = (int)(-(face->size->metrics.descender >> 6));
+    if (face_asc > ascent)
+      ascent = face_asc;
+    if (face_desc > descent)
+      descent = face_desc;
+  }
+
   const int height = ascent + descent + 2;
   if (width > ATLAS_MAX || height > ATLAS_MAX)
     return NULL;
@@ -471,7 +487,15 @@ static TextCache *render(const char *utf8, int px, unsigned color) {
         const uint8_t a = g->bitmap.buffer[row * g->bitmap.pitch + col];
         if (!a)
           continue;
-        bitmap[(size_t)y * width + x] = ((uint32_t)a << 24) | (cr << 16) | (cg << 8) | (cb);
+        /* The buffer is a uint32_t uploaded as GL_RGBA/GL_UNSIGNED_BYTE, so on a
+         * little-endian CPU the bytes that reach the texture are the reverse of
+         * the word: packing (a<<24)|(r<<16)|(g<<8)|b lands as B,G,R,A and every
+         * colour whose red and blue differ came out swapped -- the gold names
+         * turned blue, the blue emphasis turned red. Pack it the way the texture
+         * actually reads it: A,B,G,R. */
+        bitmap[(size_t)y * width + x] = ((uint32_t)a << 24) |
+                                         ((uint32_t)cb << 16) |
+                                         ((uint32_t)cg << 8) | (uint32_t)cr;
         (void)ca;
       }
     }
@@ -515,16 +539,21 @@ static unsigned colour_for_code(unsigned char id) {
    * closed by "$B" ("...可以获得$S每日奖励$B。"), so it is what the sentence
    * returns to. S is the emphasis the original draws in blue -- "每日奖励",
    * the numbers in a skill description, the HP range on a potion. R is the
-   * red warning used for a missing skill point. */
+   * red warning used for a missing skill point.
+   *
+   * These are plain 0xRRGGBBAA now. They used to be written for the swapped
+   * byte order render() produced (see the texel packing there), which is why
+   * "S" held 0xFF4080FF: blue on screen, pink in the value. */
   case 'B': return 0xFFFFFFFFu;   /* base / default */
-  case 'S': return 0xFF4080FFu;   /* emphasis, blue */
-  case 'R': return 0xFFFF4040u;   /* red            */
-  case 'G': return 0xFF40FF40u;   /* green          */
-  case 'Y': return 0xFFFFFF40u;   /* yellow         */
-  case 'C': return 0xFF40FFFFu;   /* cyan           */
-  case 'M': return 0xFFFF40FFu;   /* magenta        */
+  case 'A': return 0xFF4040FFu;   /* accent: the popup title, same red as R */
+  case 'S': return 0x4080FFFFu;   /* emphasis, blue */
+  case 'R': return 0xFF4040FFu;   /* red            */
+  case 'G': return 0x40FF40FFu;   /* green          */
+  case 'Y': return 0xFFFF40FFu;   /* yellow         */
+  case 'C': return 0x40FFFFFFu;   /* cyan           */
+  case 'M': return 0xFF40FFFFu;   /* magenta        */
   case 'W': return 0xFFFFFFFFu;   /* white          */
-  case 'K': return 0xFF101010u;   /* black          */
+  case 'K': return 0x101010FFu;   /* black          */
   default:  return 0xFFFFFFFFu;   /* unknown: back to the default pen */
   }
 }
@@ -688,6 +717,7 @@ static int wrap_width;
 
 void text_set_wrap_width(int w) { wrap_width = w > 0 ? w : 0; }
 
+
 /* byte length of the UTF-8 sequence starting at p (1 for a stray byte) */
 static int utf8_len(const char *p) {
   const unsigned char c = (unsigned char)*p;
@@ -719,7 +749,17 @@ static int bytes_for_chars(const char *s, int n) {
  * of that paragraph down by the same amount. A paragraph ends when the engine
  * starts a new frame (y goes backwards). */
 static int wrap_extra;
+static int wrap_extra_on = 1;
 static int wrap_last_y = -10000;
+/* The push-down that keeps the engine's *next line* below the extra lines we
+ * added only makes sense for a single block of text. A page that draws several
+ * blocks at its own y positions (the skill description draws one per level) must
+ * not accumulate it, or the second block lands a whole block lower. */
+void text_set_wrap_extra(int on) {
+  wrap_extra_on = on;
+  if (!on)
+    wrap_extra = 0;
+}
 
 void text_draw_engine(const char *utf8, int len, int x, int y, int px,
                       unsigned color) {
@@ -779,7 +819,7 @@ void text_draw_engine_ex(const char *utf8, int len, int x, int y, int px,
    * again" and "new frame". */
   if (y <= wrap_last_y)
     wrap_extra = 0;
-  int draw_y = y + wrap_extra;
+  int draw_y = y + (wrap_extra_on ? wrap_extra : 0);
   wrap_last_y = y;
 
   const int size = sane_px(px);
@@ -796,6 +836,7 @@ void text_draw_engine_ex(const char *utf8, int len, int x, int y, int px,
   char work[1024];
   snprintf(work, sizeof(work), "%s", source);
   char *p = work;
+  char carry = 0;            /* colour code still in force from the last line */
   while (p && *p) {
     char *nl = strchr(p, '\n');
     if (nl)
@@ -837,10 +878,35 @@ void text_draw_engine_ex(const char *utf8, int len, int x, int y, int px,
             break;
           memcpy(piece, p, (size_t)bytes);
           piece[bytes] = 0;
-          if (strchr(piece, '$'))
-            text_draw_rich_line(piece, x, draw_y + line * line_h, size, color);
+          /* A wrap can land in the middle of a coloured span: "…$R刺杀格里" /
+           * "普顿伯爵$B。" -- the second line starts with no code at all and
+           * would be drawn in the base colour, while the original keeps it red.
+           * Carry the last code seen onto the continuation. */
+          char tmp[1040];
+          const char *draw_piece = piece;
+          const int starts_with_code =
+              piece[0] == '$' && piece[1] &&
+              ((piece[1] >= 'A' && piece[1] <= 'Z') ||
+               (piece[1] >= 'a' && piece[1] <= 'z'));
+          if (carry && !starts_with_code) {
+            tmp[0] = '$';
+            tmp[1] = carry;
+            snprintf(tmp + 2, sizeof(tmp) - 2, "%s", piece);
+            draw_piece = tmp;
+          }
+          for (const char *q = piece; *q; q++)
+            if (q[0] == '$' && q[1] &&
+                ((q[1] >= 'A' && q[1] <= 'Z') ||
+                 (q[1] >= 'a' && q[1] <= 'z'))) {
+              carry = q[1];
+              q++;
+            }
+          if (strchr(draw_piece, '$'))
+            text_draw_rich_line(draw_piece, x, draw_y + line * line_h, size,
+                                color);
           else
-            text_draw_engine_line(piece, x, draw_y + line * line_h, size, color);
+            text_draw_engine_line(draw_piece, x, draw_y + line * line_h, size,
+                                  color);
           line++;
           p += bytes;
         }
@@ -852,7 +918,7 @@ void text_draw_engine_ex(const char *utf8, int len, int x, int y, int px,
   }
 
   /* the engine's next line was laid out for the original count */
-  if (line > 1)
+  if (line > 1 && wrap_extra_on)
     wrap_extra += (line - 1) * line_h;
 }
 
@@ -866,6 +932,57 @@ void text_set_engine_size(int w, int h) {
     engine_w = w;
   if (h > 0)
     engine_h = h;
+}
+
+/* Display region for text, in engine units (x1 <= x0 = off). Glyph quads are
+ * trimmed at its edges, the same way the original clips the scrolling
+ * description, so the text slides under the frame instead of disappearing a
+ * line at a time. */
+static int clip_on, clip_x0, clip_y0, clip_x1, clip_y1;
+
+/* A plain filled rectangle in engine units -- used for the description page's
+ * scroll thumb, which the engine's own ControlScroll draws but never moves here
+ * (its position is only fed by the scroll control's event handling, which this
+ * page never sees). */
+void text_fill_rect(int x, int y, int w, int h, unsigned color) {
+  if (w <= 0 || h <= 0)
+    return;
+  const GLboolean tex_on = glIsEnabled(GL_TEXTURE_2D);
+  const GLboolean blend_on = glIsEnabled(GL_BLEND);
+  GLfloat prev[4] = { 1, 1, 1, 1 };
+  glGetFloatv(GL_CURRENT_COLOR, prev);
+  glDisable(GL_TEXTURE_2D);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glColor4f(((color >> 24) & 0xff) / 255.0f, ((color >> 16) & 0xff) / 255.0f,
+            ((color >> 8) & 0xff) / 255.0f, (color & 0xff) / 255.0f);
+  const GLfloat v[4][2] = { { (float)x, (float)y },
+                            { (float)(x + w), (float)y },
+                            { (float)x, (float)(y + h) },
+                            { (float)(x + w), (float)(y + h) } };
+  glEnableClientState(GL_VERTEX_ARRAY);
+  glVertexPointer(2, GL_FLOAT, 0, v);
+  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+  glDisableClientState(GL_VERTEX_ARRAY);
+  /* `v` is a local: the engine's SGL fills submit through one global array and
+   * never re-specify the pointer, so leaving ours behind makes the next fill
+   * read this dead stack frame -- which is exactly the smeared, repeated quads
+   * that showed up once the scroll thumb started drawing. */
+  nx_restore_client_arrays();
+  glColor4f(prev[0], prev[1], prev[2], prev[3]);
+  if (tex_on)
+    glEnable(GL_TEXTURE_2D);
+  if (!blend_on)
+    glDisable(GL_BLEND);
+}
+
+void text_set_clip(int x0, int y0, int x1, int y1) {
+  if (x1 <= x0 || y1 <= y0) {
+    clip_on = 0;
+    return;
+  }
+  clip_on = 1;
+  clip_x0 = x0; clip_y0 = y0; clip_x1 = x1; clip_y1 = y1;
 }
 
 /* One textured quad. y grows downwards in the engine's layout, so the ortho
@@ -884,15 +1001,25 @@ static void draw_quad(TextCache *c, int x, int y, int own_ortho) {
   const GLboolean light_on = glIsEnabled(GL_LIGHTING);
   GLint prev_tex = 0;
   GLfloat prev_color[4] = { 1, 1, 1, 1 };
+  GLfloat prev_proj[16], prev_mv[16];
   glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
   glGetFloatv(GL_CURRENT_COLOR, prev_color);
   if (own_ortho) {
+    /* Save and restore the matrices by value rather than with
+     * glPushMatrix/glPopMatrix. GLES1 guarantees only TWO projection stack
+     * entries, and the engine already uses one of them while it draws its 2D
+     * pass (pact2DBegin pushes GL_PROJECTION). A push on top of that overflows:
+     * the push is dropped, the glLoadIdentity below then overwrites the
+     * engine's own projection, and the matching pop pops *its* matrix -- so the
+     * rest of that frame is drawn with an identity projection and the picture
+     * jumps for one frame, every frame, which reads as the whole screen
+     * twitching. */
+    glGetFloatv(GL_PROJECTION_MATRIX, prev_proj);
+    glGetFloatv(GL_MODELVIEW_MATRIX, prev_mv);
     glMatrixMode(GL_PROJECTION);
-    glPushMatrix();
     glLoadIdentity();
     glOrthof(0.0f, (float)engine_w, (float)engine_h, 0.0f, -1.0f, 1.0f);
     glMatrixMode(GL_MODELVIEW);
-    glPushMatrix();
     glLoadIdentity();
   }
 
@@ -916,8 +1043,21 @@ static void draw_quad(TextCache *c, int x, int y, int own_ortho) {
 
   const GLfloat x0 = (float)x, y0 = (float)y;
   const GLfloat x1 = x0 + (float)c->w, y1 = y0 + (float)c->h;
-  const GLfloat uvs[4][2] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } };
-  const GLfloat vtx[4][2] = { { x0, y0 }, { x1, y0 }, { x0, y1 }, { x1, y1 } };
+  /* Pixel clipping at the region edge, the way the original cuts its scrolling
+   * text: a line that crosses the edge is trimmed, not dropped. */
+  float ax0 = x0, ay0 = y0, ax1 = x1, ay1 = y1;
+  float tu0 = 0.0f, tv0 = 0.0f, tu1 = 1.0f, tv1 = 1.0f;
+  if (clip_on) {
+    if (x1 <= (float)clip_x0 || x0 >= (float)clip_x1 ||
+        y1 <= (float)clip_y0 || y0 >= (float)clip_y1)
+      return;
+    if (ax0 < (float)clip_x0) { tu0 = ((float)clip_x0 - x0) / (x1 - x0); ax0 = (float)clip_x0; }
+    if (ax1 > (float)clip_x1) { tu1 = ((float)clip_x1 - x0) / (x1 - x0); ax1 = (float)clip_x1; }
+    if (ay0 < (float)clip_y0) { tv0 = ((float)clip_y0 - y0) / (y1 - y0); ay0 = (float)clip_y0; }
+    if (ay1 > (float)clip_y1) { tv1 = ((float)clip_y1 - y0) / (y1 - y0); ay1 = (float)clip_y1; }
+  }
+  const GLfloat uvs[4][2] = { { tu0, tv0 }, { tu1, tv0 }, { tu0, tv1 }, { tu1, tv1 } };
+  const GLfloat vtx[4][2] = { { ax0, ay0 }, { ax1, ay0 }, { ax0, ay1 }, { ax1, ay1 } };
 
   /* GLES1 has no immediate mode, so a client array is the only way to submit
    * the four vertices; the strip is wound both ways by the two triangles of a
@@ -931,6 +1071,13 @@ static void draw_quad(TextCache *c, int x, int y, int own_ortho) {
     glDisableClientState(GL_TEXTURE_COORD_ARRAY);
   if (!va_on)
     glDisableClientState(GL_VERTEX_ARRAY);
+  /* Both arrays above are locals of this frame. The engine's SGL GRP drawers
+   * (SGL_grpFillRect, the NPC name plate's backing bar among them) submit
+   * through one global array and never re-specify the pointer, so leaving ours
+   * behind makes the next such fill read this dead stack frame: a black
+   * 4-vertex strip with whatever numbers happen to be there, i.e. a whole-screen
+   * flash. Put the engine's own pointers back. */
+  nx_restore_client_arrays();
 
   glColor4f(prev_color[0], prev_color[1], prev_color[2], prev_color[3]);
   glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
@@ -945,9 +1092,9 @@ static void draw_quad(TextCache *c, int x, int y, int own_ortho) {
   if (depth_on) glEnable(GL_DEPTH_TEST);
   if (own_ortho) {
     glMatrixMode(GL_PROJECTION);
-    glPopMatrix();
+    glLoadMatrixf(prev_proj);
     glMatrixMode(GL_MODELVIEW);
-    glPopMatrix();
+    glLoadMatrixf(prev_mv);
   }
 }
 
@@ -1078,16 +1225,18 @@ static void text_draw_rich_line(const char *utf8, int x, int y, int px,
   int o = 0;
   int pen = x;
   unsigned cur = base;
-  /* the baseline the whole line sits on, so every colour run lands on it */
-  const int base_ascent = text_ascent_at(utf8, px);
+  /* Every run of one line is drawn at the same y: render() pads each glyph box
+   * to the face's ascender/descender, so runs of one size already share a
+   * baseline. Aligning each run by its own ink (what this used to do) pushed a
+   * run holding nothing but "。" far down, which is why that full stop kept
+   * disappearing. */
   for (const char *p = utf8;; p++) {
     if (*p == '$' && p[1]) {
       const unsigned char id = (unsigned char)p[1];
       if ((id >= 'A' && id <= 'Z') || (id >= 'a' && id <= 'z')) {
         if (o > 0) {
           run[o] = 0;
-          text_draw_engine_line(run, pen, y + (base_ascent - text_ascent_at(run, px)),
-                                px, cur);
+          text_draw_engine_line(run, pen, y, px, cur);
           pen += text_measure_at(run, px);
           o = 0;
         }
@@ -1106,8 +1255,15 @@ static void text_draw_rich_line(const char *utf8, int x, int y, int px,
   }
   if (o > 0) {
     run[o] = 0;
-    text_draw_engine_line(run, pen, y + (base_ascent - text_ascent_at(run, px)),
-                          px, cur);
+    {
+      static int rl_logs;
+      if (rl_logs < 16 && strstr(utf8, "伯爵")) {
+        rl_logs++;
+        debugPrintf("rich: run '%s' at %d col %08x (line y %d)\n", run, pen, cur,
+                    y);
+      }
+    }
+    text_draw_engine_line(run, pen, y, px, cur);
   }
 }
 
@@ -1122,6 +1278,41 @@ static void text_draw_engine_line(const char *utf8, int x, int y, int px,
                   (int)strlen(utf8), px);
     }
     return;
+  }
+
+  /* Which drawer paints the quest popup? Its text does not show up in the
+   * text-control log, so this names the entry point that actually draws it. */
+  {
+    static int qn;
+    if (qn < 12 && (strstr(utf8, "伯爵") || strstr(utf8, "复命"))) {
+      qn++;
+      debugPrintf("quest: [%s] at %d,%d px %d len %d '%s'\n", g_caller, x, y,
+                  px, (int)strlen(utf8), utf8);
+    }
+  }
+
+  /* Who draws a short line in the dialogue band? The speaker's name is a short
+   * string above the body, and every drawer's own log has a budget that is long
+   * spent by the time a dialogue appears, so this one names the drawer. */
+  {
+    static struct { char text[32]; const char *who; } seen[12];
+    static int n;
+    const size_t len = strlen(utf8);
+    if (y > 420 && y < 580 && len > 0 && len < 16) {
+      int known = 0;
+      for (int i = 0; i < n; i++)
+        if (!strcmp(seen[i].text, utf8) && seen[i].who == g_caller) {
+          known = 1;
+          break;
+        }
+      if (!known && n < (int)(sizeof(seen) / sizeof(*seen))) {
+        snprintf(seen[n].text, sizeof(seen[n].text), "%s", utf8);
+        seen[n].who = g_caller;
+        n++;
+        debugPrintf("evt: '%s' drawn by '%s' at %d,%d px %d col %08x\n", utf8,
+                    g_caller, x, y, px, color);
+      }
+    }
   }
 
   if (cfg.text_trace) {
@@ -1176,6 +1367,94 @@ static void text_draw_engine_line(const char *utf8, int x, int y, int px,
    * three seconds. The watchdog then reported "no frame for 3 s" and the frame
    * was never presented -- which is exactly why the story text looked like it
    * was never drawn, even though the readback had proved the quad rasterised. */
+}
+
+/* Break a line at the width the engine laid it out for.
+ *
+ * A text control is given a box width and wraps its own string image to it, but
+ * the string it hands this port is unwrapped -- one long line. Drawing that
+ * line as it comes is what pushed the quest popup's text out past its frame:
+ * the box is 410 px wide and the line ran to 24 characters. CJK breaks between
+ * any two characters, so that is what this does; an ASCII space at the break is
+ * dropped. Returns the number of lines written. */
+int text_wrap_to_box(const char *utf8, int box_w, int px, char *dst, int cap) {
+  if (!utf8 || !dst || cap < 2 || box_w <= 0 || px <= 0)
+    return 0;
+  int o = 0, lines = 1, line_w = 0;
+  const unsigned char *p = (const unsigned char *)utf8;
+  char ch[8];
+  while (*p && o < cap - 2) {
+    int n = 1;
+    if (*p >= 0xF0)
+      n = 4;
+    else if (*p >= 0xE0)
+      n = 3;
+    else if (*p >= 0xC0)
+      n = 2;
+    if (o + n >= cap - 1)
+      break;
+    /* "$<letter>" is a colour change, not two glyphs: it has to be carried
+     * along with the line it belongs to and must not take up any width, or a
+     * rich line (the popup title, the quest body) wraps far too early. */
+    if (p[0] == '&' && (p[1] == 'N' || p[1] == 'n')) {
+      dst[o++] = '\n';
+      lines++;
+      line_w = 0;
+      p += 2;
+      continue;
+    }
+    if (p[0] == '$' && p[1] &&
+        (((p[1] >= 'A' && p[1] <= 'Z') || (p[1] >= 'a' && p[1] <= 'z')))) {
+      if (o + 2 >= cap - 1)
+        break;
+      dst[o++] = '$';
+      dst[o++] = (char)p[1];
+      p += 2;
+      continue;
+    }
+    memcpy(ch, p, (size_t)n);
+    ch[n] = 0;
+    if (ch[0] == '\n') {
+      dst[o++] = '\n';
+      lines++;
+      line_w = 0;
+      p += n;
+      continue;
+    }
+    const int cw = text_measure_at(ch, px);
+    /* a couple of pixels of slack: the engine's box and our measurement do not
+     * agree exactly, and without it a trailing "。" gets pushed onto a line of
+     * its own */
+    if (line_w + cw > box_w + 6 && line_w > 0) {
+      /* drop the space we are breaking on, so the next line does not start
+       * with one */
+      if (ch[0] == ' ') {
+        p += n;
+        dst[o++] = '\n';
+        lines++;
+        line_w = 0;
+        continue;
+      }
+      dst[o++] = '\n';
+      lines++;
+      line_w = 0;
+    }
+    memcpy(dst + o, ch, (size_t)n);
+    o += n;
+    line_w += cw;
+    p += n;
+  }
+  dst[o] = 0;
+  /* A trailing break (the engine's strings often end with "&N" or a newline)
+   * would add an empty line: no glyphs, but the block's height counts it, which
+   * showed up as a blank line between the description and the dashed
+   * separator. */
+  while (o > 0 && (dst[o - 1] == '\n' || dst[o - 1] == '\r')) {
+    dst[--o] = 0;
+    if (lines > 1)
+      lines--;
+  }
+  return lines;
 }
 
 int text_width_engine(const char *utf8, int len, int px) {

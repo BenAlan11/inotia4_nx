@@ -1,0 +1,50 @@
+Inotia 4 for Nintendo Switch -- known good snapshot
+
+build stamp : 2026-11-06 12:13:26
+nro md5     : b6827148678568ff8967a4c4399dad4b
+nro size    : 9150583 bytes
+config      : config.prod.ini (bar_h = 34, log_level = 1, string_draw = 1)
+verified    : 2026-11-06 12:16 by play testing (skill description page:
+              dragging scrolls, the three blocks no longer overlap)
+
+Changes since 20261105-1909:
+  * the skill description page scrolls again. Its scroll control never receives
+    the pointer in this port (its ControlScroll_ControlEventProc is only
+    reachable through the control tree's virtual dispatch; the skill tree works
+    because ControlSkill_ControlEventProc calls ControlScroll_EventProcPressed
+    directly), so the finger travel is fed into the control's own position
+    (data+0x50) every frame -- clamped to [viewport-content, 0] and only for a
+    drag that started inside the page. The engine then draws the page, the
+    separator, the comparison block and its scrollbar at that one offset,
+    exactly as it does for the tree.
+
+  * the page is laid out as one text flow instead of three engine-positioned
+    blocks. UIDesc_DrawTextScroll positions each part from the previous text
+    control's height field (ctrl+0x08), which the engine fills from a string
+    image its Android rasteriser would have produced -- 0 here, so the
+    next-level block and the value comparison landed on top of each other. The
+    page's draw callback (data+0xa0) now points at our own drawer: the
+    current-level block, the dashed separator and the next-level block are
+    drawn by the port with one measurement, and the engine's
+    UISkill_DrawDescAbility is only handed the y that flow ends at. Measured
+    layout: A y193 h200, dash 403, B y413 h75, ability 493 (viewport 645,193
+    358x298).
+
+  * the seven-line blank band before the next-level block. text_draw_engine
+    carries a "push the engine's next line down" accumulator for the screens
+    that hand it one line at a time; a whole paragraph in one call must not use
+    it. The current-level block's 8 lines pushed the next-level block down by
+    7 line heights (175 px) and onto the comparison block. Disabled around each
+    block.
+
+  * long text controls were being truncated. X_TEXTCTRL_SetTextControl takes
+    (ctrl, str, WIDTH, align, mode, colour) -- the third argument is the box
+    width, not a byte count -- but the port's string cache used it as a copy
+    limit, and the cache itself was only 256 bytes. A skill description is
+    about 269 bytes, so its tail ("剑之灵魂持续时间： 5秒", the blue value) was
+    dropped. Cache is 1 KB now and the copy length is strlen().
+
+Restore:
+  copy inotia4_nx.nro over <sdmc>/switch/inotia4/inotia4_nx.nro
+  copy config.prod.ini  to   <sdmc>/switch/inotia4/config.ini
+  (font.ttf, 原机 DroidSansFallback, is in the save-slot zip)

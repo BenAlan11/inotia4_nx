@@ -264,15 +264,16 @@ are not".
 
 ### Open
 
-1. **The NPC name plate has no text.** The plate sits *above* the hint bar. It
-   is **not** the string-image path: standing next to an NPC produced zero
-   `SGL_grpCreateStringImageInRect` calls over a whole session (the only three
-   in the log belong to dialogs). So the name comes from one of the 15 drawers
-   that `text_trace` watches. `README` section *Driving a run unattended* below
-   says how to catch it.
-2. **The picture twitches when an NPC is approached.** Suspected to be the same
-   missing-text path retrying every frame, but not yet reproduced under
-   instrumentation, so unconfirmed.
+1. ~~**The NPC name plate has no text.**~~ **Solved 2026-11-05** — it is
+   `INSTANTMSG_Draw` -> `INSTANTMSGPorting_DrawNameFrame` ->
+   `GRPX_DrawStringWithFont`, i.e. the entry point this port already answers.
+   The glyphs were being drawn, in *black*: the plate's backing bar is painted
+   with `glColor(0,0,0,0.7)` immediately before the name, and the drawer read
+   its colour from the GL state. See *The NPC name plate* below.
+2. ~~**The picture twitches when an NPC is approached.**~~ **Addressed
+   2026-11-05**: the "lift a near-black text tint to white" rule was being
+   applied to quads that are not drawn from a texture at all, so the plate's
+   backing bar flipped between black and white. See the same section.
 3. **The new-game opening black phase has no text.** During the `state = 5`
    phase (`prev = 4`) that follows character select, no traced text entry point
    fires and there are no JNI movie calls. `skip_intro` is parsed in
@@ -372,18 +373,17 @@ cp config.prod.ini dist/switch/inotia4/config.ini && python deploy.py --eden --n
 
 ### Next steps
 
-1. `text_trace = 1`, walk to an NPC, and read the
-   `text: <entry>(...) str@xN '...'` lines. Whatever fires is the name plate's
-   drawer; implement it the way `nx_grp_draw_string` is implemented.
+1. ~~`text_trace = 1`, walk to an NPC, and read the
+   `text: <entry>(...) str@xN '...'` lines.~~ Done — the plate is
+   `GRPX_DrawStringWithFont`, see *2026-11-05: the NPC name plate*.
 2. Widen the `atlas-draw` probe to log any vertex count, then look for extra
    quads with a non-black colour over the hint bar. That decides how the blue
    emphasis has to be reproduced.
 3. Start a new game with `text_trace = 1` and grep the opening black phase for
    entry points that fire with a string argument.
-4. For the twitch, grab consecutive frames standing next to an NPC and diff
-   them. The `frame:` log line already prints the centre pixel, so an
-   alternating colour there means the whole scene is being re-rendered
-   differently rather than one quad flickering.
+4. ~~For the twitch, grab consecutive frames standing next to an NPC and diff
+   them.~~ Addressed together with (1); if anything still moves, `top: quad`
+   prints the strip's colour every frame it is submitted.
 
 ### 2026-11-04: the block over a finished dialogue line
 
@@ -457,6 +457,259 @@ with the fill decision looking back 8 frames instead of 4.
 Also fixed while testing this: `tap_script` never armed anything. The ini reader
 keeps the quotes the README shows, so `sscanf("%d,%d@%u")` saw a leading `"` and
 recorded zero taps; `tap_script_parse()` now skips a leading quote itself.
+
+### 2026-11-05: the NPC name plate (black bar, no name, and the flicker)
+
+Walking up to an NPC shows a full-width dark strip at the top with the NPC's
+name in it. Here it showed the strip and no name, and the strip flickered.
+
+**Where the plate comes from.** Not the string-image path and not one of the
+traced drawers: `INSTANTMSG_Draw` (one entry point for every instant message)
+switches on the message type, and the name-plate case is
+
+```
+INSTANTMSG_Draw
+  GRPX_GetColorFromGRP / GRPX_SetFontColor     the name's colour
+  GRPX_FillRectRGBAlpha(0, 49, screenW, fontH+8, 0,0,0, 70)   the backing bar
+  GRPX_DrawStringWithFont(str, screenW/2 + 1, 54, 2, 1)       shadow, 1 px down
+  GRPX_DrawStringWithFont(str, screenW/2,     53, 2, 1)       the name
+```
+
+`GRPX_DrawStringWithFont` is `nx_grpx_draw_string`, so the name *was* being
+drawn -- in black. `SGL_grpFillRect` (what `GRPX_FillRectRGBAlpha` calls) ends
+with `glColor4x(0,0,0,0.7)` and never restores it, so
+`glGetFloatv(GL_CURRENT_COLOR)` inside the drawer returned black and the name was
+painted black on the black bar. The engine's own pen colour is no better: it
+comes out of `GRPX_GetColorFromGRP` on a palette table that reads as zero here,
+so `SGL_grpFontColor` gets black too. The probe says it in one line:
+
+```
+plate: grpx '黑暗教团士兵' at 508,43 col 000000ff (gl 000000ff pen 1)
+```
+
+Every string in this game is light on a dark plate, so a near-black colour is
+never a text colour -- it is a fill that did not restore what it found. One
+helper, applied in all four text drawers (`sub`, `grp`, `sglgrp`, `grpx`):
+
+```c
+static unsigned text_colour(unsigned color) {
+  if (r + g + b < 24) return 0xFFFFFFFFu;   /* black text is never intended */
+  return color;
+}
+```
+
+The same run then logs `plate: grpx '杂货商人' at 528,43 col ffffffff`. An
+earlier attempt tracked `SGL_grpFontColor` and preferred it over the GL colour;
+it was removed -- it tinted the potion counter tan and the character-select
+banner's class name black, and the palette it reads is zero anyway.
+
+A split "shadow stays dark, only the main line goes white" was tried and then
+dropped: the plate draws the name **once** per frame. A second, shadow draw at
+`y + 1` would have shown up as its own `plate:` line (the probe keys on
+drawer/x/y/colour) and never did, across three different NPCs. What reads as a
+shadow is the antialiasing of the single 20 px quad.
+
+**The flicker.** Reported as "the whole picture twitches, not just the bar", so
+the bar's own colour was not the whole story. Two state leaks in the text
+drawer, both of which only bite while the plate is on screen:
+
+* `draw_quad()` built its own ortho with `glPushMatrix` on `GL_PROJECTION`.
+  GLES1 guarantees **two** projection stack entries and `pact2DBegin` already
+  uses one, so the push overflowed: it was dropped, the `glLoadIdentity` then
+  overwrote the engine's own 2D projection, and the matching `glPopMatrix` popped
+  *the engine's* matrix. Everything drawn after that point in the frame used an
+  identity projection -- one bad frame, every frame. Now the matrices are saved
+  and restored by value (`glGetFloatv` / `glLoadMatrixf`), which never grows the
+  stack.
+* The quad's vertex/texcoord arrays are locals of `draw_quad()`, and the engine's
+  SGL GRP drawers submit through one global array **without re-specifying the
+  pointer** (`SGL_grpFillRect` writes four vertices into a fixed buffer and calls
+  `glDrawArrays`). The plate's backing bar is exactly such a fill, so it read the
+  dead stack frame: a 4-vertex strip with arbitrary coordinates, drawn in black
+  at 70% -- a quad that can cover the whole screen for a frame. `draw_quad()` now
+  calls `nx_restore_client_arrays()` (main.c) to put the engine's pointers back.
+
+There is also a third, smaller one in the same path: `nx_glDrawArrays` lifts a
+near-black tint to white for quads drawn from a string-image atlas (the engine
+draws those with `glColor(0,0,0,0.6)` and the atlas holds white glyphs, so they
+would be invisible otherwise). The test was `is_filled_atlas(bound_texture)` --
+and the binding is whatever the previous draw left behind even when
+`GL_TEXTURE_2D` is **disabled**, in which case the bound texture is not used at
+all. That repainted the plate's black bar white whenever the leftover id was one
+of our atlases. The lift is now gated on `glIsEnabled(GL_TEXTURE_2D)`.
+
+`top: quad ...` (the top strip) and `plate: ...` (one line per distinct drawer /
+y / colour in that strip) are what to read on the next run: the quad should stay
+`col 0.00 0.00 0.00 0.70` frame after frame, and the plate line should end in a
+light colour.
+
+### 2026-11-06: the description panel's buttons
+
+The panel on the right of the skill and item windows draws its text fine but its
+two buttons did nothing -- `学习` no-op'd, `取消快捷键` no-op'd, and tapping a
+potion on the item page never switched the description. Both are the same bug,
+and it is in the dispatch order rather than in the buttons.
+
+`ControlObject_EventProc` walks a control's child list in order and stops at the
+first child that returns 1 or 2. The window that owns this panel has two
+children:
+
+```
+id 99   (625,133) 409x431   the description panel  (scroll viewport + buttons)
+id 100  ( 88,133) 1137x431  the big content panel  -- rectangle covers the window
+```
+
+`100` is visited first. A press that no item slot claims makes it return 0 after
+visiting nothing, the child list ends there, and `99` is never tried -- so
+everything in the description panel, buttons included, was unreachable. (Only
+the scroll viewport worked, because the port drives that one itself.)
+
+The port already wraps `ControlObject_EventProc` for diagnostics, so the fix
+lives there: when a whole dispatch comes back 0 and the press landed inside the
+description panel's rectangle but **outside** its scroll viewport, the press and
+release are handed to that panel directly. The viewport is excluded on purpose --
+the port feeds it from the finger travel, and forwarding it as well would double
+the scroll speed.
+
+```
+ui: desc panel 0x210b06d140 rect 625,133 409x431 forwarded code 0017 at (900,524) -> 1
+ui: desc panel 0x210b06d140 rect 625,133 409x431 forwarded code 0018 at (900,524) -> 1
+```
+
+The header's value was the other half of the same report: `技能点: 0` drew its
+label at (610,147) in gold and its value at (677,147) in a dim brown
+(`0x684f30`, the colour the engine hands over where this port's UI palette is
+all zeroes). `is_stat_value()`, which whitens numbers on these pages, started its
+band at `y >= 150`, so y 147 fell straight through. The band starts at 140 now;
+the label is still matched by the gold rule, so the header keeps the original
+gold-label / white-value pairing.
+
+### 2026-11-06: the skill description page
+
+The page on the right of the skill window is one scroll control whose draw
+callback lays it out in three parts, and every part after the first starts at
+`previous part's height` -- a height the engine fills from a string image its
+Android rasteriser would have produced, i.e. 0 here. Three separate faults came
+out of that one fact, plus a fourth in the port's own text cache:
+
+1. **It did not scroll.** The control's `ControlScroll_ControlEventProc` is only
+   reachable through the control tree's virtual dispatch, and nothing in this
+   port produces the press/move pair it needs; the skill *tree* on the left
+   works because `ControlSkill_ControlEventProc` calls
+   `ControlScroll_EventProcPressed` directly. The page's position (`data+0x50`)
+   is now driven from the finger travel instead (`input_drag_start` /
+   `input_take_drag_dy` -> `desc_scroll_tick`), clamped to
+   `[viewport - content, 0]` and applied only to a drag that started inside the
+   page, so dragging the tree does not move the description. The engine then
+   draws the blocks, the separator, the comparison rows and its scrollbar at
+   that one offset.
+2. **The blocks overlapped.** `UIDesc_DrawTextScroll` places
+   `A at rect.y + scroll`, the dashed separator `A.height` lower, `B` 20 px
+   below that, and the value comparison after `B.height`. With both heights 0
+   all four landed together. The control's draw callback (`data+0xa0`) now
+   points at `nx_desc_text_scroll`, which draws the page as one text flow with
+   the port's own wrapping (`A y193 h200 | dash 403 | B y413 h75 | ability 493`
+   in the 645,193 358x298 viewport) and only hands `UISkill_DrawDescAbility` the
+   y that flow ends at.
+3. **A seven-line blank band before the next-level block.**
+   `text_draw_engine` carries a "push the engine's next line down" accumulator
+   (`wrap_extra`) for the screens that hand it one line at a time. The
+   current-level block is a whole paragraph in one call, and its 8 lines pushed
+   the next block down by `7 x line height` (175 px) -- straight onto the
+   comparison rows. Disabled around each block (`text_set_wrap_extra(0)`).
+4. **Long strings were truncated.** `X_TEXTCTRL_SetTextControl(ctrl, str, width,
+   ...)`'s third argument is the box WIDTH, not a byte count, but the port's
+   string cache used it as a copy limit -- and the cache was 256 bytes. A skill
+   description is about 269 bytes, so its tail went missing:
+   `剑之灵魂持续时间： 5秒` lost the blue value, which is exactly what the player
+   reported. The cache is 1 KB now and the copy length is `strlen()`.
+
+### 2026-11-05: the quest popup
+
+The accept popup ("<刺杀格里普顿伯爵> 获得") drew its body as one long line that ran
+out of the frame, with the title half outside the frame and the body on the
+title's baseline. Four separate causes, all in the text path:
+
+1. **The wrap was computed and thrown away.** `nx_textctrl_draw` built `wrapped`
+   from the control's box width and then called `text_draw_engine(str, ...)` --
+   the raw string. It draws `line` now.
+2. **The box width is 410 minus the popup's padding.** `UIPopupMsg_SetText(msg,
+   len, 410)` passes the OUTER width, and `UIPopupMsg_Draw` puts the text at
+   `rect + 20`, so the usable width is 370 -- which fits 18 characters a line,
+   exactly the break points the original has. Wrapping at the full 410 put 20
+   on the line.
+3. **`&N` is a line break, not two glyphs.** The engine writes its own breaks
+   as `&N`; `text_wrap_to_box` measured them as two characters (40 px), which is
+   why the second paragraph broke after 13 characters instead of 18.
+4. **The colour in force at a break has to follow the text.** A wrap can land
+   inside a coloured span (`…$R刺杀格里` / `普顿伯爵$B。`); the continuation
+   starts with no code at all and used to be drawn in the base colour. The
+   active code is carried onto the next piece. (Not "the line above's colour" --
+   the *text's* colour, which is the same thing only while the span continues.)
+
+Two more that are not about wrapping:
+
+* **`$A` had no colour.** The popup title is built as `$A<%s>$B %s`; `A` fell
+  through to white. It is the same red as `$R`.
+* **The popup's vertical layout comes from the text control's height**
+  (`UIPopupMsg_GetTextHeight()` reads `+0x08`), which the engine fills from a
+  string image its Android rasteriser would have produced -- 0 here. The engine
+  then drew the body on the title's baseline. `nx_textctrl_set` fills `+0x08`
+  with the wrapped line count x line height, **only for the popup (width 410)**:
+  every other control is laid out with 0 and the engine's own vertical centring
+  compensates, so filling it there moved the tutorial hint's text up by half a
+  line.
+
+And the full stop at the end of the first paragraph that kept vanishing: it was
+being drawn (`rich: run '。' at 423 col ffffffff`), but every colour run was
+y-aligned by *its own ink ascent*, and a run holding nothing but `。` has almost
+none -- it was pushed down into the gap between lines. `render()` already pads
+each glyph box to the face's ascender/descender, so runs of one size share a
+baseline; all runs of a line are now drawn at the same y.
+
+### 2026-11-05: the dialogue speaker's name
+
+In the original the speaker's name above a dialogue line is a warm gold
+(`#FAC8A0`) at about 1.7x the body text; here it was white at the body size, so
+it read as a second line of dialogue. Two things had to be found:
+
+* **Which drawer.** Not `EVTSYSTEM_DrawDialogName` (that one never runs here) and
+  not `GRP_DrawString`: a probe over short strings in the dialogue band names it
+  -- `GRPX_DrawStringWithFont` at y 434 while the body goes through
+  `GRPX_DrawSubStringWithFont2` at y 487. `is_dialog_name()` keys on that line
+  (y 425..445, x < 900, at most 15 bytes, no digits -- the HUD's own short
+  strings there sit in the right-hand column).
+* **The colour was packed for the wrong channel order.** `text.c`'s `render()`
+  builds each texel as `(a<<24)|(r<<16)|(g<<8)|b` in a little-endian `uint32_t`,
+  so the bytes it uploads are `B,G,R,A` and the red and blue channels swap on
+  the way into the texture. Passing `0xFAC8A0FF` drew the name **blue**; the
+  value that reaches the screen as `#FAC8A0` is `0xA0C8FAFF`. Everything that was
+  already on screen is white or grey, which is why nobody noticed until a colour
+  with a different red and blue arrived. `colour_for_code()`'s `$S` blue is
+  written for the swapped order as well -- do not "fix" the channel order in
+  `text.c` without re-checking every `$` colour.
+
+The name is measured at 34 px (20 x 1.7) and the log line is
+`gold: '凯恩' at 376,434 px 34 (dialog name)`.
+
+The same gold is used in two more places, so `is_gold_text()` (main.c) covers
+three shapes, all of them things the game only ever draws in that colour:
+
+| Where | How it is recognised |
+|---|---|
+| dialogue speaker's name | y 425..445, x <= 900, at most 15 bytes, no digits, **and** a body line was drawn in the last two frames |
+| character page labels | exact strings: `力量 敏捷 体力 智力 精力 HP MP EXP DMG M.DMG CRT H.RATE C.DMG DEF P.RES M.RES EVD W.D.R S.D.R`, plus the `能力点:` / `技能点:` prefixes |
+| character page name block | x 430..620, y 195..288 (stops above the in-game map banner at y 294) |
+| save slot's map name | third text line of a row (y ~181 / 347 / 513), x 600..700 -- not 1000: the character page's stat values sit at x ~750 on the same heights |
+
+Only the *dialogue* name is drawn bigger (1.7x). The size bump needs the same
+"a body line is on screen" condition as the colour, because 智力 and EVD sit at
+y 425/434 too and were coming out enlarged.
+
+The character page's values are pure white in the original and the engine hands
+the drawer a dimmed grey, so `is_stat_value()` lifts numeric strings in the page
+area (x 200..1100, y 150..640) to white -- that includes the `0` after
+`能力点:` / `技能点:`, which is a separate draw.
 
 ---
 
@@ -614,7 +867,13 @@ and one zip with the sources that produced it. Restoring a known state is
 
 | Snapshot | Build | NRO md5 | Verified for |
 |---|---|---|---|
-| `snapshots/known-good-20261104-2211/` + `save-slot-20261104-2211.zip` | 2026-11-04 22:10:51 | `a8adfa63d39a19bf308d8dd942146860` | **current default**: everything below, plus the tutorial hint sits inside its black bar (text is centred on the anchor) |
+| `snapshots/known-good-20261106-1240/` + `save-slot-20261106-1240.zip` | 2026-11-06 12:37:57 | `294defaf72ff3b8b4e3dfa3c699eaead` | **current default**: everything below, plus the skill page's numbers and buttons: the value after `技能点:` is white again, and `学习` / `取消快捷键` (and the item page's description buttons) take the touch -- see *2026-11-06: the description panel's buttons* |
+| `snapshots/known-good-20261106-1213/` + `save-slot-20261106-1213.zip` | 2026-11-06 12:13:26 | `b6827148678568ff8967a4c4399dad4b` | the skill description page: it scrolls again (the finger travel drives the page's own scroll control), it is laid out as one text flow so the next-level block and the value comparison no longer overlap, and text controls longer than 256 bytes are no longer truncated (the blue `5秒` at the end of the first block) -- see *2026-11-06: the skill description page* |
+| `snapshots/known-good-20261105-1909/` + `save-slot-20261105-1909.zip` | 2026-11-05 19:04:15 | `c2d3533bf35a92b33747da80ba2089b5` | everything below, plus the quest popup laying its text out like the original (wrapped at the popup's own content width, colour runs carried across the wrap, `&N` as a hard break, `$A` red title, the control height that drives the popup's vertical layout) -- see *2026-11-05: the quest popup* |
+| `snapshots/known-good-20261105-1524/` + `save-slot-20261105-1524.zip` | 2026-11-05 15:17:01 | `912e55d61c6c0a0ad69e6069c4141153` | the gold text system (dialogue name and character page, sized from the engine's font index), one baseline per size, the save slot's map name gold and the shop button no longer freezing |
+| `snapshots/known-good-20261105-1139/` + `save-slot-20261105-1139.zip` | 2026-11-05 11:37:15 | `3647e3a84a1d98d6205b5880dc0e8508` | NPC name plate shows its name (white); the whole-screen twitch while a plate is up is gone -- two state leaks in the text drawer |
+| `snapshots/known-good-20261105-0945/` + `save-slot-20261105-0945.zip` | 2026-11-05 09:27:40 | `792f3671d9db0f9279150d50b7dfb270` | tutorial hint's highlight bar drawn 34 px tall instead of the engine's 20 (`bar_h`) |
+| `snapshots/known-good-20261104-2211/` + `save-slot-20261104-2211.zip` | 2026-11-04 22:10:51 | `a8adfa63d39a19bf308d8dd942146860` | everything below, plus the tutorial hint sits inside its black bar (text is centred on the anchor) |
 | `snapshots/known-good-20261104-1946/` + `save-slot-20261104-1946.zip` | 2026-11-04 19:46:51 | `5760bb9fb50e4295d417286d76181f97` |: everything below, plus the in-game HUD no longer freezes when it draws a number |
 | `snapshots/known-good-20261104-1846/` + `save-slot-20261104-1846.zip` | 2026-11-04 18:46:08 | `2a6d92db69db83f485a664fe1beef2fc` | save slots land in the row they were created in; engine-owned delete dialog; START works again after returning to the title; class-screen tap filter; `$X` colour runs and `&N` line breaks in text |
 | `snapshots/known-good-20261103-1958/` | 2026-11-03 19:58 | see its `VERSION.txt` | save read/write, cross-restart slot load, delete, back-to-menu |

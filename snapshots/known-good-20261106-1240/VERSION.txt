@@ -1,0 +1,45 @@
+Inotia 4 for Nintendo Switch -- known good snapshot
+
+build stamp : 2026-11-06 12:37:57
+nro md5     : 294defaf72ff3b8b4e3dfa3c699eaead
+nro size    : 9154679 bytes
+config      : config.prod.ini (bar_h = 34, log_level = 1, string_draw = 1)
+verified    : 2026-11-06 12:41 by play testing (skill page: the value after
+              "技能点:" is white and readable; 学习 / 取消快捷键 both take the
+              touch; item page: tapping a potion switches the description on
+              the right and its buttons respond)
+
+Changes since 20261106-1213:
+  * the number after "技能点:" / "能力点:" is white again. The engine draws that
+    row as two strings -- the label at (610,147) and the value at (677,147) --
+    and the port whitens "stat values" through is_stat_value(), whose band
+    started at y >= 150. y 147 fell through to the colour the engine hands over
+    (0x684f30, dark brown), which is unreadable on the plate. Band starts at 140
+    now; the label still goes through the gold rule, so the header keeps the
+    original "gold label, white value" pairing.
+
+  * the two buttons on the description panel (学习 / 取消快捷键) respond again,
+    and so do the item page's. ControlObject_EventProc walks the child list in
+    order and stops at the first child that returns 1/2. The window's big
+    content panel is a SIBLING that comes BEFORE the description panel and its
+    rectangle is the whole window (1137x431), so a press outside every item slot
+    made it return 0 after visiting nothing, the list ended there, and the
+    description panel was never tried -- its buttons were unreachable. When a
+    whole dispatch comes back empty, the press is now handed to the description
+    panel if it lands inside its rectangle but OUTSIDE the scroll viewport (the
+    viewport is driven by the port itself; forwarding it as well would double
+    the scroll speed).
+
+    Log evidence: "ui: desc panel 0x... rect 625,133 409x431 forwarded code 0017
+    at (900,524) -> 1", and the dispatch as a whole now returns 1.
+
+Restore:
+  copy inotia4_nx.nro over <sdmc>/switch/inotia4/inotia4_nx.nro
+  copy config.ini       to   <sdmc>/switch/inotia4/config.ini
+  (font.ttf, 原机 DroidSansFallback, see the save-slot zip in snapshots/)
+
+Diagnostics left in this build (all bounded, they cost a few log lines):
+  "desc: f<frame> rect ... A y.. h.. | dash .. | B y.. h.. | ability .."
+  "ui: desc panel <ptr> rect ... forwarded code ... -> ..."
+  "hdr: '<str>' at x,y font n col xxxxxxxx"   (30 lines max)
+Set log_level = 0 in config.ini to silence all of them.

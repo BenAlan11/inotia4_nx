@@ -172,6 +172,30 @@ void input_configure(const InputConfig *cfg) {
 
 int input_injection_active(void) { return iconf.inject; }
 
+/* Raw drag tracking for pages whose own scroll control never sees the input in
+ * this port (the skill description). The caller consumes the accumulated
+ * vertical travel once a frame; the sign is "screen pixels moved downwards". */
+static int drag_on;
+static float drag_last_y;
+static float drag_acc;
+static float drag_start_x, drag_start_y;
+
+int input_take_drag_dy(void) {
+  const int v = (int)drag_acc;
+  drag_acc -= (float)v;
+  return v;
+}
+
+int input_drag_start(float *x, float *y) {
+  if (!drag_on)
+    return 0;
+  if (x)
+    *x = drag_start_x;
+  if (y)
+    *y = drag_start_y;
+  return 1;
+}
+
 void input_touch(int action, int id, float x, float y) {
   if (action < 0 || action > 3 || !iconf.inject)
     return;
@@ -184,6 +208,20 @@ void input_touch(int action, int id, float x, float y) {
       debugPrintf("input: touch a%d id%d (%.0f,%.0f) engine count %d\n", action,
                   id, x, y, input_engine_touch_count());
     }
+  }
+
+  if (action == 0) {
+    drag_on = 1;
+    drag_last_y = y;
+    drag_start_x = x;
+    drag_start_y = y;
+    drag_acc = 0;
+  } else if (action == 1) {
+    if (drag_on)
+      drag_acc += y - drag_last_y;
+    drag_last_y = y;
+  } else {
+    drag_on = 0;
   }
 
   const int ev = (action == 0) ? EV_DOWN : (action == 1) ? EV_MOVE : EV_UP;

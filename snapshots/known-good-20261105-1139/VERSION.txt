@@ -1,0 +1,35 @@
+Inotia 4 for Nintendo Switch -- known good snapshot
+
+build stamp : 2026-11-05 11:37:15
+nro md5     : 3647e3a84a1d98d6205b5880dc0e8508
+nro size    : 9068663 bytes
+config      : config.prod.ini (bar_h = 34, log_level = 1, string_draw = 1)
+verified    : 2026-11-05 11:39, walked up to three NPCs
+              (黑暗教团士兵 / 卓拉德 / 杂货商人)
+
+Changes since 20261105-0945:
+  * the NPC name plate shows its name. It was being drawn in black: the plate's
+    backing bar is filled with glColor(0,0,0,0.7) and never restores the colour,
+    so the drawer picked black out of the GL state and painted the name black on
+    black. The engine's own pen colour is black too (its palette table reads as
+    zero here), so the rule is simply "a near-black colour is drawn white".
+    Log line: "plate: grpx '杂货商人' at 528,43 col ffffffff".
+  * the whole picture no longer twitches while the plate is on screen. Two state
+    leaks in the text drawer: (1) it pushed GL_PROJECTION with glPushMatrix, but
+    GLES1 has only two projection stack entries and the engine's 2D pass already
+    uses one -- the push overflowed, the engine's own projection was overwritten
+    and then popped, so the rest of that frame was drawn with an identity
+    projection. Matrices are now saved/restored by value. (2) the quad's vertex
+    arrays are locals of the drawer and the engine's SGL fills submit through a
+    global array without re-specifying the pointer, so a fill that followed a
+    text quad read the dead stack frame -- a black quad with arbitrary
+    coordinates. nx_restore_client_arrays() puts the engine's pointers back.
+  * the "lift a near-black text tint to white" rule is gated on
+    glIsEnabled(GL_TEXTURE_2D); before, an untextured quad whose leftover bound
+    texture happened to be one of our atlases was repainted white.
+  * the plate is drawn once per frame (measured), so there is no shadow draw to
+    keep dark; the name is a single white quad.
+
+Restore:
+  copy inotia4_nx.nro over <sdmc>/switch/inotia4/inotia4_nx.nro
+  copy config.prod.ini  to   <sdmc>/switch/inotia4/config.ini

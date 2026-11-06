@@ -40,6 +40,16 @@ void input_focus_box(int *x, int *y, int *w, int *h);
 
 int  input_injection_active(void);
 
+/* Vertical travel of the finger since the last call (screen pixels, positive =
+ * moved down), drained on every call. Pages whose own scroll control never sees
+ * the input (the skill description) use this to drive their scroll themselves. */
+int input_take_drag_dy(void);
+
+/* 1 while a finger is down, with the point it went down at (screen pixels).
+ * A page only scrolls for a drag that started inside it, so that dragging the
+ * skill tree does not also move the description next to it. */
+int input_drag_start(float *x, float *y);
+
 /* what the engine believes its screen size is (bring-up diagnostics) */
 int input_engine_screen_w(void);
 unsigned char *input_engine_virtbase(void);

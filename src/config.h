@@ -52,6 +52,7 @@ typedef struct {
   int  text_px;           /* 0 = take the size from the font group */
   int  text_wrap_w;       /* break engine text at this width (0 = never) */
   int  text_px_scale;     /* percent of the engine's line height used as glyph size */
+  int  bar_h;             /* height the hint highlight bar is drawn at; 0 = leave it */
   int  text_fixed_px;     /* 1 = use text_px for every font index */
   int  calib;             /* draw scissor calibration marks */
   int  redraw_probe;      /* paint magenta after each present to see if the engine redraws */

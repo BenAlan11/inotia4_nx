@@ -1,0 +1,40 @@
+Inotia 4 for Nintendo Switch -- known good snapshot
+
+build stamp : 2026-11-05 15:17:01
+nro md5     : 912e55d61c6c0a0ad69e6069c4141153
+nro size    : 9072759 bytes
+config      : config.prod.ini (bar_h = 34, log_level = 1, string_draw = 1)
+verified    : 2026-11-05 15:21 by play testing
+
+Changes since 20261105-1139:
+  * the dialogue speaker's name is gold (#FAC8A0) and drawn in the engine's
+    "name" font size. The size now comes from the font index that
+    GRPX_DrawStringWithFont already carries: font 0 = small (Lv. 1), font 1 =
+    body (labels, 力量/敏捷 rows), font 2 = the name font. The position-based
+    guess it replaced also caught 敏捷, which sits at the same height.
+  * the character page's labels and name block are gold too, in a cooler, darker
+    tone (#C6B992) because that panel is blue-grey and the warm gold read red on
+    it; its stat values are pure white and 能力点/技能点 on the light bar are
+    black. The name block is lifted 8 px inside its frame.
+  * the save slot shows only its map name in gold -- Lv.1 and the class line stay
+    white -- and the in-game map banner stays white.
+  * every string of one size now shares one baseline (the glyph box is padded to
+    the font's ascender/descender). Before, a digits-only string such as the "0"
+    after 能力点: sat higher than the CJK label beside it.
+  * black is never drawn as a text colour: a near-black colour is lifted to
+    white, except the two 能力点/技能点 on the light bar, which are black on
+    purpose.
+  * the shop button no longer freezes the console. jniInAppV4Initialize is called
+    at boot, so CS_IapV4MarketConnect has a JavaVM and an object to call;
+    jni_fake answers marketConnect and CS_IapV4GetProductInfo builds a local
+    product list. The store still does not draw its pages: its state machine is
+    driven by the game's own server protocol (Network_SendData(0x42) ->
+    Network_NextInterrup), which never answers offline. Tapping the cart opens a
+    dimmed screen and the back button leaves it.
+  * COLOR_Initialize (the UI palette COLOR_nValue[]) is still never called: it
+    hangs in this port, before the engine init and after nativeStart alike, so
+    every colour above is decided by the port.
+
+Restore:
+  copy inotia4_nx.nro over <sdmc>/switch/inotia4/inotia4_nx.nro
+  copy config.prod.ini  to   <sdmc>/switch/inotia4/config.ini
