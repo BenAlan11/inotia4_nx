@@ -100,4 +100,16 @@
 - 仓库内容：src/、build.py、deploy.py、config.prod.ini、README、tools/*.py、
   snapshots（**只带 2211 的 NRO 和 zip**，旧的大快照仅留 VERSION.txt/配置）、
   .workbuddy/memory/。游戏本体/APK/存档/工具链不进仓库。
-- 令牌用完提醒用户轮换（已在对话中出现）。
+- 令牌用完提醒用户轮换（已在对话中出现）。PAT 是 fine-grained 且**有写权限**，
+  实测 `permissions.push = true`；令牌我从历史会话记录里取（不写进任何文件）。
+- `gh_push.py` 直接上传**工作区字节**（`make_blob` 读磁盘），而本地索引是
+  `core.autocrlf=true` 归一化后的 LF，所以文本文件的远端 blob sha 与本地索引不同。
+  历史上每次推送都是这样，远端一致（全 CRLF），clone 下来与本地磁盘逐字节相同。
+
+### 2026-11-06 12:51 推送
+- 远端 main = 提交 `a19b5ed21fbc7b9ff73419b607a85248d340aaf8`（tree `435c0a00`，
+  parent `660a5699`），378 文件 / 26,611,416 字节。
+- 索引里只留**当前** known-good 的 NRO 与 zip（`1240`），旧的 2211 的 NRO/zip
+  已从索引移除（磁盘上仍在）；`.gitignore` 现在是通配 + 否定规则：
+  `snapshots/known-good-*/inotia4_nx.nro`、`snapshots/save-slot-*.zip` 全忽略，
+  再 `!` 放行 `1240` 的两个。
