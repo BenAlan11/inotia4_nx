@@ -543,10 +543,10 @@ y / colour in that strip) are what to read on the next run: the quad should stay
 `col 0.00 0.00 0.00 0.70` frame after frame, and the plate line should end in a
 light colour.
 
-### 2026-11-06: balloon ink and the hint plate
+### 2026-11-06: balloon ink, the hint plate, and the quest row
 
-Two fixes that both came from reading what the engine actually calls, rather
-than matching rectangles on a screenshot.
+Three fixes that came from reading what the engine actually calls, rather than
+matching rectangles on a screenshot.
 
 **The battle shouts were red instead of black.** A text control carries its pen
 colour at `+0x14`, and `X_TEXTCTRL_DrawTextControl` (0x1447a8) hands that word
@@ -570,28 +570,40 @@ in the log (`bar: quad 80,152-1057,172 ... ra 0x4ceb35f640`) is exactly
 `SGL_grpFillRect+0x1bc` once the module base 0x4ceb234000 is subtracted.
 `UI_DrawTextBackground` (0x143b30) passes `w3 = 0x22 = 34` to
 `GRPX_FillRectRGBAlpha`, so 34 px is the engine's own text-background height;
-the hint plates are submitted at 20. The old `bar_expand()` worked only for the
-tutorial hint, because it requires the quad's `GL_CURRENT_COLOR` to be black and
-the plain tips reach the rectangle through a tinted path.
+the hint plates are submitted at 20. `bar_expand()` already grew the tutorial
+hint's quad around its centre to `cfg.bar_h` (34); the plain tips were the one
+case it never saw, because they are **full-screen wide** -- `0,152 1137x20`,
+black at 60% alpha (`0x99000000`) -- and its width cap was 1080 px. Lifting that
+cap to 1280 (the engine's screen width) fixes both with the same GL-layer path.
+The colour test is unchanged: only a black translucent quad is eligible, so the
+quest page's grey/brown title strips are never touched.
 
-The fix overrides `SGL_grpFillRect` with `nx_sgl_fillrect()`: short (14..26 px),
-wide (>= 200 px), translucent plates in the hint band are grown around their
-centre to `cfg.bar_h` (34) *before* the real function builds its vertices, so no
-text quad or nine-slice art can be caught by mistake. The bounded
-`fillrect: x,y wxh col caller 0x<vaddr>` log records the actual parameters and
-the calling function. `TIPBOX_Draw` (0x1dd050) only draws the string and runs
-the timer; `UI_DrawBorderRect` (0x14314c) is the 24 px nine-slice window, not
-this tip.
+A rectangle-level override of `SGL_grpFillRect` was tried first and **removed**.
+It grew the plate before the four vertices were built, which worked for the bar
+but also caught the quest page: its title bar is three 476x15 / 476x18 / 476x15
+strips at y 164/179/197 in brown (`0xe5315069`) and grey (`0x7f6f6f6f`), and
+growing and shifting them stacked a grey plate over the quest text. Even with
+the condition narrowed to `h == 20` plus pure black the quest text still sat in
+the wrong place, so the override was dropped entirely. Lesson worth keeping:
+read the parameter that *excluded* the case (here `w > 1080`) before adding a
+new hook anywhere else.
 
-The first version of that override accepted *any* short, wide, translucent
-plate, which broke the quest page: its title bar is three 476x15 / 476x18 /
-476x15 strips at y 164/179/197 in brown (`0xe5315069`) and grey (`0x7f6f6f6f`),
-and growing and shifting them stacked a grey plate over the quest text. The
-condition is now the exact signature of the hint plate -- `h == 20`, `w >= 200`,
-pure black with a non-trivial alpha (`0xAA000000`, e.g. `0x99000000`) -- which
-none of the quest strips share. Lesson worth keeping for the next subsystem:
-narrow a hook by the *drawing signature*, not by how the artefact looks in a
-screenshot.
+`TIPBOX_Draw` (0x1dd050) only draws the string and runs the timer;
+`UI_DrawBorderRect` (0x14314c) is the 24 px nine-slice window, not this tip.
+
+**The quest page's title sat one paragraph too low.** Removing the rectangle
+override cleared the grey plate but the text stayed in the wrong box. The cause
+was in the text layer: `text_draw_engine_ex()` keeps `wrap_extra`, the
+push-down for lines a wrapped paragraph added, as a frame-global accumulator
+and only resets it when the next `y` goes *backwards*. The quest description
+wraps to five lines and leaves four lines (~100 px) behind; the next control is
+drawn at a **larger** y, so it inherited the whole offset. `nx_textctrl_draw()`
+now clears the accumulator after every control (`text_set_wrap_extra(0)` then
+`(1)`), which is the paragraph boundary the accumulator was meant to respect.
+The bounded `quest:` probe was raised to 40 entries and now prints the colour,
+which is what separated the two draws in one frame:
+`[grpx] at 193,173` (the MAIN-bar title) and `[textctrl] at 682,168/193/218/243`
+(the five description lines).
 
 Still open from the previous build: a *short* battle shout ("杀了他") shows a
 white plate behind the bubble, because its 35 px nine-slice corners are drawn
@@ -963,7 +975,7 @@ and one zip with the sources that produced it. Restoring a known state is
 
 | Snapshot | Build | NRO md5 | Verified for |
 |---|---|---|---|
-| `snapshots/known-good-20261106-1945/` + `save-slot-20261106-1945.zip` | 2026-11-06 20:05:16 | `379dcfbb92a4f630d7eaca49fa85bcf8` | **current default**: everything below, plus black (not red) ink on the battle shouts, the plain tips' 60% black plate grown to 34 px at the rectangle's source, and the quest page free of the grey plate the first attempt introduced -- see *2026-11-06: balloon ink and the hint plate* |
+| `snapshots/known-good-20261106-1945/` + `save-slot-20261106-1945.zip` | 2026-11-06 20:25:51 | `f7e34f21c71b9292f19f3eca93a04390` | **current default**: everything below, plus black (not red) ink on the battle shouts, the plain tips' 60% black plate grown to 34 px (just `bar_expand`'s width cap 1080 -> 1280), and the quest page's title back in its MAIN bar (`wrap_extra` cleared per control). The rectangle-level override that broke the quest page was removed -- see *2026-11-06: balloon ink, the hint plate, and the quest row* |
 | `snapshots/known-good-20261106-1905/` + `save-slot-20261106-1905.zip` | 2026-11-06 19:02:50 | `683ed6302f8af0c1a8267f02e616e695` | everything below, plus the dialogue's speaker name in gold in *every* layout, inner thoughts in grey, and the save slots' map name in the character page's gold (#C6B992) -- see *2026-11-06: names, thoughts and the save rows* |
 | `snapshots/known-good-20261106-1240/` + `save-slot-20261106-1240.zip` | 2026-11-06 12:37:57 | `294defaf72ff3b8b4e3dfa3c699eaead` | everything below, plus the skill page's numbers and buttons: the value after `技能点:` is white again, and `学习` / `取消快捷键` (and the item page's description buttons) take the touch -- see *2026-11-06: the description panel's buttons* |
 | `snapshots/known-good-20261106-1213/` + `save-slot-20261106-1213.zip` | 2026-11-06 12:13:26 | `b6827148678568ff8967a4c4399dad4b` | the skill description page: it scrolls again (the finger travel drives the page's own scroll control), it is laid out as one text flow so the next-level block and the value comparison no longer overlap, and text controls longer than 256 bytes are no longer truncated (the blue `5秒` at the end of the first block) -- see *2026-11-06: the skill description page* |
@@ -1074,6 +1086,9 @@ python tools/win_place.py --list                   # monitors + window rects
 ```
 
 It uses `SetWindowPos` with `SWP_NOACTIVATE`, so the window does not take focus.
+`tasklist` output is decoded with the system ANSI code page (`mbcs`): on a
+zh-CN Windows some image names are non-ASCII and the default UTF-8 decode made
+the helper fail before it ever moved a window.
 
 ## Layout of this repository
 

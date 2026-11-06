@@ -63,8 +63,12 @@ def windows(exe_names):
     for name in exe_names:
         os.system("")  # keep subprocess output clean
     import subprocess
+    # tasklist writes in the console's OEM code page; on a zh-CN Windows some
+    # image names are non-ASCII and decoding as UTF-8 raises, leaving stdout
+    # as None. Decode with the system ANSI code page and tolerate bad bytes.
     task = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
-                          capture_output=True, text=True).stdout
+                          capture_output=True, text=True,
+                          encoding="mbcs", errors="replace").stdout or ""
     for line in task.splitlines():
         parts = [p.strip('"') for p in line.split('","')]
         if len(parts) >= 2 and parts[0].lower() in exe_names:

@@ -2247,6 +2247,14 @@ static void nx_textctrl_draw(void *ctrl, int x, int y) {
   /* the display region belongs to this draw only -- keeping it for the rest of
    * the frame hid every other label on the page (技能点: 0 among them) */
   text_set_clip(0, 0, 0, 0);
+  /* A control that wrapped into N lines leaves wrap_extra = (N-1)*line_h
+   * behind, and text_draw_engine_ex only clears it when the next y goes
+   * BACKWARDS. Two side-by-side controls are drawn in increasing y order, so
+   * the quest page's 5-line description pushed the NEXT control (the quest
+   * title / list row) down by four lines. The accumulator belongs to one
+   * paragraph, not to the whole frame: clear it after every control, then
+   * leave the feature enabled for the next draw. */
+  text_set_wrap_extra(0);
   text_set_wrap_extra(1);
 }
 
@@ -4465,76 +4473,14 @@ void nx_glDrawElements(GLenum mode, GLsizei count, GLenum type,
   glDrawElements(mode, count, type, indices);
 }
 
-/* Every solid rectangle the engine draws leaves through SGL_grpFillRect
- * (0x12b484): GRPX_FillRect, GRPX_FillRectAlpha and GRPX_FillRectRGBAlpha all
- * tail-call it from 0x122568 / 0x122624 / 0x1226b0, and it submits one
- * glDrawArrays(GL_TRIANGLE_STRIP, 0, 4) at 0x12b63c with the vertices
- * (x,y)-(x+w,y+h). The tutorial hint's 60% black plate is exactly such a
- * call -- its runtime return address is SGL_grpFillRect+0x1bc.
- *
- * The plain ("no exclamation mark") tips were never lifted: the GL-layer
- * bar_expand below only sees quads whose GL_CURRENT_COLOR is black, and those
- * tips reach the same rectangle through a tinted path. Fix it at the source
- * of the rectangle instead. The engine's own text background asks for 0x22
- * = 34 px (UI_DrawTextBackground, 0x143bdc passes w3=0x22 to
- * GRPX_FillRectRGBAlpha), so 34 is the height the original draws; the hint
- * plates are submitted at 20. */
-static void (*sgl_fillrect_real)(long, long, long, long, unsigned long);
-
-static void nx_sgl_fillrect(long x, long y, long w, long h,
-                            unsigned long color) {
-  const unsigned c = (unsigned)color;
-  {
-    /* Dedup by geometry+colour: one line per distinct plate, with the
-     * caller's vaddr so the next round never has to guess which function
-     * asked for a 20 px plate. */
-    static struct { long x, y, w, h; unsigned c; } seen[24];
-    static int n, logs;
-    if (logs < 60 && w > 200 && h >= 8 && h <= 60) {
-      int dup = 0;
-      for (int i = 0; i < n; i++)
-        if (seen[i].x == x && seen[i].y == y && seen[i].w == w &&
-            seen[i].h == h && seen[i].c == c) { dup = 1; break; }
-      if (!dup) {
-        const unsigned long ra =
-            (unsigned long)__builtin_return_address(0) -
-            (unsigned long)game_mod.load_virtbase;
-        if (n < (int)(sizeof(seen) / sizeof(*seen))) {
-          seen[n].x = x; seen[n].y = y; seen[n].w = w; seen[n].h = h;
-          seen[n].c = c; n++;
-        }
-        logs++;
-        debugPrintf("fillrect: %ld,%ld %ldx%ld col %08x caller 0x%lx\n",
-                    x, y, w, h, c, ra);
-      }
-    }
-  }
-  /* ONLY the 60% translucent BLACK hint plate, submitted at exactly 20 px.
-   * The engine packs its colour as 0xAA000000 -- log evidence:
-   *   fillrect: 80,152 977x20 col 99000000 caller 0x20c434   (tutorial hint)
-   *   fillrect: 0,152 1137x20 col 99000000 caller 0x1d83d0   (plain tip)
-   * A wider "short, wide, translucent" test was tried first and broke the
-   * quest page: its title bar is three 476x15/18/15 strips at y 164/179/197
-   * in brown (0xe5315069) and grey (0x7f6f6f6f). Growing and shifting those
-   * stacked a grey plate over the quest text. Pure black (RGB = 0) with a
-   * non-trivial alpha is the one property those strips do not share. */
-  const int black60 = ((c & 0x00ffffffu) == 0u) &&
-                      ((c >> 24) != 0u) && ((c >> 24) != 0xffu);
-  if (cfg.bar_h > 0 && h == 20 && w >= 200 && black60 &&
-      y >= 80 && y <= 280) {
-    static int fix_logs;
-    if (fix_logs < 12) {
-      fix_logs++;
-      debugPrintf("fillrect: hint plate %ld,%ld %ldx%ld -> h %d (col %08x)\n",
-                  x, y, w, h, cfg.bar_h, c);
-    }
-    const int grow = cfg.bar_h - (int)h;
-    y -= grow / 2;      /* grow around the plate's centre, as bar_expand does */
-    h = cfg.bar_h;
-  }
-  if (sgl_fillrect_real)
-    sgl_fillrect_real(x, y, w, h, color);
-}
+/* A RECTANGLE-LEVEL OVERRIDE WAS TRIED HERE AND REMOVED. Overriding
+ * SGL_grpFillRect (0x12b484) to grow the plate before its four vertices were
+ * built did produce a 34 px bar, but it also caught the quest page's three
+ * 476x15/18/15 title strips, and the quest layout never looked right again.
+ * The real reason the plain tips stayed 20 px was much simpler: they are
+ * FULL-SCREEN WIDE (0,152 1137x20), and bar_expand's width cap below was
+ * 1080. Lifting that cap to 1280 fixes both hints with the GL-layer path that
+ * already worked for the tutorial hint, and touches no other subsystem. */
 
 /* The tutorial hint's highlight bar, as the engine submits it:
  *   bar: quad 80,152-1057,172  tex 31  col 0 0 0 0.60  blend 1
@@ -4567,18 +4513,29 @@ static int bar_expand(GLenum mode, GLint first, GLsizei count) {
     if (vy > y1) y1 = vy;
   }
   const float w = x1 - x0, h = y1 - y0, cy = (y0 + y1) * 0.5f;
-  /* The bar is sized to its line, so its width is not a constant: the tutorial's
-   * "!" hint spans 80..1057 (977 px) while the plain tips are ~600 px. Keying on
-   * the wide one left every shorter hint at the engine's 20 px height. What does
-   * not vary is the strip it lives in (cy 120..220) and the colour, which the
-   * caller checks below. */
-  if (w < 250.0f || w > 1080.0f || h < 8.0f || h > 40.0f || cy < 90.0f ||
+  /* The bar is sized to its strip, not to its line: the tutorial's "!" hint
+   * spans 80..1057 (977 px), while the plain tips ("从掉在地上的道具上方走过…")
+   * are FULL-SCREEN WIDE -- 0..1137, submitted by SGL_grpFillRect as
+   * 0,152 1137x20 in black at 60% alpha. The old 1080 px cap silently excluded
+   * exactly that one, which is why bar_h never reached the plain tips. The cap
+   * is now the engine's screen width. What does not vary is the strip it lives
+   * in (cy 120..220) and the black translucent colour checked below; the quest
+   * page's grey/brown title strips fail that colour test. */
+  if (w < 250.0f || w > 1280.0f || h < 8.0f || h > 40.0f || cy < 90.0f ||
       cy > 230.0f)
     return 0;
   GLfloat col[4] = { 1, 1, 1, 1 };
   glGetFloatv(GL_CURRENT_COLOR, col);
-  if (col[0] > 0.2f || col[1] > 0.2f || col[2] > 0.2f)
+  if (col[0] > 0.2f || col[1] > 0.2f || col[2] > 0.2f) {
+    static int rej_logs;
+    if (w > 1000.0f && rej_logs < 8) {
+      rej_logs++;
+      debugPrintf("bar: full-width plate rejected, col %.2f %.2f %.2f %.2f "
+                  "rect %.0f,%.0f-%.0f,%.0f\n",
+                  col[0], col[1], col[2], col[3], x0, y0, x1, y1);
+    }
     return 0;                       /* the bar is the black translucent strip */
+  }
   const float k = (float)cfg.bar_h / h;
   for (GLsizei i = 0; i < count; i++) {
     bar_verts[i * 2 + 0] = xs[i];
@@ -4586,7 +4543,7 @@ static int bar_expand(GLenum mode, GLint first, GLsizei count) {
   }
   glVertexPointer(2, GL_FLOAT, 0, bar_verts);
   static int logs;
-  if (logs < 12) {
+  if (logs < 24) {
     logs++;
     debugPrintf("bar: expanded %.0f,%.0f-%.0f,%.0f to height %d\n", x0, y0, x1,
                 y1, cfg.bar_h);
@@ -7042,17 +6999,6 @@ int main(int argc, char **argv) {
     };
     so_set_overrides(strimg_overrides,
                      (int)(sizeof(strimg_overrides) / sizeof(*strimg_overrides)));
-  }
-  /* Same mechanism, for the solid-rectangle exit: keep the engine's own
-   * implementation around so nx_sgl_fillrect only changes the height. */
-  sgl_fillrect_real = (void (*)(long, long, long, long, unsigned long))
-      so_try_find_addr_rx(&game_mod, "SGL_grpFillRect");
-  {
-    static const so_override rect_overrides[] = {
-      { "SGL_grpFillRect", (void *)nx_sgl_fillrect },
-    };
-    so_set_overrides(rect_overrides,
-                     (int)(sizeof(rect_overrides) / sizeof(*rect_overrides)));
   }
   bridge_to_save_list = bridge_to_save_list_impl;
   so_set_overrides(flow_overrides,

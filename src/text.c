@@ -1284,10 +1284,10 @@ static void text_draw_engine_line(const char *utf8, int x, int y, int px,
    * text-control log, so this names the entry point that actually draws it. */
   {
     static int qn;
-    if (qn < 12 && (strstr(utf8, "伯爵") || strstr(utf8, "复命"))) {
+    if (qn < 40 && (strstr(utf8, "伯爵") || strstr(utf8, "复命"))) {
       qn++;
-      debugPrintf("quest: [%s] at %d,%d px %d len %d '%s'\n", g_caller, x, y,
-                  px, (int)strlen(utf8), utf8);
+      debugPrintf("quest: [%s] at %d,%d px %d col %08x len %d '%s'\n",
+                  g_caller, x, y, px, color, (int)strlen(utf8), utf8);
     }
   }
 

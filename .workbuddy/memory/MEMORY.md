@@ -130,12 +130,18 @@
   `GRPX_SetFontColor` 前必须 `__builtin_bswap32()`，否则黑色变红、金色变蓝。
 - **矩形出口**：`SGL_grpFillRect`(0x12b484) 是所有纯色填充的唯一出口
   （`GRPX_FillRect`/`FillRectAlpha`/`FillRectRGBAlpha` 尾调用它），
-  在 0x12b63c 提交 `glDrawArrays(6,0,4)`。要改矩形几何/颜色，**优先 override
-  这个导出函数**（`so_set_overrides` + `so_try_find_addr_rx` 存 real），
-  不要在 `nx_glDrawArrays` 里按坐标/颜色猜 quad —— 会误伤文字 quad。
-  ⚠️ 即便在这一层，条件也要按**绘图签名**收窄：曾把「短+宽+半透明」当提示条，
-  结果命中任务页标题栏的三条 476x15/18/15（棕色 `e5315069`、灰 `7f6f6f6f`），
-  叠成灰块盖住文字。提示条的精确签名是 `h==20 && 纯黑半透明(0xAA000000)`。
+  在 0x12b63c 提交 `glDrawArrays(6,0,4)`。日志里的 `ra` 减去模块基址就是
+  `SGL_grpFillRect+0x1bc` —— 用它确认 quad 来源，而不是猜坐标。
+  ⚠️ **不要轻易 override 它**：为把提示条撑到 34px 曾挂了这个钩子，结果误伤
+  任务页标题栏三条 476x15/18/15（棕色 `e5315069`、灰 `7f6f6f6f`），叠出灰块
+  盖住文字；收窄条件后任务页文字仍不对，最后**整个移除**。真正原因很简单：
+  普通提示条是全宽 `1137x20`，被 `bar_expand` 的 `w > 1080` 上限排除了。
+  **先查现有路径里"排除该情况"的那个参数，再考虑新增 hook。**
+- **wrap_extra 是帧级全局累加器**（`text.c` `text_draw_engine_ex`），只在
+  `y <= wrap_last_y` 时清零。并排控件按 y 递增绘制时，前一个多行段落留下的
+  下推量会被下一个控件继承 —— 任务页标题因此整体下移约 100px。
+  `nx_textctrl_draw` 现在每个控件画完 `text_set_wrap_extra(0); (1);` 清一次。
+  排查"文字莫名下移/跑到别的框"先怀疑它。
 - **调试定位技巧**：`bar: quad ... ra <运行时地址>` 减去日志里的
   `libgame.so: virt = 0x...` 就是调用点的 vaddr，再用 `tools/disas_at.py`
   找最近导出符号；比反复改阈值猜测快得多。

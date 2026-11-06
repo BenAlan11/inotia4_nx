@@ -1,16 +1,18 @@
 Inotia 4 for Nintendo Switch -- known good snapshot
 
-build stamp : 2026-11-06 20:05:16 (rebuilt after the quest-page regression)
-nro md5     : 379dcfbb92a4f630d7eaca49fa85bcf8
-nro size    : 9162871 bytes
+build stamp : 2026-11-06 20:25:51
+nro md5     : f7e34f21c71b9292f19f3eca93a04390
+nro size    : 9158775 bytes
 config      : config.prod.ini (bar_h = 34, log_level = 1, string_draw = 1)
-verified    : 2026-11-06 19:48 by play testing (black ink + 34 px plate);
-              the quest-page regression fix below is verified from the log and
-              awaits one visual re-check on the console.
+verified    : 2026-11-06 21:03 by play testing -- black (not red) ink on the
+              battle shouts, the plain tips' 60% black plate at 34 px, and the
+              quest page's title back in its MAIN bar.
 
-NOTE: the 19:45:13 build (md5 05e3b1e1...) had a regression and is NOT a
-known-good state. It grew every short wide translucent rectangle to 34 px,
-which also caught the quest page's three title strips. This NRO replaces it.
+The 19:45:13 (05e3b1e1...), 20:05:16 (379dcfbb...) and 20:17:11
+(1aabd378...) builds are NOT known-good states. The first two carried a
+rectangle-level SGL_grpFillRect override that broke the quest page; the third
+removed it but the quest text still sat one paragraph too low. This NRO
+replaces all of them.
 
 Changes since 20261106-1905:
 
@@ -24,26 +26,31 @@ Changes since 20261106-1905:
     byte-swaps the word for nx_textctrl_draw() and desc_draw_block(). The
     textctrl path does NOT apply text_colour()'s black->white lift.
 
-  * the plain tips' 60% black plate is now 34 px tall. SGL_grpFillRect
-    (0x12b484) is the single exit for every solid rectangle (GRPX_FillRect /
-    FillRectAlpha / FillRectRGBAlpha tail-call it); the runtime return address
-    in "bar: quad 80,152-1057,172 ... ra 0x4ceb35f640" is SGL_grpFillRect+0x1bc.
-    UI_DrawTextBackground (0x143b30) asks GRPX_FillRectRGBAlpha for h = 0x22,
-    so 34 px is the engine's own text background, while the hint plates were
-    submitted at 20. bar_expand() only matched quads with a black
-    GL_CURRENT_COLOR, which the tinted plain tips never have. The override
-    nx_sgl_fillrect() grows short wide translucent plates around their centre
-    to cfg.bar_h at the rectangle's source, before the real function builds
-    its four vertices. Bounded "fillrect:" log records parameters + caller
-    vaddr.
+  * the plain tips' 60% black plate is 34 px tall. It is NOT a different
+    rectangle from the tutorial hint: both are quads submitted by
+    SGL_grpFillRect (0x12b484 -> glDrawArrays at 0x12b63c), black at 60%
+    (0x99000000), 20 px high. The tutorial one is 977 px wide, the plain tip is
+    FULL SCREEN (1137 px), and bar_expand()'s width cap was 1080 -- so the plain
+    tip was silently skipped. The cap is now 1280 (the engine's screen width).
+    UI_DrawTextBackground (0x143b30) independently confirms 34 px is the
+    engine's own text-background height (w3 = 0x22).
+    A rectangle-level override of SGL_grpFillRect was tried first and REMOVED:
+    it also caught the quest page's three 476x15/18/15 title strips in brown
+    (0xe5315069) and grey (0x7f6f6f6f), stacking a grey plate over the text.
 
-  * REGRESSION FIX in this rebuild: the first attempt accepted any short, wide,
-    translucent rectangle and broke the quest page -- its title bar is three
-    476x15 / 476x18 / 476x15 strips at y 164/179/197 in brown (0xe5315069) and
-    grey (0x7f6f6f6f); growing and shifting them stacked a grey plate over the
-    quest text. The condition is now exactly the hint plate: h == 20, w >= 200,
-    and a pure-black colour with a non-trivial alpha (0xAA000000, e.g.
-    0x99000000). The quest strips share none of those.
+  * the quest page's title is back in its MAIN bar. text_draw_engine_ex()'s
+    wrap_extra is a frame-global push-down that is only cleared when the next y
+    goes BACKWARDS. The quest description wraps to 5 lines and left 4 lines
+    (~100 px) behind; the next control (the title / list row) is drawn at a
+    LARGER y, so it inherited the whole offset. nx_textctrl_draw() now clears
+    the accumulator after every control (text_set_wrap_extra(0) then (1)).
+    Log proof, same frame:
+      quest: [grpx]    at 193,173 col ffffffff '刺杀格里普顿伯爵'
+      quest: [textctrl] at 682,168/193/218/243 ... (the five description lines)
+
+  * tools/win_place.py decodes tasklist with the system ANSI code page (mbcs)
+    instead of UTF-8, which crashed on zh-CN Windows; the second-screen test
+    window can always be placed again.
 
 Known open item (engine-side art, not port code):
 
@@ -54,7 +61,7 @@ Known open item (engine-side art, not port code):
     shouts are unaffected because their middle tile covers the overlap.
 
 Diagnostics in this build (all bounded; log_level = 0 silences them):
-  dlg:, bal:, df:/dfq:, bar:, hbar:, elbar:, fillrect:, gold:, page:, popup:
+  dlg:, bal:, df:/dfq:, bar:, hbar:, elbar:, gold:, page:, popup:, quest:
 
 Restore:
   copy inotia4_nx.nro over <sdmc>/switch/inotia4/inotia4_nx.nro
