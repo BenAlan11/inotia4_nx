@@ -57,6 +57,15 @@ typedef struct {
   int  calib;             /* draw scissor calibration marks */
   int  redraw_probe;      /* paint magenta after each present to see if the engine redraws */
   int  state_probe;       /* log scene/popup/input-tree state + wrap the menu transition (bring-up) */
+  int  pad_probe;         /* 1 = log every quad in the pad corner while the stick is held,
+                           * 2 = and drop them (bring-up; 2 also eats the map behind the pad) */
+  int  hide_pad_zone;     /* 1 = drop HUD-issued quads in the pad corner (the lit ring) */
+  int  tap_buttons;       /* 1 = A/B tap real 确认 / × / skip controls on pages */
+  int  flip_arg;          /* 1 = forward GRPX_DrawPartFlip's 8th arg (mirror) */
+  int  hud_page_filter;   /* kept for compatibility; rectangle filter retired */
+  int  no_pad_art;        /* 1 = suppress the virtual-key draw loop at its source */
+  int  quick_layout;      /* 1 = move the 6 HUD quick-slot buttons to quick_pos */
+  char quick_pos[256];    /* six "x,y" pairs in engine units, control ids 8..13 */
   int  patch_http;        /* rewrite BL call sites inside the engine (see main.c) */
   int  stall_abort;       /* seconds without a frame before aborting for a stack (0 = off) */
 

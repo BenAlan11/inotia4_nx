@@ -214,11 +214,48 @@ FILE *shim_fopen(const char *path, const char *mode) {
   return f;
 }
 
+/* libgame.so was linked against Android's bionic, so every open() flag it
+ * hands us uses BIONIC's bit layout. We used to pass those bits straight to
+ * newlib, whose layout is different:
+ *
+ *                bionic   newlib
+ *   O_CREAT       0x040   0x0200
+ *   O_EXCL        0x080   0x0800
+ *   O_NOCTTY      0x100   0x8000
+ *   O_TRUNC       0x200   0x0400
+ *   O_APPEND      0x400   0x0008
+ *   O_NONBLOCK    0x800   0x4000
+ *   access mode   0..2    0..2  (identical)
+ *
+ * SAVE_SaveDataAsNameKey opens slot files with mode 4 -> CS_fsOpen emits
+ * 0x241 = WRONLY|CREAT|TRUNC (bionic). Under newlib that is
+ * WRONLY | 0x040 (ignored) | 0x200 (O_CREAT) -- the O_TRUNC is LOST. A save
+ * shorter than the previous one therefore leaves the old tail behind.
+ * SAVE_LoadDataAsNameAndKey then derives the cipher length from filesize-3,
+ * both trailer checksums miss, and the slot renders as "ERROR(00)".
+ *
+ * This function is only wired into the engine's import table (imports.c);
+ * the port's own open() calls use newlib flags directly and never reach it.
+ * Translate once here so writes truncate again. Unknown high flags are
+ * passed through untouched. */
+static int bionic_flags_to_newlib(int f) {
+  int n = f & 3;                       /* O_ACCMODE is the same on both */
+  if (f & 0x0040) n |= 0x0200;         /* O_CREAT    */
+  if (f & 0x0080) n |= 0x0800;         /* O_EXCL     */
+  if (f & 0x0100) n |= 0x8000;         /* O_NOCTTY   */
+  if (f & 0x0200) n |= 0x0400;         /* O_TRUNC    */
+  if (f & 0x0400) n |= 0x0008;         /* O_APPEND   */
+  if (f & 0x0800) n |= 0x4000;         /* O_NONBLOCK */
+  return n | (f & ~0x0fff);            /* keep O_SYNC & friends */
+}
+
 int shim_open(const char *path, int flags, ...) {
   char buf[512];
   shim_path_resolve(path, buf, sizeof(buf));
+  const int engine_flags = flags;
+  flags = bionic_flags_to_newlib(flags);
   mode_t mode = 0;
-  if (flags & O_CREAT) {
+  if (engine_flags & 0x0040) {        /* bionic O_CREAT -> a 3rd arg exists */
     va_list va;
     va_start(va, flags);
     mode = (mode_t)va_arg(va, int);
@@ -254,7 +291,8 @@ int shim_open(const char *path, int flags, ...) {
   }
 
   if (cfg.log_level >= 2 || !buf[0])
-    debugPrintf("fs: open(%s, 0x%x) -> %d%s from %p\n", buf, flags, fd,
+    debugPrintf("fs: open(%s, 0x%x -> 0x%x) -> %d%s from %p\n",
+                buf, engine_flags, flags, fd,
                 fd < 0 ? " (failed)" : "", __builtin_return_address(0));
   return fd;
 }

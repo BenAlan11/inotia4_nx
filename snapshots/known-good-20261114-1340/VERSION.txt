@@ -1,0 +1,168 @@
+Inotia 4 for Nintendo Switch -- known good snapshot
+
+build stamp : 2026-11-14 13:22:43
+frozen at   : 2026-11-14 13:39 (snapshot taken; no source change after the
+              13:22 build --
+              src/input.c 13:22:43.04 was the last edit and it IS in the .o --
+              build/input.o 13:22:44.06, nro 13:22:44.89)
+nro md5     : b838dbc32566042fa995586ef9939b52
+nro size    : 9216119 bytes
+config      : config.ini in this folder (= config.prod.ini, unchanged since
+              2026-11-08; hide_pad_zone = 0, no_pad_art = 1, string_draw = 1,
+              quick_layout = 1,
+              quick_pos = "945,395; 865,475; 1025,475; 945,555; 20,530; 120,530")
+parent      : snapshots/known-good-20261110-1245/ (051ab32c..., commit bd37dc2)
+              See `git log --oneline bd37dc2..HEAD` for the landing commits.
+
+CLOSEST TO WHAT THE USER ACTUALLY RAN
+  This binary is byte-identical (b838dbc3...) to the copy deployed to
+  %APPDATA%\eden\sdmc\switch\inotia4\ and to dist/switch/inotia4/.
+  It was NOT rebuilt for this snapshot on purpose: a rebuild changes the build
+  stamp and therefore the md5, and this md5 is the one under test.
+
+PLAY-TESTED BY THE USER SINCE 20261110-1245
+  * skill page: the focus arrow lands on the real skill icons now (kept inside
+    the engine's PRIVATE icon group, see below), A's gold selection ring follows
+    the focus, the right stick scrolls the skill tree up/down and the focus is
+    auto-scrolled back into view
+  * right stick left/right no longer switches tabs (it was too easy to hit);
+    L/R still switch
+  * tab switching no longer sticks: 6/6 -> 1/6 works from every page
+  * the gold emphasising box is gone; a small ">" arrow on the left of the
+    focused control is the only cursor
+  * B closes just the top panel first, and backs out of the menu on the second
+    press
+  * everything from the 11-10 snapshot still holds: story emphasis colour, the
+    6 quick slots + RT+X/Y/A/B, R swap, d-pad L/R on the lower-left pair, the
+    assign page, 路障 A, UIChoice row taps, attack key Y, the hidden
+    pad-bound icons, settings-page entry
+
+VERIFIED IN THIS SESSION BUT NOT HAND-TESTED
+  * settings pages (1/6)..(6/6) message boxes: A confirms / B cancels straight
+    away, no need to walk the cursor onto the button.
+    Root cause: nav_update() gated that branch on `!settings` on the assumption
+    that settings pages never raise a popup. They do -- nx_TouchHandle_Event's
+    popup_base_real() reroute proves it. The branch is now the very first thing
+    nav_update() does, for every page: `if (popup_on()) { A|B -> ab_press }`.
+    popup_on() reads the engine's own POPUP_BASE (vb+0x2b8d78), which the engine
+    clears when the box closes, so a stale box cannot be misdetected.
+    If a "yes/no" box still ignores A/B, check debug.log for
+    `input: A press -> message box`; if it is absent the box is a
+    UI_PopupProcess (not a UIPopupMsg) and needs its own tree test.
+
+CHANGES SINCE 20261110-1245 (.workbuddy/memory/2026-11-13.md, 2026-11-14.md)
+  1. The settings pages got a NEW pad model. The user asked for the old
+     hand-designed one to be scrapped ("角色加点 / 技能加点 / 背包选取 ... 全部废除")
+     and for a design based on how other games do it (BOTW, Genshin, Xbox
+     XAG 112 guidelines were researched). One rule set, no per-page special
+     cases:
+       - the focus set is every clickable control of the topmost visible panel
+         (occlusion filtering in nav_gather_boxes + proc whitelist kept)
+       - d-pad / left stick: nearest-neighbour spatial move, off-axis distance
+         weighted x3, edge WRAP-AROUND (XAG says stop, but stopping felt stuck),
+         hold 18 frames then repeat every 6
+       - A: always just a tap on the focus
+       - B: back one layer (panel X first, then the page), focus returns to the
+         control that opened the panel (nav_saved_*)
+       - L / R / right-stick flick: switch tab directly (the tab's own control
+         is tapped; no "tab bar layer" any more)
+       - X / Y are unused inside menus, they belong to the field
+       - default focus: 开始游戏 on the title/class pages, first NAV_K_SKILL on
+         the skill page, otherwise the first control of the visible panel
+     NAV_TOP/BODY/STAT, nav_stat_point/hold, nav_classify() and NAV_K_ACTION
+     were deleted.
+  2. Focus cursor: gold box removed. nav_focus_marker() draws a 17x18 solid ">"
+     arrow 16px OUTSIDE the left edge of the focus control (9 scanlines, dark
+     outline + bright white core (1,1,0.92)), independent kx/ky scaling.
+     nav_gold_cursor() is kept but unused.
+  3. Skill icons are NOT in the root control tree. UISkill_SkillScrollDraw
+     (0x162614) does `ldr x0,[x22,#0x8a0]` with x22 = adrp 0x2b9000, so the
+     icon group lives at vb+0x2b98a0 and the engine draws it by hand
+     (ControlObject_GetChild -> ControlSkill_Draw). nav_collect_skill_icons()
+     reads that group through the real engine objects (p_ctrl_count /
+     p_ctrl_child / p_abs_rect), after nav_count_side_tabs() >= 2 proves the
+     page really is the skill page (other tabs leave a stale pointer there and
+     would inject ghost icons). Icons go to the FRONT of the control list so
+     nav_idx still means the same skill after a scroll rebuilds the tree;
+     NAV_K_SKILL puts the default focus on the first icon.
+  4. Scrolling is a real 4-frame drag (nav_scroll_request/nav_scroll_pump ->
+     input_touch(0/1/2, ID_PAD, ...), 60px per frame, 120px total so the engine
+     sees a drag and not a tap). The engine samples the pointer once per frame,
+     so a down/up inside one frame is invisible -- do not "simplify" this.
+     Right stick up/down = scroll, left/right flick = tab. Focus auto-scrolls
+     back into view when it leaves [vy+h/2+8, vy+vh-h/2-8].
+  5. Tab switching sticks / silently does not switch. Two separate causes:
+     a. page liveness: the quest-list page holds a single 514x56 ControlButton
+        and nav_collect_items had a 400px width cap, so items_n = 0 and the
+        navigator switched itself off. Cap is 600 now, `present` no longer
+        requires items_n > 0, and input_nav_active() accepts pages with tabs.
+     b. events eaten by a leftover panel: on the bag page the container id 283
+        (88,0 1137x640) has child id 297 = 88,0 409x431 UIGameMenu_SubEvent.
+        It covers tab1 (206..304) and tab2 (343..441) but not tab3 (480..578),
+        which is exactly why only 2->1 failed while every rightward move and
+        every arrival at tab1 from another page worked. Fix: nav_tab_objs[] +
+        ui_tab_control_at(x,y), and a branch at the TOP of
+        nx_ControlObject_EventProc: depth==1, code 0x17/0x18/0x19, point inside
+        a tab rect -> colevent_real(tab_obj,...) straight to that tab button and
+        return. Same direct-dispatch channel as the quick slots / UIChoice rows.
+        The page-id + content-fingerprint confirm / retry / cursor-restore logic
+        stays as the fallback.
+  6. B did not close a panel on its own. ui_panel_close_button() looks for the
+     55..90px square ControlButton among the DIRECT children of a
+     UIGameMenu_SubEvent container, else the topmost button in the panel's own
+     upper 110px. nav_panel_closed makes it two-stage (panel, then menu).
+
+THINGS THAT BROKE AND MUST NOT BE REPEATED
+  * Gating the popup A/B branch on "not a settings page". Settings pages DO
+    raise UIPopupMsg boxes.
+  * Calling the engine's per-scene key handler from port code (directly,
+    through the 0x29eb90 slot, or after PT_LOAD|PF_X validation) -- stalls the
+    frame loop. menu_key_press() was DELETED.
+  * POPUPSTATE_Exist() returns 0 on the character page.
+  * Matching shortcut slots / UIChoice rows / front-end pages / settings tabs by
+    control id: those ids change every launch (742->792, 3830->4083->4143).
+    Match the event proc or the tree SHAPE.
+  * Reading the skill icons from the root tree -- they are only in the private
+    group at vb+0x2b98a0.
+  * Doing a scroll as a same-frame down/up, or trusting ftruncate() on the
+    Switch devoptab.
+  * Drawing a highlight on a control rect that is a padded HIT box.
+  * Passing bionic flag bits straight to newlib (O_TRUNC 0x200 vs 0x400).
+  * Incremental builds after changing config.h / text.h / input.h: --clean.
+  * Filtering quads by screen rectangle to hide UI; cut the draw call site.
+
+FOOTGUN -- KEEP THE CONFIG
+  * hide_pad_zone = 0 in every config.ini. Without it the GL interception
+    turns on and the game stalls at 0 FPS / nan ms.
+  * quick_layout / quick_pos identical in all three ini files.
+  * The Eden sdmc config.ini also carries the user's log_level = 3 and
+    tap_script. Do NOT overwrite it with config.ini from this folder.
+  * pad_probe = 0, string_draw = 1, no_pad_art = 1.
+  * Do not edit %APPDATA%\eden\config\qt-config.ini, and do not touch
+    sdmc\switch\inotia4\save\ when deploying. Replace only inotia4_nx.nro.
+
+KNOWN GAPS
+  * The popup A/B fix (item 6 above / the "not hand-tested" block) has not been
+    confirmed by the user yet.
+  * Panels with no small square close button (e.g. the 409x431 description
+    column) still make B back out of the page instead of closing the panel.
+  * A few pages expose several 0x13e72c scroll viewports; the one nearest the
+    focus is used, which may be the wrong one.
+  * The R swap assumes the HUD reads shortcut slots as array[page+i].
+  * The save-page cursor deliberately excludes the 66x66 delete bins so a stray
+    A cannot delete a save; a finger can still reach them.
+
+HOW TO RESTORE
+  Fastest (binary only):
+    copy this folder's inotia4_nx.nro over
+      %APPDATA%\eden\sdmc\switch\inotia4\inotia4_nx.nro   (Eden)
+      dist/switch/inotia4/inotia4_nx.nro                  (SD-card tree)
+    do NOT copy config.ini over the Eden one (see FOOTGUN).
+    Verify with: md5sum inotia4_nx.nro -> b838dbc32566042fa995586ef9939b52
+  From source:
+    the zip carries src/, build.py, config.prod.ini, README.md, three tools,
+    the memory files, the snapshot files and font.ttf. It does NOT carry the
+    compiler toolchain or the game's own assets. Unpack it over a copy of this
+    repository (which supplies tools/dkp_rootfs, data/libgame.so and
+    dist/switch/inotia4/font.ttf), then `python build.py --clean`.
+    ALWAYS use --clean: input.h / config.h / text.h changed more than once.

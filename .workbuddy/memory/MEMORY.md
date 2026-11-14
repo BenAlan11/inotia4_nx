@@ -1,148 +1,91 @@
 # 项目长期约定（Inotia 4 Switch port）
 
-## 调试授权与流程（用户明确授权，2026-11-03）
-- **推送 dist/ 前直接结束 eden 进程**，不需要每次询问：
-  `Stop-Process -Id <pid> -Force`（`Get-Process eden,eden-cli` 可能有多个实例，
-  包括关窗口后残留的）。eden 会占住 `dist/switch/inotia4/inotia4_nx.nro`，
-  不结束就报 "Device or resource busy"。
-- 调试阶段**只推 Eden**（`%APPDATA%\eden\sdmc\switch\inotia4\`），
-  **不推 SD 卡**；等 Eden 里游戏跑通再推卡。
-- 推 Eden 不需要 `deploy.py --eden`（它要求 `~/Downloads/Inotia4.apk` 存在，
-  且会覆盖 config.ini）。直接 `cp build/inotia4_nx.nro` 到 sdmc + dist，再 `md5sum` 核对。
+## 调试授权与部署流程（用户授权，长期有效）
+- 推 dist/ 前直接结束 eden 进程，不用询问：`Stop-Process -Id <pid> -Force`
+  （`Get-Process eden,eden-cli` 常有多个残留实例，会占住 `dist/switch/inotia4/inotia4_nx.nro`）。
+- 调试阶段**只推 Eden**：`%APPDATA%\eden\sdmc\switch\inotia4\`，不推 SD 卡。
+  直接 `cp build/inotia4_nx.nro` 到 sdmc + dist，再 md5 核对（不用 `deploy.py --eden`，
+  它要求 `~/Downloads/Inotia4.apk` 且会覆盖 config.ini）。
+- **用户明确要求（2026-11-09）：不要动存档**。只替换 `inotia4_nx.nro`，不碰 `save/`、
+  不覆盖 sdmc 的 `config.ini`、不改 `qt-config.ini`。新功能用编译默认值，不引入必须改 ini 的开关。
+  收尾用「文件数 + 总字节 + 全目录 md5 + config.ini md5」与部署前只读基线核对并回报。
+- 拉起测试一律用 `C:\1GAME\BaiduDownload\eden\eden\eden.exe -g <nro>`（不要 eden-cli.exe）。
+  用户接 Xbox 手柄，Eden 自己映射成 NS 手柄，不要改 `qt-config.ini` / `sdl2-config.ini`。
+- 测试窗口**不再需要挪到第二屏**，默认位置拉起即可。
 
 ## 环境事实
-- `base(4).apk`（用户给的那个）是 **armeabi-v7a 32 位**包，端口用的是 arm64
-  `libgame.so`（`data/libgame.so`，2793248 字节）。符号级结论以 arm64 为准。
-- 存档目录：`save/com.com2us.inotia4.normal.freefull.google.global.android.common/`
-  下 `<32hex>/save%d.dat` 与 `<32hex>A/thpcheckslot%d.dat`。
-- Eden 安装位置：`C:\1GAME\BaiduDownload\eden\eden\eden.exe`；
-  启动 `eden.exe -g "<sdmc>\switch\inotia4\inotia4_nx.nro"`。
-  ⚠️ 我用工具启动的 GUI 进程会被沙箱回收，**窗口必须由用户自己拉**。
+- 端口用的 arm64 `libgame.so`（2793248 B）；`base(4).apk` 是 armeabi-v7a 32 位，符号结论以 arm64 为准。
+- 存档目录 `<32hex>/save%d.dat` 与 `<32hex>A/thpcheckslot%d.dat`。
+- 字体：卡上 `font.ttf` = 原机 `DroidSansFallback.ttf`（3.7MB，50951 字形）；缺失时回退主机共享字体。
 
-## 已验证的基线构建（2026-11-03）
-- `build/inotia4_nx.nro` md5 `aa29fc3837bdf522e03c77f34a9260b9`，build 14:24:24
-- 用户实测通过：存档读写、跨重启读档、删除存档、回主菜单后再按 START 进存档页
-- 快照：`snapshots/save-fix-20261103-v2.zip`（src + README + 记忆）
+## 引擎通用事实（反复用到）
+- **颜色字序**：引擎 32 位颜色 `(a<<24)|(b<<16)|(g<<8)|r`，我们的 `text_draw_engine()` 吃
+  `0xRRGGBBAA`。文本控件 `+0x14` 交 `GRPX_SetFontColor` 前必须 `__builtin_bswap32()`。
+- **`wrap_extra` 是帧级全局累加器**（`text.c` `text_draw_engine_ex`），只在 `y <= wrap_last_y`
+  清。整段一次性画必须 `text_set_wrap_extra(0)` 包住；`nx_textctrl_draw` 每控件画完清一次。
+  症状：段间凭空多出数行高空格、后续控件整体下移。
+- **`X_TEXTCTRL_SetTextControl(ctrl, str, width, ...)` 第三参是框宽，不是字节数**。
+- **引擎全局函数指针槽常是两层**：槽地址 → `ldr x8,[x9]` → `blr x8`。直接调引擎回调前先
+  反汇编数清层数，并用 `so_module.phdr` 的 `PT_LOAD|PF_X` 校验目标在可执行段内。
+- **引擎 scene key handler 一律不要从移植层调用**（2026-11-08 定稿，曾跳进 .bss 卡死）：
+  `menu_key_press()` 已删除；`ab_press()` 对非消息框页只留 `popup_press()`（消息框）与
+  B 的 `corner_tap()`。不要按 layer 判断（角色信息页 `POPUPSTATE_Exist()` 返回 0）。
+- **不要轻易 hook `SGL_grpFillRect`(0x12b484)**：曾误伤任务页标题栏三条填充。先查现有路径里
+  "排除该情况"的参数，再考虑新增 hook。日志 `ra` 减模块基址 = 调用点 vaddr，
+  配 `tools/disas_at.py` 定位最近导出符号。
+- **`libgame.so` 是 bionic**：`open()` flags 必须翻译（`libc_shim.c:bionic_flags_to_newlib()`）。
+  bionic O_CREAT=0x40/O_TRUNC=0x200/O_APPEND=0x400；newlib O_CREAT=0x200/O_TRUNC=0x400/O_APPEND=0x8。
+  原样透传会导致写存档从不截断 → 尾部残留 → 读档 `ERROR(00)`。
+- **存档格式**（`ENCRYPT_Process2`，表在 `0xbb7e8`）：`len=filesize-3`，`nonce=data[len+1]`，
+  `plain[i]=(key[(nonce+i)%kl]+TBL[(nonce+i)&0xff])^cipher[i]`（key 索引不掩 8 位）；
+  `data[len]`=密文和，`data[len+2]`=明文和。密钥 `inotia4-switch-save-v1`。
+  `thpcheckslot1.dat` 应解出 `2|011110|99|99|99|99|99|END|`（最快标尺）。
+  三层保护已加：写后 `"wb"` 重写精确 `len+3`、读失败扫最长合法 L 裁尾重读、启动体检不改名 `.bad`。
+  `ftruncate()` 在 Switch devoptab 上不可靠，用 `"wb"` 重写代替。
+- 用户要求：**修复靠读绘图逻辑，不要靠量坐标/猜阈值**。
 
+## 页面/控件树
+- root = `*(vb+0x2b4140)`；节点 `+0x18` 为相对 x,y，`+0x28` 为 w,h；`p_abs_rect` 给绝对 rect。
+- **页面识别只认结构不认 id**（设置页/快捷键页 id 每次启动都变）：root 下每个 `1137x640`
+  子节点是一层页面，**最后一个可识别层 = 最上层**（职业页压存档页、存档页压标题页）。
+  形状分类：TITLE `369x124`+2×`300x92`；SAVE 3×`634x150`；CLASS 6×`116x114`+`292x64`；
+  SETTINGS `784x98` tab 栏。游戏内 HUD 无 1137x640 层 → 导航关闭。
+- 三个前置页面只用十字键 + A/B，L/R 无响应；职业页两段确认（A 选职业 → 光标跳 `292x64`
+  开始游戏 → 再 A 进游戏）。
+- 职业页压在存档页上时，`nx_TouchHandle_Event` 会丢弃落在底层 `634x150` 行 / `66x66` 删除 bin
+  上的 tap → 导航注入点 `tx/ty` 要在控件自身矩形内避开这些 shadow 矩形。
+- **控件 rect ≠ 可见 art**：标题按钮命中框 `369x124`/`300x92`，图集
+  `UI_TITLEMAIN_BUT_cn_s_001.png` 里 alpha 边界 `357x77`/`292x63`，**宽高比全 4.63:1**。
+  `nav_title_art()` 取命中框宽 92%、高 = 宽/4.63、居中，`tx/ty` 保持控件中心。
+- 金色高亮统一走 `nav_gold_cursor()`（三层琥珀→橙金→亮金），形状由 `NavItem.shape`
+  （NAV_SHAPE_ROUNDRECT/CIRCLE/PILL/ELLIPSE）指定，不要退回纯黄直角框。
 
-## 测试窗口位置（2026-11-05 用户撤销了"放第二屏"的要求）
-- **不再需要把 Eden 窗口挪到第二屏**，直接默认位置拉起即可，不要再调 `tools/win_place.py`。
-- 工具保留（`python tools/win_place.py --monitor 2`），需要时再用。
-- 历史约定（已作废）：2026-11-04 曾要求一律放 2 屏、不抢 1 屏焦点。
-- 工具：`python tools/win_place.py --monitor 2 --watch 30`（主屏算 1 号）。
-  用 `SetWindowPos + SWP_NOACTIVATE` 移动，不抢焦点。
-- 标准流程：先起 eden（后台），再跑上面的命令；窗口出现 0.5s 内被挪到 2 屏。
-- `--list` 可查显示器与窗口当前坐标。
+## 说明页（技能/物品描述）
+- 右侧说明页 = `ControlScroll`（`[vb+0x2b5a30]`），绘制回调在 `data+0xa0`，
+  `ControlScroll_Draw` 用 `data+0x50` 调它。该控件在移植里收不到指针，
+  位置由 `input.c` 的 `desc_scroll_tick` 喂入。
+- 三块（A/下一等级B/对比块）y 由上一块高度字段 `ctrl+0x08` 算；引擎那套来自 Java 光栅器
+  字符串图 = 0，必须由移植层给：`data+0xa0` 指向 `nx_desc_text_scroll` 整体排版。
+- **事件分发**：`ControlObject_EventProc` 按子控件链表顺序递归，返回 1/2 即停。技能/物品页
+  `id 100`（整窗 1137x431）排在 `id 99`（说明面板 409x431）前面 → 说明面板收不到事件。
+  修法：`colevent_depth==1` 且整次返回 0，落点在说明面板内且不在滚动视口内时，
+  手动转发 0x17/0x18/0x19（日志 `desc panel ... forwarded`）。视口必须排除，否则双倍速滚动。
 
-## 字体（2026-11-04）
-- 卡上 `font.ttf` 现在放的是**原机字体** `DroidSansFallback.ttf`（3.7MB，50951 字形），
-  来自用户提供的 `原机字体.zip`；`dist/switch/inotia4/font.ttf` 同步。
-- 加载日志：`text: loaded font sdmc:/switch/inotia4/font.ttf (N glyphs)`；
-  没有 font.ttf 时回退主机共享字体（日志 `no TTF on the card`）。
-- 之前"字体导致卡死"的结论是**错的**，真因是日志里调了引擎的 `SGL_GetTextSize`。
+## 对话文字颜色
+- `is_gold_text()` 返回 GOLD_WARM `#FAC8A0`（对话说话人、能力/技能点）或
+  GOLD_COOL `#C6B992`（角色页标签/名字块、存档行地图名）。说话人靠关系判定：字体 index 2
+  且下方 0..160px 内有正文行。括号开头的正文行 → `0xAAAAAA`（心里话）。
+- ⚠️ 气泡控件高度不要改（底板按此高度画，改高气泡视觉变大）。
 
-## 说明页（技能/物品描述）架构（2026-11-06）
-- 右侧说明页 = 一个 `ControlScroll`（`[virtbase+0x2b5a30]`），它的绘制回调存在 `data+0xa0`，
-  `ControlScroll_Draw` 用 `data+0x50`（位置）调用它。
-- 该控件的 `ControlScroll_ControlEventProc` 在移植里**收不到指针**（只能走控件树虚分发）；
-  左侧技能树能拖是因为 `ControlSkill_ControlEventProc` 直接调 `ControlScroll_EventProcPressed`。
-  所以位置由 `input.c` 采的位移喂进去（`desc_scroll_tick`），引擎负责其余绘制与滚动条。
-- 页面三块（A / 下一等级 B / 对比块）的 y 全部由"上一块的高度字段"算（ctrl+0x08）。
-  引擎那套高度来自 Java 光栅器的字符串图 = 0，所以移植里必须由我们给：
-  `data+0xa0` 指向 `nx_desc_text_scroll`，用我们自己的折行/行高整体排版，
-  只把最后一段的 y 交给 `UISkill_DrawDescAbility`。
-
-## 两个反复踩的坑（2026-11-06）
-- **`text_draw_engine` 的 `wrap_extra`**：为"引擎逐行送、我们折行"的场景设计的下压累加器。
-  整段一次性画时必须 `text_set_wrap_extra(0)` 包起来，否则下一块会被整体下推 N 行
-  （症状：段间出现"7 行字高"的空行，并压住下一块）。
-- **`X_TEXTCTRL_SetTextControl(ctrl, str, width, ...)` 第三个参数是框宽**，不是字节数；
-  文本缓存别拿它当拷贝上限（缓存已 1024 字节，长度用 `strlen`）。否则长文本尾部被截
-  （技能说明 269 字节，正好切掉尾部 `： $S5秒$B`）。
-
-## 事件分发（2026-11-06，踩过一次）
-- `ControlObject_EventProc` 按**子控件链表顺序**递归，返回 1/2 就停。
-- 技能页 / 物品页窗口里 `id 100`（左侧大面板，矩形＝整窗 1137x431）排在
-  `id 99`（右侧说明面板 409x431）**前面**；大面板里没有格子接住时返回 0 → 链表到头 →
-  说明面板永远收不到事件（症状：`学习`/`取消快捷键`/点药水都没反应）。
-- 修法：在 `nx_ControlObject_EventProc` 里，`colevent_depth == 1` 且整次分发返回 0 时，
-  若落点在说明面板矩形内、且**不在滚动视口内**，手动转发 0x17/0x18/0x19 给面板。
-  视口必须排除（否则引擎拖动 + 我们的滚动 = 双倍速）。日志标记 `ui: desc panel ... forwarded`。
-
-## 已知良好基线（2026-11-06 19:05，当前默认）
-- `build/inotia4_nx.nro` md5 `683ed6302f8af0c1a8267f02e616e695`，build 19:02:50，9158775 字节
-- 快照：`snapshots/known-good-20261106-1905/`（NRO + VERSION.txt + config.ini）
-  + `snapshots/save-slot-20261106-1905.zip`（35 文件：src/README/config/tools/记忆/NRO/font.ttf）
-- 用户实测：对话说话人名字全版式金色、括号心里话灰、存档页地图名 #C6B992
-- 上一版 1240（说明页滚动/排版/按钮）仍是历史记录，NRO 已不放进仓库
-
-## 对话文字颜色判定（2026-11-06）
-- `is_gold_text()` 返回 **GOLD_WARM / GOLD_COOL**，抽屉只读这个值：
-  - COOL `#C6B992`：角色页标签/名字块、存档行地图名
-  - WARM `#FAC8A0`：对话说话人、能力点/技能点
-- 说话人名字靠**关系**判定：字体 index 2 且下方 0..160px 内有正文行（两种版式都适用）
-- 括号 `（`/`(` 开头的正文行 → `0xAAAAAA`（心里话）
-- ⚠️ 气泡控件高度**不要改**：气泡底板就按这个高度画，改高会让气泡视觉变大
-
-## GitHub 备份（2026-11-04）
-- 本地已 `git init`（分支 main），一个提交 `960ef85`，375 文件 / 58MB：
-  `src/`、`build.py`、`deploy.py`、`config.prod.ini`、`README.md`、`tools/*.py`、
-  `snapshots/`（每个 known-good 的 NRO + VERSION.txt + 源码 zip）、`.workbuddy/memory/`。
-- `.gitignore` 排除：`build/`、`dist/`、`data/`、`apk_new/`、`ref*/`、`wip/`、
-  `tools/dkp_rootfs|libnx*|*.zip|*.bin`、`*.png`、`*.log`、存档备份。
-  **游戏本体/APK/存档不进仓库。**
-- 远端：`BenAlan11/inotia4_nx`（public，main 上是 10-29 的旧版移植代码）。
-  计划推到新分支 `backup-20261104`，不动 main。
-- ⚠️ 用户给的 fine-grained PAT **只有读权限**：`POST /git/refs` 返回
-  "Resource not accessible by personal access token"，`git push` 403。
-  需要 Contents: Read and write（或 classic token 的 repo scope）才能推。
-- 令牌未写入 .git/config，也已 `credential-manager erase` 清掉缓存。
-
-### 备份已成功（22:49）
-- 远端 main = 提交 `85395cab2282`（tree `206c2a2eca69`），368 文件 / 25MB，`src/` 与
-  `snapshots/known-google-2211/inotia4_nx.nro`(9060471 B) 大小与本地一致。
-- **git push 在这台机器上走不通**：出口代理只放行 api.github.com，
-  github.com 的 git 端点 CONNECT 502 / TLS reset。
-- 解决：`tools/gh_push.py` 走 Git Data API（blobs→tree→commit→ref），
-  用法 `GH_TOKEN=... python tools/gh_push.py BenAlan11/inotia4_nx main`。
-  脚本已改成会带上远端当前 head 作为 parent（首次是孤儿提交）。
-- 仓库内容：src/、build.py、deploy.py、config.prod.ini、README、tools/*.py、
-  snapshots（**只带 2211 的 NRO 和 zip**，旧的大快照仅留 VERSION.txt/配置）、
-  .workbuddy/memory/。游戏本体/APK/存档/工具链不进仓库。
-- 令牌用完提醒用户轮换（已在对话中出现）。PAT 是 fine-grained 且**有写权限**，
-  实测 `permissions.push = true`；令牌我从历史会话记录里取（不写进任何文件）。
-- `gh_push.py` 直接上传**工作区字节**（`make_blob` 读磁盘），而本地索引是
-  `core.autocrlf=true` 归一化后的 LF，所以文本文件的远端 blob sha 与本地索引不同。
-  历史上每次推送都是这样，远端一致（全 CRLF），clone 下来与本地磁盘逐字节相同。
-
-### 2026-11-06 12:51 推送
-- 远端 main = 提交 `a19b5ed21fbc7b9ff73419b607a85248d340aaf8`（tree `435c0a00`，
-  parent `660a5699`），378 文件 / 26,611,416 字节。
-- 索引里只留**当前** known-good 的 NRO 与 zip（`1240`），旧的 2211 的 NRO/zip
-  已从索引移除（磁盘上仍在）；`.gitignore` 现在是通配 + 否定规则：
-  `snapshots/known-good-*/inotia4_nx.nro`、`snapshots/save-slot-*.zip` 全忽略，
-  再 `!` 放行 `1240` 的两个。
-
-## 引擎通用事实（后续非文字系统适配也会用到，2026-11-06）
-- **颜色字序**：引擎的 32 位颜色是 `(a<<24)|(b<<16)|(g<<8)|r`（内存字节序 RGBA，
-  证据 `X_TEXTCTRL_GetColorFromCode` 表 0xbb9c8：`$R`=0xFF0000FF、`$B`=0xFF000000）；
-  我们的 `text_draw_engine()` 吃 `0xRRGGBBAA`。文本控件 `+0x14` 交给
-  `GRPX_SetFontColor` 前必须 `__builtin_bswap32()`，否则黑色变红、金色变蓝。
-- **矩形出口**：`SGL_grpFillRect`(0x12b484) 是所有纯色填充的唯一出口
-  （`GRPX_FillRect`/`FillRectAlpha`/`FillRectRGBAlpha` 尾调用它），
-  在 0x12b63c 提交 `glDrawArrays(6,0,4)`。日志里的 `ra` 减去模块基址就是
-  `SGL_grpFillRect+0x1bc` —— 用它确认 quad 来源，而不是猜坐标。
-  ⚠️ **不要轻易 override 它**：为把提示条撑到 34px 曾挂了这个钩子，结果误伤
-  任务页标题栏三条 476x15/18/15（棕色 `e5315069`、灰 `7f6f6f6f`），叠出灰块
-  盖住文字；收窄条件后任务页文字仍不对，最后**整个移除**。真正原因很简单：
-  普通提示条是全宽 `1137x20`，被 `bar_expand` 的 `w > 1080` 上限排除了。
-  **先查现有路径里"排除该情况"的那个参数，再考虑新增 hook。**
-- **wrap_extra 是帧级全局累加器**（`text.c` `text_draw_engine_ex`），只在
-  `y <= wrap_last_y` 时清零。并排控件按 y 递增绘制时，前一个多行段落留下的
-  下推量会被下一个控件继承 —— 任务页标题因此整体下移约 100px。
-  `nx_textctrl_draw` 现在每个控件画完 `text_set_wrap_extra(0); (1);` 清一次。
-  排查"文字莫名下移/跑到别的框"先怀疑它。
-- **调试定位技巧**：`bar: quad ... ra <运行时地址>` 减去日志里的
-  `libgame.so: virt = 0x...` 就是调用点的 vaddr，再用 `tools/disas_at.py`
-  找最近导出符号；比反复改阈值猜测快得多。
-- 用户明确要求：**修复要靠读绘图逻辑，不要靠量坐标/猜阈值**。
+## 备份
+- 远端 `BenAlan11/inotia4_nx`（PAT 有写权限）。**git push 本机不通**（代理只放行 api.github.com），
+  用 `GH_TOKEN=... python tools/gh_push.py BenAlan11/inotia4_nx main`（Git Data API）。
+  游戏本体/APK/存档/工具链不进仓库。
+- 最新可恢复点：`snapshots/known-good-20261114-1340/`（NRO md5 `b838dbc3…`，
+  build stamp 13:22:43，未重编译=正在跑的那份），提交 `fd68c2f`；
+  上一恢复点 `known-good-20261110-1245`（`051ab32c…`，`bd37dc2`）。
+- 远端可能滞后：本机 `git push` 挂住（auth/代理），要用 GH_TOKEN 跑 gh_push.py，
+  而该脚本会把**索引里所有文件**重新传一遍——仓库里囤了 7 代 nro+zip ≈100MB，
+  推一次很慢。要提速就按 .gitignore 的既定策略只留当前+上一代（`git rm --cached`
+  旧代，本地文件不删）。
+- `debug.log` 启动时轮转，grep 要先限定「本轮新增日志」再判断。

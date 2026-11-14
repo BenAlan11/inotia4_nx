@@ -54,6 +54,9 @@ void text_set_viewport(int w, int h);
 /* the engine's layout size (1137x640 here): text coordinates are in these
  * units, not framebuffer pixels */
 void text_set_engine_size(int w, int h);
+/* the mapped libgame.so base, so the text layer can read the engine's own
+ * $X colour-code table instead of carrying a hand-written subset */
+void text_set_engine_base(void *base);
 /* main.c: re-specify the client arrays the engine last set, after this module
  * drew from its own (see nx_restore_client_arrays) */
 void nx_restore_client_arrays(void);

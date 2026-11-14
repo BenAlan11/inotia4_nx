@@ -76,6 +76,12 @@ void config_defaults(void) {
   cfg.calib         = 0;
   cfg.redraw_probe  = 0;   /* the check needs a server, i.e. it cannot pass offline */
   cfg.state_probe   = 0;   /* bring-up: log the scene/popup/input state */
+  cfg.pad_probe     = 0;   /* bring-up: what still paints in the pad corner */
+  cfg.hide_pad_zone = 1;   /* the lit pad ring survives the blit filter */
+  cfg.tap_buttons   = 1;   /* A/B tap the page's real buttons */
+  cfg.flip_arg      = 1;   /* forward the real mirror argument */
+  cfg.hud_page_filter = 1; /* retired rectangle filter, kept for compatibility */
+  cfg.no_pad_art    = 1;   /* suppress the virtual-key draw loop itself */
   cfg.patch_http    = 0;   /* rewrite BL call sites in the engine; see main.c */
   cfg.stall_abort   = 0;   /* >0: panic-break after N stalled seconds (0 = log only) */
 
@@ -87,6 +93,15 @@ void config_defaults(void) {
   cfg.button_pct    = 18;
   cfg.overlay       = 0;   /* the real panel is the primary pointer */
   cfg.tap_script[0] = 0;   /* no scripted taps unless config.ini asks */
+
+  /* Quick-slot layout (HUD control ids 8..13), engine layout units 1137x640.
+   * Default: ids 8..11 form an EXACT cross on the right (centre 985,515,
+   * radius 80 -- up/left/right/down), ids 12/13 sit at the lower left.
+   * The d-pad / action disc already ignore screen touches through the
+   * existing input.c hud_touch_blocked() rule; nothing here changes that. */
+  cfg.quick_layout = 1;
+  snprintf(cfg.quick_pos, sizeof(cfg.quick_pos), "%s",
+           "945,395; 865,475; 1025,475; 945,555; 20,530; 120,530");
 }
 
 static char *trim(char *s) {
@@ -176,6 +191,12 @@ void config_load(const char *path) {
     else if (!strcasecmp_compat(key, "calib"))          cfg.calib         = atoi(val);
     else if (!strcasecmp_compat(key, "redraw_probe"))   cfg.redraw_probe  = atoi(val);
     else if (!strcasecmp_compat(key, "state_probe"))    cfg.state_probe   = atoi(val);
+    else if (!strcasecmp_compat(key, "pad_probe"))      cfg.pad_probe     = atoi(val);
+    else if (!strcasecmp_compat(key, "hide_pad_zone"))  cfg.hide_pad_zone = atoi(val);
+    else if (!strcasecmp_compat(key, "tap_buttons"))    cfg.tap_buttons   = atoi(val);
+    else if (!strcasecmp_compat(key, "flip_arg"))       cfg.flip_arg      = atoi(val);
+    else if (!strcasecmp_compat(key, "hud_page_filter")) cfg.hud_page_filter = atoi(val);
+    else if (!strcasecmp_compat(key, "no_pad_art"))     cfg.no_pad_art     = atoi(val);
     else if (!strcasecmp_compat(key, "patch_http"))     cfg.patch_http    = atoi(val);
     else if (!strcasecmp_compat(key, "stall_abort"))    cfg.stall_abort   = atoi(val);
     else if (!strcasecmp_compat(key, "inject"))         cfg.inject        = atoi(val);
@@ -197,6 +218,17 @@ void config_load(const char *path) {
         v++;
       }
       snprintf(cfg.tap_script, sizeof(cfg.tap_script), "%s", v);
+    }
+    else if (!strcasecmp_compat(key, "quick_layout")) cfg.quick_layout = atoi(val);
+    else if (!strcasecmp_compat(key, "quick_pos")) {
+      /* same quoted form as tap_script: the semicolons separate the pairs */
+      char *v = val;
+      const size_t n = strlen(v);
+      if (n >= 2 && v[0] == '"' && v[n - 1] == '"') {
+        v[n - 1] = '\0';
+        v++;
+      }
+      snprintf(cfg.quick_pos, sizeof(cfg.quick_pos), "%s", v);
     }
     else if (!strcasecmp_compat(key, "data_dir"))       snprintf(g_data_dir, sizeof(g_data_dir), "%s", val);
     else if (!strcasecmp_compat(key, "save_dir"))       snprintf(g_save_dir, sizeof(g_save_dir), "%s", val);

@@ -138,40 +138,49 @@ The game is **touch-only** — there is no keypad code in `libgame.so` at all.
 Every button is drawn by the engine and read through its pointer path, so the
 pad drives a virtual finger instead of pretending to be a controller.
 
-There are two modes, both shown on screen so the player always knows where a
-press will land:
+The pad behaves differently depending on what is on screen. Nothing here needs
+a config key; it is all compiled in.
 
-**Focus mode** (default) — a yellow box walks a list of menu targets:
-
-| Input | Effect |
-|---|---|
-| Left stick ←/→, D-pad ←/→, L/R | move the box between SETTINGS / START / MORE GAMES |
-| A or ZR | tap the boxed button |
-| Y | switch to free cursor |
-
-**Free cursor** — a crosshair the right stick aims, for anything not in the
-list (in-game menus, dragging an inventory, the map):
+**In the field** (the engine's HUD control tree is present):
 
 | Input | Effect |
 |---|---|
-| Right stick | move the crosshair |
-| A or ZR | press where it is; keep holding to drag |
-| B | release |
-| Y | back to focus mode |
-
+| Left stick | move |
+| Y | attack / interact with the map |
+| A | open the menu, advance dialogue, confirm |
+| B | back, cancel, release a stuck press |
+| RT + X / Y / A / B | the four right-hand quick slots, up / left / right / down |
+| D-pad ← / → | the two lower-left quick slots |
+| R | swap the right-hand four between the two pages |
+| + / − | the HUD's own menu buttons |
 | Touchscreen | passed straight through, one finger per contact |
 
-The focus list lives in `src/input.c` (`focus[]`, percentages of the view) if
-the title screen ever moves; the box is drawn with scissored clears, so it
-needs no texture and costs a few hundred pixels of fill per frame.
+**Settings pages (1/6 … 6/6)** -- one focus, no modes:
 
-**`inject = 0` is the default and only logs.** The engine's injection points
-(`InputQueue_CreateEventItem` and `InputQueue_Put`) are located and bound, but
-the event codes and the payload field order are inferred from disassembly
-rather than confirmed on hardware, and a wrong guess corrupts the engine's
-event list instead of failing cleanly. Set `inject = 1` in `config.ini` to
-enable the mirroring and watch `debug.log`; the touchscreen path works
-regardless.
+| Input | Effect |
+|---|---|
+| D-pad / left stick | move the focus to the nearest control, wrapping at the edge |
+| A | tap the focused control |
+| B | close the top panel; a second B leaves the menu |
+| L / R, or a right-stick flick ←/→ | change tab |
+| Right stick ↑/↓ | scroll the page (skill tree, description column) |
+| X / Y | unused -- they belong to the field |
+
+The focus is marked by a small `>` arrow outside the control's left edge. The
+old gold frame and the free crosshair are both gone.
+
+**Front-end pages** (title, save list, class select) are d-pad + A/B only,
+exactly like the original menus; the class screen is two-step (A picks the
+class and parks the cursor on 开始游戏, the next A enters the game).
+
+A touchscreen press is always forwarded unchanged, so anything the pad cannot
+reach can still be done with a finger. `inject = 1` (the shipped default) is
+what lets the pad's virtual finger exist at all: every synthetic tap and drag
+goes through the engine's own MotionEvent translator,
+`handleCletEvent_MV(action, x, y, id, pointerCount)`, which queues the same
+`0x17` press / `0x18` release / `0x19` move events Android would have produced.
+Set it to 0 to disable the virtual finger and leave only real touches.
+
 
 ---
 
@@ -732,6 +741,527 @@ out of that one fact, plus a fourth in the port's own text cache:
    `剑之灵魂持续时间： 5秒` lost the blue value, which is exactly what the player
    reported. The cache is 1 KB now and the copy length is `strlen()`.
 
+### 2026-11-07: the wheel, A/B, and the mirror
+
+Four unrelated complaints from play testing, and one rule that came out of them.
+
+**1. The golden rune wheel that only appeared while walking.** It was the
+virtual pad's own art: a gold magic circle plus two torches, centred exactly on
+the stick's press point. Two rounds were spent trying to filter it by screen
+rectangle and both were wrong -- the blit-level filter compared `GRPX_DrawPart`'s
+*arguments* against the control tree's rectangles, but `GRPX_DrawPart`'s mode
+1/2 shifts x by `w` or `w/2` before submitting, so the rectangle it saw and the
+vertices that reached GL were not the same. The fix is not a filter at all:
+`UIPlayPorting_Draw`'s virtual-key loop (`0x15bf98..0x15c410`) is the only code
+that paints the pad, the attack disc, the pressed highlight and the glow, so
+`nx_grpx_draw_part()` drops the five `GRPX_DrawPart` calls whose return address
+is inside that range (`cfg.no_pad_art`). The loop's other work -- `GetNext`,
+tutorial state -- still runs, and the controls still receive input; they are
+simply not drawn.
+
+**2. A and B had fixed jobs.** A was wired to the attack disc and B to "stop
+walking", so the `确认` in a message box was unreachable while the play HUD was
+up. `ab_layer()` now decides each frame: `AB_POPUP` (a `UIPopupMsg` base control
+exists) -> `ButtonOKExe` / `ButtonCancelExe`; `AB_SCENE` (`POPUPSTATE_Exist`) ->
+B taps the page's own button; `AB_MAP` -> the old disc and stop-walking;
+`AB_MENU` -> the old key path. Both new paths go through the engine's **public
+touch queue** (`input_tap_at`), never through engine internals. The button is
+found in the live control tree: a square in the top-left corner is the `×`, a
+wide bar in the top-right (id 381) is `skip`.
+
+**3. The stat arrows pointed the wrong way.** `GRPX_DrawPartFlip` takes **eight**
+arguments; the port's wrapper declared seven, so `w7` was garbage when it
+forwarded the call. Inside, `cmp w7,#0` selects the sign of the X *and* Y scale
+(`+100/-100`), i.e. both the left-right mirror and a vertical flip -- which is
+why the right-hand column showed a gold `<` instead of `>`, drifted off its row
+and ran out of its frame. The wrapper now forwards the argument verbatim.
+
+**4. `Lv. 4 <class>` on the equipment page.** It arrives as one string in a
+near-invisible dark brown (`0x684f30`), anchored on the plate's bottom edge. It
+is matched exactly (`Lv.` prefix, length > 8, y 470..560, x 200..450 -- the
+character page's separate `Lv. 4` / class labels at y 228/253 are excluded) and
+drawn in `#C6B992`, 5 px above the engine's anchor.
+
+**The rule:** hiding UI means suppressing its *draw call*, never filtering by
+screen rectangle. `hud_blit_hidden()` -- which dropped any blit landing inside
+the pad's rectangle -- is retired to a no-op. It was a crude mask over the
+bottom-left corner, and it ate the inventory grid's icons (the equipment slots
+sit at `id 22 (10,260 380x380)`, inside the pad zone) along with map art and page
+decorations. The GL-level `hide_pad_zone` interception that briefly replaced it
+is off as well: returning early from `nx_glDrawArrays` skips that function's
+`glColor4f` / `glVertexPointer` restore path and stalls the frame loop
+(`watchdog: no frame for 75 s`, `pc 0x4`).
+
+Also of note: calling `POPUPSTATE_Event()` / the scene key handler directly from
+port code terminated the process with SIGSEGV, and reading `UIPopupMsg`'s OK
+control (`0x2b8d98`) after a box closed hung the loop -- that global is not
+cleared when the box goes away, so the pointer is stale. Both attempts were
+removed; see the *things that broke* list in the 23:21 `VERSION.txt`.
+
+### 2026-11-08: A no longer calls the scene key handler (from the 10:04 baseline)
+
+The work tree was rolled back to `63266ba` (10:04, the 23:21 known good) and the
+A-key fix redone from there, so this build is 10:04 plus **one** change in
+`src/input.c`: no new config keys, no changes to `config.c/h` or to any ini.
+
+Pressing A on the character page stopped the frame loop (`游戏 0 FPS / 帧 nan ms`;
+`debug.log` stops with no `watchdog:` line). `ab_press()` ended with
+`menu_key_press(ok)`, which wrote the key code and padflags and then called
+`*(0x29eb90)` as a function. `handleCletEvent` at `0x169880` shows that global
+is a **slot**: `ldr x9,[0x29eb90]` (slot address), `ldr x8,[x9]` (function),
+`blr x8`. Calling the slot ran the engine's `.bss` as instructions. A second
+dereference plus an ELF `PT_LOAD|PF_X` check was tried in the 10:20 build: it
+resolves a real handler, but that handler is written for the Java key-event pump
+(the pump sets the flags, the handler consumes them, the pump clears them) and
+still hangs. That build also guarded only `layer == AB_SCENE`, while
+`POPUPSTATE_Exist()` is 0 on the character page, so `ab_layer()` called it
+`AB_MENU` and A fell through anyway.
+
+`menu_key_press()` is gone. `ab_press()` now has exactly three outcomes on a
+non-HUD page: a message box is answered by `popup_press()`, B taps the page's
+real ×/skip control through the public touch path (`corner_tap()`), and anything
+else -- including A on the character page -- is ignored and logged
+(`input: A on menu ignored (no safe engine key handler)`). `menu_has_handler()`
+stays for the focus-cursor touch fallback in `input_update()`. No page ever
+answered A through the removed path, so nothing that worked was lost; A does
+**not** add stat points or confirm on those pages yet (that needs a tap on a
+control from the live control tree, not an engine key call).
+
+### 2026-11-08, later: the six quick slots in a cross
+
+The six buttons along the bottom-right arc are HUD control ids 8..13 (each
+80x80, `UIPlay_SkillEventProc`). Before the change:
+
+| id | x,y | what |
+|---|---|---|
+| 8 | 672,553 | attack (red / white) |
+| 9 | 772,553 | skill (gold cross) |
+| 10 | 872,553 | quick slot |
+| 11 | 885,463 | quick slot |
+| 12 | 953,400 | quick slot |
+| 13 | 1047,397 | potion (7) |
+
+`ControlObject_GetRelativeRect` reads x,y at `obj+0x18` and w,h at `obj+0x28`;
+`ControlObject_SetRect` writes exactly those fields. `hud_scan_node()` now
+writes the object's relative rect for ids 8..13 once every 30 frames, so the
+icon AND the touch hit test move together -- both ask for that same rect. The
+absolute rect can carry a parent offset, so the write is
+`target - (p_abs_rect(c).x - rel_x)`, not a blind assignment.
+
+`quick_layout = 1` and `quick_pos = "<six x,y pairs, ids 8..13>"` in config.ini
+control it, with no rebuild needed to fine-tune. Default:
+`945,395; 865,475; 1025,475; 945,555; 20,530; 120,530` -- ids 8..11 form an
+**exact cross** on the right (centre 985,515, radius 80: up 8, left 9, right
+10, down 11), and ids 12/13 sit at the lower left (20,530 / 120,530).
+`quick_layout = 0` restores the original diagonal arc.
+
+The lower-left pair needs no new "do not answer the stick" work. `input.c`'s
+`hud_touch_blocked()` already swallows every real screen touch that lands in
+the four HUD control rects (d-pad and action disc included), while the stick
+and A are driven straight on their control objects by `pad_drive()` /
+`hud_action()`. An earlier attempt parked those controls' rects off-screen;
+it was removed on the user's instruction -- do not reintroduce it. The
+focus-cursor press (`input_update()`'s `want_down`) injects straight into the
+engine and is not subject to that rule.
+
+**Two sets of six, not one.** The "请选择要设置的快捷键" page builds its own six
+slot controls (proc `UIShortcutMenu_Shortcut_EventProc`, `engine+0x161178`) at
+the old arc positions 675/775/875/888/956/1050. Their control ids are
+**dynamic** -- 334..339 in one run, 231..236 in the next -- so matching a
+fixed id range (or an id 331 page container) misses them. `hud_scan_node()`
+now resolves that proc from the ELF export with `so_try_find_addr_rx()`,
+matches the second set by proc instead of id, numbers the six slots in tree
+order and caches the objects; `quick_layout_frame()` re-applies every frame so
+a page that resets its rects cannot undo it. The log reads
+`quick: assign page slot N ...` for the second set.
+
+**Keeping the blocked corners clickable.** `hud_touch_blocked()` in `input.c`
+swallows every real finger inside the four HUD control rects. The lower-left
+pair (20,530 / 120,530) sits in the d-pad rect and the right-hand cross
+overlaps the action disc, so those taps never reached the engine and a
+shortcut could not be assigned there. `quick_layout_parse()` now publishes the
+six button rects through `input_set_quick_rects()`; only those six small
+rectangles are exempt. `nx_ControlObject_EventProc()` then hands such a tap
+straight to the matching cached slot object instead of walking the tree, so
+the virtual stick and the action disc never see it. The stick and A are driven
+on their control objects by `pad_drive()` / `hud_action()` and are unaffected.
+Logs: `input: touch on quick slot passed` and `ui: quick slot N ...`.
+
+**Page swap = R, four slots only.** The circular-arrow button at 1059,313
+(75x75; the shortcut-assign page has its own copy at the same rect) used to
+call `PLAYER_ScrollShortcut`, which flips a global page byte `(p+6)%12` and
+changes all six buttons. Same pattern as the stick / A now: `nx_grpx_draw_part()`
+suppresses both copies' icon draw calls, `input_set_swap_rect()` makes that
+rect ignore real screen touches (checked before the `hud_active` test so the
+assign page is covered too), and `input_update()` calls `quick_swap_fire()` on
+`HidNpadButton_R`. R was removed from the menu focus-step list (Right / Up /
+StickR still cycle it). `quick_swap_fire()` exchanges shortcut slots 0..3 with
+6..9 in the array at `*(void**)(vb+0x29e7f8)` (12 x 16 bytes, from
+`PLAYER_MakeShortcut`), so only the four right-hand buttons change while slots
+4/5 -- the lower-left pair -- stay fixed. The exchange is its own inverse and
+loses no configuration. `quick_layout = 0` restores the icon, the touch and
+the original six-slot behaviour is never invoked by R.
+
+**Pad keys for the six slots (bound to positions, not data).** `input_update()`
+maps d-pad Left / Right to the two lower-left buttons (slots 4 / 5), and
+RT (NS `ZR`, Xbox RT) + X / Y / A / B to the right-hand cross (slots 0 / 1 /
+2 / 3 = up / left / right / down). Those are the letters printed on the Xbox
+pad: the NS bit order used in `input_update()` is X, Y, A, B (an earlier build
+tried to compensate for Eden's qt-config.ini A/B swap with X, Y, B, A; play
+testing showed that reversed the physical A/B, so it was changed back). Every
+press/release goes through
+`input_fire_control()` straight onto the cached HUD control object -- the same
+`SetSelectedControl` / `SetReleaseEvent` path as the stick and A, with no
+touch injection, so the HUD touch block cannot eat it. `ZR` is no longer an
+alias of A, and while RT is held A / B do not attack or stop walking. R (the
+shoulder, not the trigger) still swaps the four right-hand slots; since the
+keys fire control objects at fixed positions, a swap never changes which
+button a key fires. No icons were hidden for this change.
+
+### 2026-11-08, later: A confirms the "路障" box
+
+The 路障 / NPC-dialogue info boxes are `UI_PopupProcess`, not `UIPopupMsg`:
+`UI_SetPopupProcessInfo(1,c)` builds them and they have no `0x2b8d78` base
+control. So `popup_on()` is false, `ab_layer()` reports `AB_SCENE` ("popup
+page"), and A used to be dropped with `input: A on popup page ignored`. B
+already worked because `corner_tap()` finds the top-left × button. In the live
+tree (snapshot 42) the page container holds that × and a dialog body whose
+children are the body text (`ControlScroll_EventProc`) and 确认
+(`ControlButton_EventProc`, 473,519 190x48).
+
+`ui_confirm_button()` in main.c finds the body by **control type + tree
+shape** -- a text scroll child plus a button child, under a full-screen parent,
+the button below the text and wider than tall -- rather than by measured
+pixels or control id (ids change on every run). `confirm_tap()` in input.c then
+taps its centre through the engine's public touch path, exactly like B on the
+× button: the engine closes the box, runs its action and pops the popup state.
+A is only routed there on `AB_SCENE`, so the character page (which
+`POPUPSTATE_Exist()` reports as `AB_MENU`) still ignores A, the play HUD keeps
+A as the attack key, and `UIPopupMsg` boxes still use
+`UIPopupMsg_ButtonOKExe`. No engine internal or scene key handler is called.
+Logs: `ui: confirm button centre (...)` and `input: confirm tap engine (...)`;
+`ui: no confirm button in the live tree` means the shape did not match.
+
+### 2026-11-08, later: the NPC dialogue option list
+
+The "那么。。你想知道些什么呢？" screen with four arrow rows is `UIChoice`,
+a different system again. `UIChoice_CreateControl` (0x145384) keeps its
+controls in globals: `+0x2b49e0` is a heap block of one 0x7f8-byte record per
+option, freed and NULLed by `UIChoice_Exit` (that non-NULL value is the
+engine's own "page is open" flag -- the control pointers themselves are NOT
+cleared and go stale); `+0x2b49e8` is the 462x423 frame, `+0x2b49f0` the
+scroll, `+0x2b4a00` the list's content control, and `+0x2b4a08[]` one
+`ControlButton` per row. `UIChoice_ButtonListExe` (0x1456d4) reads
+`+0x2b4a00` to turn the selected row into the answer. Those rows never
+answered a tap in this port.
+
+`ui_choice_button()` in main.c checks the open flag and the frame's own
+rect, then hands the event straight to the row control whose own rect
+contains the tap -- the same direct dispatch the six quick slots use, so the
+control-tree order and any stale popup layer cannot swallow it. If no row
+rect matches (the rows may carry their parent's local origin) it hands the
+event to the content control and lets the engine walk its own children; no
+pixel offset is guessed. Logs: `ui: choice row N ... -> ... rc 1`, or
+`no row rect matched, using content ...`. The diagnostic log caps were
+raised (`input: touch` 40 -> 120, `TouchHandle_Event` 200 -> 400) so a
+fresh session can show whether a tap reaches the engine at all.
+
+### 2026-11-08, later: hide the two pad-bound menu buttons
+
+The left column's first button (download arrow, control id 1) and the gear
+(id 3) were already bound to pad keys and already blocked from real screen
+touches (`HUD_BTN_PLUS` / `HUD_BTN_MINUS` in `input.c`'s `hud_r[]`), but their
+icons were still painted. `UIPlayPorting_Draw` SHARES its `GRPX_DrawPart` call
+sites with every other HUD button, so the pure return-address range that
+hides the wheel cannot single these two out. `hud_scan_node()` now publishes
+their own absolute rects (read from the engine's control tree) and
+`nx_grpx_draw_part()` cuts exactly those two calls, confined to
+`UIPlayPorting_Draw`'s ra range. Same call-site cut as `no_pad_art` / the
+page-swap icon; `hud_blit_hidden()` stays a no-op, no global rectangle mask.
+Log: `pad: bound menu button N draw suppressed`. `no_pad_art = 0` brings the
+icons back. No input change -- those keys and the touch block are untouched.
+
+### 2026-11-08, later: the engine's own `$X` colour table
+
+`X_TEXTCTRL_GetColorFromCode` (0x144f3c) reads a 25-entry table at
+module-relative `+0xbb9c8`, indexed by `code - 'A'`; each entry is
+`(a<<24)|(b<<16)|(g<<8)|r`. Cross-checks: `$R` = 0xFF0000FF red, `$W` =
+0xFFFFFFFF white, `$B` = 0xFF000000 black, `$S` = 0xFFFFB400 sky blue,
+`$T` = 0xFFFF7878. `text.c` used to carry a hand-written 10-letter subset,
+so codes the game does use but that list omitted (`$T`, `$Q`, `$L`, `$O`,
+`$P`, `$V` ...) fell through to the base pen and read as white -- the
+"emphasis colour disappeared" symptom. `text_set_engine_base()` is called
+once after `so_finalize()`; `colour_for_code()` now converts the engine's own
+entry to `0xRRGGBBAA`. `$B` stays the closing code that returns to the
+caller's pen, and only `$B` does (`$W` is genuinely white now). The legacy
+subset remains as a fallback before the module is mapped. A new `subraw:`
+log (independent of `dlg_probe`'s 16-row table, which the character page
+fills first) shows whether the story body's raw string still carries its
+codes, and `rich: colour run col %08x` prints each non-base run.
+
+### 2026-11-08, later: story-text emphasis colour
+
+Hint / quest / skill text keeps its `$X` codes (the `X_TEXTCTRL` path), but the
+story and class-description body goes through **`TEXTCTRL2`**.
+`TEXTCTRL2_LineProcess` (0x1da778) consumes each code into a 32-byte display
+unit's colour field; `TEXTCTRL2_Draw` (0x1db03c) then does, for EVERY span:
+
+```
+ldr w0,[unit,#8]; GRPX_GetColorFromGRP; GRPX_SetFontColor;
+GRPX_DrawSubStringWithFont2(original + unit.offset, unit.len, ...)
+```
+
+So the string our `nx_sub_string` hook receives is a **code-free view of one
+span** -- `subraw: ... codes 0` in the log, and `text_draw_rich_line` can never
+colour it. The emphasis colour survives only in `GRPX_SetFontColor`'s
+`0xAABBGGRR` argument, while the port was reading `GL_CURRENT_COLOR`, which is
+always white here. No `$` code was ever lost by a recent build.
+
+`nx_grpx_set_font_color()` hooks `GRPX_SetFontColor`, records the value only
+for callers inside `TEXTCTRL2_Draw` / `DrawAsStep` (0x1daf98..0x1db288), and
+forwards every caller to the real function. `nx_sub_string()` uses
+`__builtin_bswap32()` of that value as its pen -- the same conversion
+`tctrl_colour()` uses -- falling back to `GL_CURRENT_COLOR` when no span
+colour was set this frame. `text_colour()` still lifts the opaque-black base
+`$B` to white, so ordinary lines stay white and only emphasised spans turn
+coloured. One hook callback per span means a line with several colours becomes
+several runs, exactly like the original. Logs: `story: font colour %08x`,
+`story: span pen %08x -> %08x`.
+
+### 2026-11-13/14: the settings pages, second design -- one focus, nothing else
+
+The three-state TOP/BODY/STAT machine described under *2026-11-09: attack key Y,
+and pad navigation for the settings pages* is **gone**. The user asked for it to
+be scrapped ("角色加点 / 技能加点 / 背包选取 ... 全部废除, 你去网上找找其他游戏
+怎么用手柄实现这些交互") and for a design based on how other games do it.
+BOTW (left stick picks a cell, right stick scrolls, A confirms, B backs out,
+L/R change category), Genshin (d-pad for item selection, LB/RB for modules) and
+the Xbox Accessibility Guideline 112 (2D spatial movement, a return path on
+every screen, focus trap, restore focus to the control that opened a panel)
+were the references. One rule set, no per-page special case:
+
+* **The focus set** is every clickable control of the topmost visible panel --
+  occlusion filtering in `nav_gather_boxes()` plus the `ControlObject_EventProc`
+  whitelist, unchanged.
+* **d-pad / left stick** move to the nearest control by centre distance,
+  off-axis distance weighted x3; holding repeats after 18 frames, then every 6.
+  At the grid edge the focus **wraps to the other end of the row/column**
+  (XAG says "stop", but stopping read as "stuck" to the user).
+* **A** is only ever a tap on the focus. **B** backs out one layer: the top
+  panel's own `×` first (`ui_panel_close_button()`), then the page. The focus
+  returns to the control that opened the panel.
+* **L / R** (and a right-stick left/right flick) tap the target tab directly.
+* **X / Y** are unused inside menus; they belong to the field.
+* The gold shape-following cursor is retired. `nav_focus_marker()` paints a
+  17x18 solid `>` arrow 16 px outside the left edge of the focus control --
+  not a frame, not gold, never over the icon.
+
+Four engine facts make the rest work, and each of them cost a debugging round:
+
+1. **The skill icons are not in the root control tree.** `UISkill_SkillScrollDraw`
+   (`0x162614`) does `ldr x0,[x22,#0x8a0]` with `x22 = adrp 0x2b9000`, i.e. the
+   icon group hangs off `vb+0x2b98a0`, and the engine walks it by hand
+   (`ControlObject_GetChild` -> `ControlSkill_Draw`, GOT `0x2a1960` / `0x2a2260`).
+   `nav_collect_skill_icons()` reads that group through the real engine objects,
+   but only after `nav_count_side_tabs() >= 2` proves the page really is the
+   skill page -- other tabs leave a stale pointer there and would inject ghost
+   icons. Icons go to the **front** of the control list, so `nav_idx` still
+   means the same skill after a scroll rebuilds the tree.
+2. **A scroll is a multi-frame drag.** The engine samples the pointer once per
+   frame, so a down/up in one frame is invisible. `nav_scroll_request()` /
+   `nav_scroll_pump()` emit a real 4-frame drag (60 px per frame, 120 px total
+   so it reads as a drag, not a tap). Right stick up/down scrolls, and the focus
+   auto-scrolls back into view when it leaves the viewport band.
+3. **A leftover panel can eat a tab press.** On the bag page, container `id 283`
+   (`88,0 1137x640`) holds child `id 297` = `88,0 409x431 UIGameMenu_SubEvent`.
+   That rect covers tab1 (206..304) and tab2 (343..441) but not tab3 (480..578)
+   -- which is exactly why only 2/6 -> 1/6 failed while every rightward move and
+   every arrival at tab1 from another page worked. `nav_tab_objs[]` +
+   `ui_tab_control_at()` plus a branch at the **top** of
+   `nx_ControlObject_EventProc` (depth 1, code `0x17/0x18/0x19`, point inside a
+   tab rect -> `colevent_real(tab_obj, ...)` and return) deliver the press
+   straight to the tab button. Page-id and content-fingerprint confirmation with
+   one retry stays as the fallback.
+4. **Settings pages do raise `UIPopupMsg` boxes.** The A/B shortcut for the
+   "保存成功 / 确认" and "是 / 否" boxes had been gated on "not a settings page";
+   it is now the first thing `nav_update()` does on every page, keyed on
+   `popup_on()` (the engine's own `POPUP_BASE`, `vb+0x2b8d78`, cleared by the
+   engine when the box closes). A confirms, B cancels, and every other key is
+   frozen while the box is up. `ui_confirm_button()` (the `UI_PopupProcess`
+   variant) stays limited to the front-end pages: a settings page's own
+   `UIGameMenu_SubEvent` panel has the same ControlScroll + ControlButton shape
+   and would be misread as a modal.
+
+### 2026-11-10: the title cursor hugs the oval art
+
+The title page highlight used to be drawn on the button's **hit box**
+(`384,492 369x124` for 开始游戏, `111,470 300x92` / `726,470 300x92` for the
+two side buttons). Those rects are much taller than the visible ovals, so a
+`NAV_SHAPE_PILL` band plus its halo produced a tall dotted capsule around the
+button. Two read-only probes established the real art geometry:
+
+* a temporary `glDrawArrays` quad diagnostic (removed again) showed the engine
+  submits the title buttons at exactly those rects -- the padding lives in the
+  texture, not in a separate quad;
+* the atlas `UI_TITLEMAIN_BUT_cn_s_001.png` has alpha bounds `357x77`,
+  `292x63`, `292x63` for the three ovals -- **all 4.63:1**, against the hit
+  boxes' 2.98 / 3.26:1.
+
+`nav_title_art()` now shrinks a title item's highlight rect to 92% of the hit
+width with that measured aspect and centres it, while leaving `tx/ty` at the
+original control centre so a smaller cursor never moves the tap.
+`NAV_SHAPE_ELLIPSE` samples 220 points (72 on a flat ellipse reads as a dotted
+arc) and uses a tighter 2/1/0 px halo. Settings, save-list, class and every
+other shape are untouched. Verified from a screenshot of the running emulator:
+a continuous gold line on the button's own outline.
+
+### 2026-11-09, later: gold pad cursor on the title / save / class screens
+
+The shape-following gold highlight and the pad navigator are no longer limited
+to the six-tab settings menu. Three front-end pages now use the SAME gold
+cursor, driven entirely by the engine's own control tree (no screenshot
+coordinates, no dynamic ids -- those change every launch):
+
+| page | recognisable control structure | cursor items |
+|---|---|---|
+| title | `369x124` 开始游戏 + two `300x92` side buttons | 3 pill buttons, cursor starts on 开始游戏 |
+| save list | three `634x150` rows + `100x100` back arrow | 3 rounded rows; delete bins stay out of the list so a stray A cannot delete a save |
+| class select | six `116x114` badges + its own `292x64` 开始游戏 | 6 rounded badges + 1 pill start button |
+| settings | `784x98` tab bar with six `98x98` tabs | unchanged: L/R + TOP/BODY/STAT |
+
+`nav_find_pages()` collects every full-screen `1137x640` layer under the root
+and `nav_page_kind_of()` classifies it by the *shapes of its children*; the
+LAST recognisable layer is the one on top. That matters because the class
+screen is pushed on top of the save list, which is pushed on top of the title
+-- all three containers are alive at once. The in-field HUD tree has no such
+layer, so the navigator stays off during play (verified against a real
+`tree:` snapshot).
+
+All three front-end pages are **d-pad only**: left/right/up/down pick the
+geometrically nearest control, A activates it, B taps that page's own return
+arrow. L/R are deliberately inert there (they still switch settings tabs, and
+R still swaps quick-slot pages in the field). A modal confirm box
+(`UIPopupMsg` or `UI_PopupProcess`, e.g. deleting a save) takes A/B back from
+the navigator so the previously fixed 确认 behaviour is preserved.
+
+The class screen is **two-step**, as requested: A on a badge picks that class
+*and* parks the cursor on this page's own 开始游戏 button; the next A starts
+the game. `nav_class_pick` survives the 4-frame rescan. Its lower two badges
+overlap the stale save rows underneath, and `nx_TouchHandle_Event` drops any
+tap landing on one of those rows. `nav_safe_point()` therefore scans the
+badge's own vertical band for a y that is still inside the badge but clear of
+every row/bin, and stores that as the item's preferred tap point (`tx/ty`).
+Geometry comes from the control tree, not from the screenshot.
+
+`NavItem` now carries an explicit `shape` (round rectangle / circle / pill) and
+`input_nav_highlight()` passes it straight to `nav_gold_cursor()`, so the same
+three-band amber/orange-gold/bright-gold glow follows the real widget outline.
+
+No new config key, no change to `save/`, no change to any `config.ini`.
+Runtime log: `nav: page up kind 2/3/4 (0 tabs, N controls, ...)`.
+
+### 2026-11-09, later: save slots reading `ERROR(00)` (bionic O_TRUNC)
+
+A save slot that used to load started rendering the text `ERROR(00)` in the
+slot list. It is not a key mismatch and not a corrupt save: the pinned key
+`inotia4-switch-save-v1` decrypts `thpcheckslot1.dat` to
+`2|011110|99|99|99|99|99|END|` with both trailer checksums passing.
+
+**Root cause.** `libgame.so` is an Android/bionic binary. `SAVE_SaveDataAsNameAndKey`
+opens slots through `CS_fsOpen(mode 4)`, which emits `open(path, 0x241, 0x180)` --
+bionic `O_WRONLY|O_CREAT|O_TRUNC` (`O_TRUNC == 0x200`). The port forwarded those
+bits unchanged to newlib's `open()`, where `0x200` means `O_CREAT` and `O_TRUNC`
+is `0x400`. Writes therefore created/overwrote the file but never truncated it.
+When a new save was shorter than the previous one, the old tail survived.
+`SAVE_LoadDataAsNameAndKey` derives the cipher length from `filesize - 3`, so both
+trailer checksums missed and the slot drew `ERROR(00)` (followed by an offline
+Hub "connection error" popup, which made it look like a network fault).
+
+Concretely, `save0.dat` was 3426 bytes while its valid record was only 3361+3;
+62 stale bytes at the end were enough to make the whole slot unreadable. The
+historical `save*.dat.bad` files are the same bug, and the boot quarantine used
+to rename those still-readable slots away.
+
+**Fix, three layers:**
+* `libc_shim.c:bionic_flags_to_newlib()` translates the bionic bit layout to
+  newlib's whenever the engine opens a file, so writes truncate again. This is
+  the root fix; `shim_open` is only reachable through the engine's import table,
+  so the port's own `open()` calls are unaffected.
+* `main.c:nx_save_nk()` rewrites the exact `len+3` bytes with `"wb"` when the
+  file came out longer, so a save is always exact-length even if another writer
+  bypasses the flag fix. Normally a no-op.
+* `main.c:nx_load_nk()` and `save_file_decrypts()` use
+  `save_scan_valid_len()`, which scans for the longest record whose two trailer
+  checksums the engine's OWN `ENCRYPT_Process2` accepts. On a failed read the
+  stale tail is trimmed and the read retried once, repairing existing slots
+  in place without guessing a key or touching any record byte. The boot
+  quarantine no longer renames such a file to `.bad`.
+
+Verified offline by reimplementing `ENCRYPT_Process2` in Python against the
+real files: scan finds `L=3361` of 3426, trimming to 3364 makes the engine's
+`len = size-3` decrypt pass. No existing save file was modified by the port.
+
+### 2026-11-09: attack key Y, and pad navigation for the settings pages
+
+> The TOP/BODY/STAT navigation described below was **replaced on 2026-11-13** by
+> the single-focus model in *2026-11-13/14: the settings pages, second design*.
+> The attack-key change is still current.
+
+**Attack moved from A to Y.** `hud_update()` now tracks two independent edges:
+`confirm_now` (A) for menus / dialogs and `attack_now` (Y) for the field HUD's
+attack disc. A is still the activate / confirm key everywhere else. RT stays a
+modifier, so RT+Y still fires quick slot 1 and holding RT attacks nothing.
+
+**Settings-page navigation.** A settings page is one full-screen control with a
+`784x98` tab bar holding six `98x98` tabs. `nav_scan()` in main.c walks the
+engine's own control tree (via `ControlObject_GetAbsoluteRect`, no screenshot
+measuring), publishes the tabs and every tappable control below `y=110`, and
+`input_set_nav()` turns that into a three-state machine:
+
+* **TOP** — L/R (or d-pad left/right) switch page immediately by tapping the
+  tab control; a gold outline follows the selected tab. A enters the content.
+* **BODY** — d-pad moves to the geometrically nearest control; A taps its
+  centre through the public one-shot touch path (`input_tap_at`), B goes back to
+  TOP (and B on TOP closes the page via the engine's `×`). After an activation
+  the tree is re-scanned, so a newly opened item-detail action group
+  (`使用` / `登录快捷键` / `粉碎`) receives the cursor.
+* **STAT** — on the character page, five rows of two `51x58` controls are
+  detected by size/relative position. Entering from the `+` next to `能力点`
+  gives up/down row selection and **left/right directly subtract/add a point**
+  without another A. B returns to BODY.
+
+All classification uses control sizes and relative positions, never hard-coded
+screen coordinates, so the other four tabs get the automatic geometric cursor
+for free. The navigator is active only while a settings page container exists --
+the title, save and dialogue screens keep their previous behaviour. No new
+config key: the feature is compiled in and the three `config.ini` files are
+untouched.
+
+**The first build did not respond to any key, and its highlight was wrong.**
+Both were fixed in the 19:40 build:
+
+* `nav_update()` had been nested inside `if (!hud_mode)`. Opening a settings
+  page does **not** remove the in-field HUD controls from the control tree
+  (`id 20` action disc and `id 21` d-pad are still there in the `tree:` dump),
+  so `hud_active` stays 1, `!hud_mode` is false and the navigator never ran a
+  single frame. `input_update()` now checks `input_nav_active()` **before** the
+  `hud_mode` branch. The quick-slot face-button block also excludes navigation
+  mode, otherwise X/Y/A/B and d-pad L/R fire quick slots while the same keys
+  are meant to drive the cursor. `hud_touch_blocked()` now has a narrow
+  whitelist (`hud_nav_hit`): only real touches that land on a rect published
+  by `nav_scan()` bypass the HUD veto. Every other HUD area stays blocked, so
+  the d-pad and attack disc still never answer a finger. Synthetic taps from
+  `nav_tap()` go through `emit()` and were never subject to that veto.
+* The square yellow `glScissor` frame is gone. `nav_gold_cursor()` now draws
+  the original game's warm-gold glow that **follows the widget's own shape**:
+  an ellipse ring for the six round tab medallions and `能力点 +`, a rounded
+  rectangle for item cells, and a pill for `使用` / `登录快捷键` / `粉碎` and
+  the whole 力量..精力 stat row. `input_nav_highlight()` publishes a
+  `NAV_SHAPE_*` value derived from the control's kind and aspect ratio. Three
+  scissored bands (outer amber halo -> orange gold -> bright inner line) are
+  painted outside the control's rect; still no textures, no vertex arrays and
+  no engine GL state beyond the clear colour.
+
 ### 2026-11-05: the quest popup
 
 The accept popup ("<刺杀格里普顿伯爵> 获得") drew its body as one long line that ran
@@ -975,7 +1505,14 @@ and one zip with the sources that produced it. Restoring a known state is
 
 | Snapshot | Build | NRO md5 | Verified for |
 |---|---|---|---|
-| `snapshots/known-good-20261106-1945/` + `save-slot-20261106-1945.zip` | 2026-11-06 20:25:51 | `f7e34f21c71b9292f19f3eca93a04390` | **current default**: everything below, plus black (not red) ink on the battle shouts, the plain tips' 60% black plate grown to 34 px (just `bar_expand`'s width cap 1080 -> 1280), and the quest page's title back in its MAIN bar (`wrap_extra` cleared per control). The rectangle-level override that broke the quest page was removed -- see *2026-11-06: balloon ink, the hint plate, and the quest row* |
+| `snapshots/known-good-20261114-1340/` + `save-slot-20261114-1340.zip` | 2026-11-14 13:22:43 | `b838dbc32566042fa995586ef9939b52` | **current default**: everything in the 12:45 row, plus the settings pages rebuilt on a single focus model (nearest-neighbour d-pad move with edge wrap, A = tap, B = back one layer, L/R + right-stick flick = tab), the gold frame replaced by a small `>` marker, the skill-page icons read out of the engine's private group at `vb+0x2b98a0`, right-stick scrolling as a real multi-frame drag, tab presses delivered straight to the tab control so the bag page's leftover `UIGameMenu_SubEvent` panel can no longer swallow them, and A/B answering the settings-page `UIPopupMsg` boxes directly -- see *2026-11-13/14: the settings pages, second design*. All but the popup A/B fix hand-tested by the user |
+| `snapshots/known-good-20261110-1245/` + `save-slot-20261110-1245.zip` | 2026-11-10 12:41:20 | `051ab32ced3f5e3171ea526be60210b3` | all of the 21:46 row plus the bionic `O_TRUNC` save-root fix, attack key A → Y, RT+X/Y/A/B and d-pad left/right for the six quick slots, the first settings-page pad navigation (TOP/BODY/STAT -- superseded on 11-13), and the same gold shape-following cursor on the title / save / class pages (d-pad only, two-step class confirm) -- all play-tested by the user. This build tightens the title page's cursor onto the flat oval button: `nav_title_art()` shrinks the padded `369x124` / `300x92` hit boxes to the atlas-measured 4.63:1 art aspect and `NAV_SHAPE_ELLIPSE` draws a 220-point continuous gold outline with a 2/1/0 px halo. Verified with a tool screenshot of the running emulator |
+| `snapshots/known-good-20261108-2146/` + `save-slot-20261108-2146.zip` | 2026-11-08 21:46:41 | `21f3215490015b78d560d49e5d925725` | everything in the 19:41 row, plus story / class-description emphasis colour restored by hooking `GRPX_SetFontColor` and using the engine's own `TEXTCTRL2` span colour as the pen -- see *2026-11-08, later: story-text emphasis colour*. Frozen before play testing this fix |
+| `snapshots/known-good-20261108-1941/` + `save-slot-20261108-1941.zip` | 2026-11-08 19:41:05 | `1b960f7417b50d9a34b598f3dcbf6ff2` | everything in the 18:00 row, plus A confirming the 路障 / UI_PopupProcess box, taps working on the NPC dialogue option list (UIChoice), RT+X/Y/A/B in the tested X/Y/A/B order, the two pad-bound left-column buttons no longer drawn, and the engine's own `+0xbb9c8` `$X` colour table restoring every emphasis colour -- see *2026-11-08, later: hide the two pad-bound menu buttons* and *2026-11-08, later: the engine's own `$X` colour table*. Frozen before play testing these last changes |
+| `snapshots/known-good-20261108-1800/` + `save-slot-20261108-1800.zip` | 2026-11-08 14:23:36 | `9a333a721b1c33fe0138ff5ae2208205` | everything in the 13:50 row, plus gamepad keys firing the six quick slots (Xbox RT+X/Y/A/B on the right-hand cross, d-pad left/right on the lower-left pair), pressed straight on the control objects so R's page swap never changes which key hits which button -- see *2026-11-08, later: pad keys for the six slots*. The "路障" message box's 确认 button still does not answer A in this build |
+| `snapshots/known-good-20261108-1350/` + `save-slot-20261108-1350.zip` | 2026-11-08 13:40:41 | `b64c3cceb837d94836adea9b21376fcf` | everything below, plus A no longer calling the engine's scene key handler (character page no longer freezes), the six quick-slot buttons in an exact cross (right-hand four + lower-left two) with the same layout on the shortcut-assign page, a touch-block exemption for those six rects, and R shoulder swapping only the four right-hand slots while the lower-left two stay fixed -- see *2026-11-08: A no longer calls the scene key handler* and *2026-11-08, later: the six quick slots in a cross* |
+| `snapshots/known-good-20261107-2321/` + `save-slot-20261107-2321.zip` | 2026-11-07 23:18:45 | `db5bd6b3982616b1b971412da2a723ad` | everything below, plus the play HUD driven from the engine's own control tree (stick / attack disc / `+` / `-`), the direction wheel and its touch feedback no longer drawn at the source, A/B routed by layer (message box / UI page / map / menu) so B closes the `×`, answers `否` and skips cutscenes, `GRPX_DrawPartFlip`'s missing 8th argument restored (the stat arrows mirror correctly), the equipment page's `Lv. 4 <class>` line in gold `#C6B992` 5 px higher, and every rectangle-level blit filter retired -- see *2026-11-07: the wheel, A/B, and the mirror* |
+| `snapshots/known-good-20261106-1945/` + `save-slot-20261106-1945.zip` | 2026-11-06 20:25:51 | `f7e34f21c71b9292f19f3eca93a04390` | everything below, plus black (not red) ink on the battle shouts, the plain tips' 60% black plate grown to 34 px (just `bar_expand`'s width cap 1080 -> 1280), and the quest page's title back in its MAIN bar (`wrap_extra` cleared per control). The rectangle-level override that broke the quest page was removed -- see *2026-11-06: balloon ink, the hint plate, and the quest row* |
 | `snapshots/known-good-20261106-1905/` + `save-slot-20261106-1905.zip` | 2026-11-06 19:02:50 | `683ed6302f8af0c1a8267f02e616e695` | everything below, plus the dialogue's speaker name in gold in *every* layout, inner thoughts in grey, and the save slots' map name in the character page's gold (#C6B992) -- see *2026-11-06: names, thoughts and the save rows* |
 | `snapshots/known-good-20261106-1240/` + `save-slot-20261106-1240.zip` | 2026-11-06 12:37:57 | `294defaf72ff3b8b4e3dfa3c699eaead` | everything below, plus the skill page's numbers and buttons: the value after `技能点:` is white again, and `学习` / `取消快捷键` (and the item page's description buttons) take the touch -- see *2026-11-06: the description panel's buttons* |
 | `snapshots/known-good-20261106-1213/` + `save-slot-20261106-1213.zip` | 2026-11-06 12:13:26 | `b6827148678568ff8967a4c4399dad4b` | the skill description page: it scrolls again (the finger travel drives the page's own scroll control), it is laid out as one text flow so the next-level block and the value comparison no longer overlap, and text controls longer than 256 bytes are no longer truncated (the blue `5秒` at the end of the first block) -- see *2026-11-06: the skill description page* |

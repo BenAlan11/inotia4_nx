@@ -1,0 +1,144 @@
+Inotia 4 for Nintendo Switch -- known good snapshot
+
+build stamp : 2026-11-08 13:40:41
+nro md5     : b64c3cceb837d94836adea9b21376fcf
+nro size    : 9179255 bytes
+config      : config.ini in this folder (bar_h = 34, log_level = 1,
+              string_draw = 1, no_pad_art = 1, tap_buttons = 1,
+              flip_arg = 1, hide_pad_zone = 0, pad_probe = 0,
+              quick_layout = 1,
+              quick_pos = "945,395; 865,475; 1025,475; 945,555; 20,530; 120,530")
+verified    : 2026-11-08. Confirmed by the user in play testing:
+              * the six quick-slot buttons render in the exact cross layout
+                (right-hand four, lower-left two) -- "布局已改" at 13:13
+              * the same six-slot layout also renders on the shortcut-assign
+                page ("请选择要设置的快捷键")
+              * the character page no longer freezes when A is pressed
+                (not reported again after the 11:11 rebuild)
+              Implemented in this build, NOT yet separately confirmed:
+              * the six quick-slot rects are exempt from the HUD touch block,
+                so shortcuts can be assigned in both blocked corners
+              * R shoulder swaps only the four right-hand slots; the
+                lower-left two stay fixed
+              * the page-swap icon is not drawn and does not answer touches,
+                in the field and on the assign page
+              Re-check those three before trusting them.
+
+HOW TO RESTORE
+  Fastest (binary only):
+    copy this folder's inotia4_nx.nro over
+      %APPDATA%\eden\sdmc\switch\inotia4\inotia4_nx.nro   (Eden)
+      dist/switch/inotia4/inotia4_nx.nro                  (SD-card tree)
+    copy this folder's config.ini next to it, then start Eden.
+    Verify with: md5sum inotia4_nx.nro -> b64c3cceb837d94836adea9b21376fcf
+    NOTE: config.ini here is the PRODUCTION config. The running Eden install
+    also has the user's log_level = 3 and tap_script = "960,919@600"; keep
+    that file if you want those debug settings, just make sure every key
+    listed in "FOOTGUN -- KEEP THE CONFIG" below is present and correct.
+  From source:
+    the zip carries src/, build.py, config.prod.ini, README.md, tools/win_*.py,
+    this VERSION.txt + config.ini + NRO, and font.ttf. It does NOT carry the
+    compiler toolchain or the game's own assets. Unpack it over a copy of this
+    repository (which supplies tools/dkp_rootfs, data/libgame.so and
+    dist/switch/inotia4/font.ttf), then `python build.py --clean`. The NRO it
+    produces must be 9179255 bytes; the md5 differs only in the build stamp.
+    ALWAYS use --clean: config.h changed today, and stale .o files compiled
+    against the old PortConfig layout silently misread every setting.
+
+CHANGES SINCE 20261107-2321
+  All of 2026-11-08. See .workbuddy/memory/2026-11-08.md for the full log.
+
+  1. A no longer freezes UI pages. The 10:04 baseline's menu_key_press()
+     called *(0x29eb90) as a function, but handleCletEvent (0x169880) shows
+     that global is a SLOT (ldr x9,[slot]; ldr x8,[x9]; blr x8). The 10:20
+     attempt (double dereference + PT_LOAD|PF_X validation) and the 10:51
+     attempt (ignore A only on AB_SCENE) both failed: the real handler needs
+     the Java key-event pump, and POPUPSTATE_Exist() is 0 on the character
+     page so ab_layer() reports AB_MENU. The user asked to roll back to
+     63266ba (10:04) and redo it. Final fix: menu_key_press() is DELETED;
+     ab_press() has only popup_press() (message boxes) and corner_tap()
+     (B on x / skip). A on UI pages is ignored and logged. No new config key.
+
+  2. Six quick-slot buttons moved to an exact cross. They are HUD control
+     ids 8..13 (80x80). ControlObject_GetRelativeRect reads x,y at obj+0x18;
+     writing that moves both the icon and the hit test. quick_layout = 1 and
+     quick_pos = six "x,y" pairs in ids 8..13 order:
+       ids 8..11 = right-hand cross, centre (985,515), radius 80
+       8 up 945,395 / 9 left 865,475 / 10 right 1025,475 / 11 down 945,555
+       ids 12/13 = lower left 20,530 / 120,530
+     quick_layout = 0 restores the original diagonal arc.
+
+  3. The shortcut-assign page has its OWN six slots (proc
+     UIShortcutMenu_Shortcut_EventProc, engine+0x161178). Their control ids
+     are DYNAMIC (334..339 in one session, 231..236 in another), so they are
+     matched by proc, numbered in tree order and cached. The page resets its
+     rects every frame, so quick_layout_frame() re-applies every frame.
+
+  4. Touch exemption. hud_touch_blocked() used to swallow every real finger
+     inside the four HUD rects; the lower-left pair sits in the d-pad rect and
+     the right-hand cross overlaps the action disc. input_set_quick_rects()
+     publishes the six rects; only those are exempt. nx_ControlObject_EventProc
+     then hands such a tap straight to the cached slot object, skipping the
+     tree walk so the virtual stick / action disc never see it.
+
+  5. Page swap = R. The circular-arrow button (1059,313 75x75, same rect on
+     the assign page) is hidden at its draw call sites, blocked from real
+     touches (checked BEFORE the hud_active test), and replaced by
+     HidNpadButton_R in input_update(). R was removed from the menu focus
+     step. quick_swap_fire() does NOT call PLAYER_ScrollShortcut (which flips
+     (p+6)%12 and changes all six); it exchanges shortcut slots 0..3 with
+     6..9 in the array at *(void**)(vb+0x29e7f8), 12 x 16 bytes. Slots 4/5
+     (the lower-left pair) never move. The exchange is its own inverse.
+
+THINGS THAT BROKE AND MUST NOT BE REPEATED
+  * Calling the engine's per-scene key handler from port code -- directly,
+    through the slot, or after PT_LOAD|PF_X validation -- stalls the frame
+    loop (0 FPS / nan ms, debug.log stops with no watchdog line). Delete the
+    call path; do not guard it by layer.
+  * POPUPSTATE_Exist() returns 0 on the character page. Any "is this a popup
+    page" test based on it will misclassify that page as AB_MENU.
+  * Matching the shortcut-assign page's slots by control id. Their ids change
+    between sessions. Match the event proc instead.
+  * Assuming a one-shot rect write sticks: that page resets its rects every
+    frame. Re-apply every frame from cached objects, with probe_mem_ok.
+  * Incremental builds after changing config.h. Stale .o files keep the old
+    PortConfig layout. Use `python build.py --clean`.
+  * so_try_find_addr_rx() returns uintptr_t; assigning it to void* without a
+    cast is a hard clang error (-Wint-conversion).
+  * Parking the d-pad / action-disc control rects off-screen to "stop them
+    answering touches". The user explicitly rejected this: that rule already
+    exists in hud_touch_blocked(), and input.c drives those objects directly.
+    Do not duplicate it, do not move their rects. Only the six quick-slot
+    rects are exempt from the block.
+  * Filtering quads by screen rectangle to hide UI. Suppress the draw call
+    site (as no_pad_art does), never mask an area.
+
+FOOTGUN -- KEEP THE CONFIG
+  * cfg.hide_pad_zone still COMPILES to 1. A config.ini without the key turns
+    the GL interception on and stalls the game ("0 FPS / nan ms"). Always
+    ship hide_pad_zone = 0. config.prod.ini and dist/.../config.ini do.
+  * quick_layout / quick_pos are new keys. If they are missing, the compiled
+    defaults apply (cross layout at the same coordinates), but a partial or
+    malformed quick_pos leaves the ORIGINAL arc while the touch exemption is
+    still enabled -- taps would then be let through at the wrong places.
+    Keep all three in sync: config.prod.ini, dist/switch/inotia4/config.ini,
+    and the Eden sdmc config.ini.
+  * The Eden sdmc config.ini also carries the user's log_level = 3 and
+    tap_script = "960,919@600". Do not overwrite them with the production
+    file when deploying; only sync the keys the code reads.
+  * pad_probe must stay 0.
+
+KNOWN GAPS
+  * A on a UI page is ignored: it does NOT add stat points or confirm. To make
+    it work, find the selected control in the live tree and inject a touch;
+    never call the scene key handler again.
+  * The R swap assumes the HUD reads shortcut slots as array[page+i] with
+    i=0..5. If the right-hand four do not change (or the lower-left two do),
+    locate the slot index in each control's data instead.
+  * The two lower-left buttons sit inside the d-pad touch block; they rely on
+    the six-rect exemption and the direct event forwarding. Mouse clicks in
+    every UI state have not been checked.
+  * Hiding the field HUD's swap icon uses the draw call's anchor near
+    1059,313. A future layout change could move that anchor.
+  * The six-slot layout and the assign-page layout were confirmed visually;
+    the R swap and the touch exemption still need one full play-test.

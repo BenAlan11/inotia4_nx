@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -783,6 +784,67 @@ static const char *key_preview(const char *key) {
   return buf;
 }
 
+/* ------------------------------------------------------------------------- */
+/* Save-file length hygiene                                                  */
+/*                                                                           */
+/* ENCRYPT_Process2 appends three trailer bytes after the ciphertext:          */
+/*   data[len]   = checksum of the cipher bytes                               */
+/*   data[len+1] = nonce                                                       */
+/*   data[len+2] = checksum of the plain bytes                                */
+/* SAVE_LoadDataAsNameAndKey always derives len from filesize-3, so a file     */
+/* that grew a stale tail (see bionic_flags_to_newlib in libc_shim.c) can      */
+/* never be opened and its slot renders as "ERROR(00)".                       */
+/*                                                                           */
+/* The engine's own decryptor is the only authority on whether a given length  */
+/* is valid: it verifies BOTH checksums and decrypts in place. Reuse it on a   */
+/* scratch copy instead of reimplementing the cipher here.                    */
+/* ------------------------------------------------------------------------- */
+static void save_full_path(const char *rel, char *out, size_t cap) {
+  if (rel && (strchr(rel, ':') || rel[0] == '/')) {
+    snprintf(out, cap, "%s", rel);   /* already absolute / sdmc: */
+    return;
+  }
+  snprintf(out, cap, "%s/%s/%s", g_save_dir, shim_package_name(),
+           rel ? rel : "");
+}
+
+/* Longest L <= n-3 whose trailer the engine's decryptor accepts, or 0. */
+static long save_scan_valid_len(unsigned char *buf, long n) {
+  if (!encrypt_real || n < 8)
+    return 0;
+  unsigned char *work = malloc((size_t)n);
+  if (!work)
+    return 0;
+  unsigned sum = 0;
+  long best = 0;
+  for (long L = 1; L <= n - 3; L++) {
+    sum = (sum + buf[L - 1]) & 0xff;
+    if (sum != buf[L])             /* cipher checksum is key-independent */
+      continue;
+    memcpy(work, buf, (size_t)L + 3);
+    if (encrypt_real(work, (int)L, 1, nx_save_key)) {
+      best = L;                    /* keep scanning: prefer the longest */
+    }
+  }
+  free(work);
+  return best;
+}
+
+/* Drop a stale tail by rewriting the leading `want` bytes with "wb", which
+ * always truncates. ftruncate() is not implemented by every Switch fs
+ * devoptab, but a plain write is. The bytes themselves are unchanged. */
+static int save_trim_to(const char *full, const unsigned char *buf,
+                        long have, long want) {
+  if (want <= 0 || want > have)
+    return 0;
+  FILE *f = fopen(full, "wb");
+  if (!f)
+    return 0;
+  const size_t wrote = fwrite(buf, 1, (size_t)want, f);
+  fclose(f);
+  return wrote == (size_t)want;
+}
+
 static int nx_save_nk(const char *path, void *data, int len, const char *key) {
   static int logs;
   if (logs < 24) {
@@ -799,6 +861,34 @@ static int nx_save_nk(const char *path, void *data, int len, const char *key) {
       memcpy(plain, data, (size_t)len);
   }
   const int rc = save_nk_real ? save_nk_real(path, data, len, nx_save_key) : 0;
+  if (rc && len > 0 && data) {
+    /* After SAVE_SaveDataAsNameAndKey returns, data[] holds the ciphertext
+     * plus the three trailer bytes, i.e. exactly len+3 bytes. Rewrite them
+     * with "wb" so the on-disk size is always exact even if some writer
+     * opened the old (longer) file without a working O_TRUNC. This is the
+     * belt-and-braces guarantee that no future save can grow a stale tail. */
+    char full[700];
+    save_full_path(path, full, sizeof(full));
+    const long want = (long)len + 3;
+    FILE *chk = fopen(full, "rb");
+    long have = 0;
+    if (chk) {
+      if (fseek(chk, 0, SEEK_END) == 0)
+        have = ftell(chk);
+      fclose(chk);
+    }
+    /* Normal case: the engine's O_TRUNC (now translated) already produced an
+     * exact-length file, so do NOT write again. Only clean up a stale tail. */
+    if (have > want &&
+        save_trim_to(full, (const unsigned char *)data, want, want)) {
+      static int trim_logs;
+      if (trim_logs < 8) {
+        trim_logs++;
+        debugPrintf("save: trimmed stale write tail '%s' %ld -> %ld bytes\n",
+                    path ? path : "(null)", have, want);
+      }
+    }
+  }
   if (rc && plain && copy && encrypt_real) {
     /* data[] now holds the ciphertext plus the three trailer bytes. Running the
      * engine's own decryptor over a copy is the only check that proves the file
@@ -839,9 +929,48 @@ static int nx_load_nk(const char *path, void *out, int *outlen, const char *key)
                 path ? path : "(null)", key_preview(key));
   }
   const int rc = load_nk_real ? load_nk_real(path, out, outlen, nx_save_key) : 0;
-  if (!rc)
-    debugPrintf("save: read FAILED '%s'\n", path ? path : "(null)");
-  return rc;
+  if (rc)
+    return rc;
+
+  /* The engine assumed len = filesize-3. A slot written before the O_TRUNC
+   * fix can still carry a stale tail. Find the real record length with the
+   * engine's own decryptor, trim just that tail (no byte of the record is
+   * touched), and retry the read once. This repairs existing slots in place
+   * without guessing a key or rewriting save data. */
+  char full[700];
+  save_full_path(path, full, sizeof(full));
+  FILE *f = fopen(full, "rb");
+  if (f) {
+    if (fseek(f, 0, SEEK_END) == 0) {
+      const long n = ftell(f);
+      rewind(f);
+      if (n >= 8 && n <= 65536) {
+        unsigned char *buf = malloc((size_t)n);
+        if (buf && fread(buf, 1, (size_t)n, f) == (size_t)n) {
+          const long L = save_scan_valid_len(buf, n);
+          /* Require a plausible record: the stale tail must be much shorter
+           * than the record itself, so a stray checksum coincidence cannot
+           * truncate a healthy file. */
+          if (L >= 64 && L + 3 < n && (n - L - 3) < L / 2 &&
+              save_trim_to(full, buf, n, L + 3)) {
+            debugPrintf("save: repaired '%s' %ld -> %ld bytes "
+                        "(%ld stale tail bytes), key '%s'\n",
+                        path ? path : "(null)", n, L + 3, n - L - 3,
+                        nx_save_key);
+          }
+        }
+        free(buf);
+      }
+    }
+    fclose(f);
+    const int again = load_nk_real
+                          ? load_nk_real(path, out, outlen, nx_save_key)
+                          : 0;
+    if (again)
+      return 1;
+  }
+  debugPrintf("save: read FAILED '%s'\n", path ? path : "(null)");
+  return 0;
 }
 
 /* SAVE_SaveData(slot, data, len) is the per-slot writer every in-game save
@@ -900,8 +1029,13 @@ static int save_file_decrypts(const char *path) {
   const size_t got = fread(buf, 1, (size_t)n, f);
   fclose(f);
   int ok = -1;
-  if (got == (size_t)n && encrypt_real)
-    ok = encrypt_real(buf, (int)n - 3, 1, nx_save_key) ? 1 : 0;
+  if (got == (size_t)n && encrypt_real) {
+    /* A file carrying a stale tail cannot be judged by filesize-3 alone.
+     * nx_load_nk repairs such a file on the next read, so do NOT quarantine
+     * it here -- renaming a still-readable slot to .bad loses the save.
+     * save_scan_valid_len works on a scratch copy, leaving buf intact. */
+    ok = save_scan_valid_len(buf, n) > 0 ? 1 : 0;
+  }
   free(buf);
   return ok;
 }
@@ -1240,6 +1374,179 @@ static void (*drawpart_real)(void *, long, long, long, long, long, long,
                              long, long);
 static unsigned drawpart_calls;
 
+/* the play HUD's own draw routine, and whether the blit we are inside was
+ * issued by it (see nx_grpx_draw_part below) */
+#define HUD_DRAW_LO 0x15b3acu
+#define HUD_DRAW_HI 0x15c5bcu
+
+/* The two left-column buttons (control ids 1 and 3) are already bound to pad
+ * keys and already blocked from real screen touches (HUD_BTN_PLUS /
+ * HUD_BTN_MINUS in input.c). Their icons still come out of
+ * UIPlayPorting_Draw, which SHARES its GRPX_DrawPart call sites with every
+ * other HUD button, so a pure return-address range cannot single them out.
+ * hud_scan_node() publishes their own absolute rects -- read from the engine's
+ * control tree, not measured off a screenshot -- and nx_grpx_draw_part() cuts
+ * exactly those two calls. Same call-site cut as no_pad_art and the page-swap
+ * icon; never a global rectangle mask. */
+static volatile long pad_menu_rect[2][4];
+static volatile int  pad_menu_seen[2];
+
+/* The virtual-key layer's own draw loop inside UIPlayPorting_Draw:
+ *   0x15bf98  InputLayer_GetVirtualKey / ControlObject_GetCount / GetHead
+ *   0x15c024  loop: GetRelativeRect, GetID, branch on id 0x14/0x15/0x16
+ *   0x15c410  loop end
+ * Its five GRPX_DrawPart sites (0x15c010, 0x15c094, 0x15c270, 0x15c2fc,
+ * 0x15c3d0) paint the direction pad, the attack disc, the pressed highlight
+ * and the gold rune glow. This is the ONLY place that draws them, so skipping
+ * these calls at the source is the logical way to not draw the wheel -- as
+ * opposed to dropping quads that happen to land in that screen corner, which
+ * also ate inventory icons and map art. */
+#define VK_DRAW_LO 0x15bf98u
+#define VK_DRAW_HI 0x15c410u
+
+/* Page-swap button: control id 7 in the field HUD and another control at the
+ * very same rect on the shortcut-assign page (its id is dynamic). Driven by R
+ * now, so its icon is suppressed at the draw call and its rect is blocked
+ * from real touches (input.c). UIShortcutMenu_DrawScrollButton draws the
+ * assign-page copy; the field copy is one GRPX_DrawPart in UIPlayPorting_Draw
+ * around this anchor. */
+#define SWAP_SCROLL_LO 0x161398u
+#define SWAP_SCROLL_HI 0x1614a8u
+#define SWAP_BTN_X 1059L
+#define SWAP_BTN_Y 313L
+#define SWAP_BTN_W 75L
+#define SWAP_BTN_H 75L
+
+/* Two more routines paint the *touch feedback* of the d-pad, not the pad
+ * itself, so the range above lets them through: a 24x24 border
+ * (UI_DrawBorderRect) and the 41x41 pressed disc, which comes from the
+ * character-info popup -- that popup owns the on-screen pad on Android, so its
+ * draw routine is where the highlight lives. Both are small; the size cap in
+ * hud_blit_hidden keeps a real popup panel out of the filter if one ever
+ * overlaps the pad. */
+#define HUD_FX_BORDER_LO 0x14314cu
+#define HUD_FX_BORDER_HI 0x1434d4u
+#define HUD_FX_POPUP_LO  0x1e6b78u
+#define HUD_FX_POPUP_HI  0x1e7a94u
+static unsigned g_blit_caller;
+static int hud_blit_hidden(long x, long y, long w, long h, unsigned direct);
+
+/* GRPX_DrawPart is the engine's own wrapper around SGL_DrawTexturePartEx and
+ * the one the play HUD uses. Wrapping it as well (seven register arguments,
+ * pure passthrough) is what tells the blit filter who asked for the part: the
+ * return address here is the HUD draw function itself, whereas the address
+ * seen inside the Ex wrapper would only be GRPX_DrawPart's interior. */
+static void (*grpx_draw_part_real)(void *, long, long, void *, long, long,
+                                   long);
+
+static void nx_grpx_draw_part(void *h, long x, long y, void *rect, long mode,
+                              long p5, long p6) {
+  const unsigned prev = g_blit_caller;
+  const unsigned ra = (unsigned)((uintptr_t)__builtin_return_address(0) -
+                                 (uintptr_t)game_mod.load_virtbase);
+  g_blit_caller = ra;
+  /* Do not run the virtual-key layer's draw calls at all. No rectangle test,
+   * no quad filter: the wheel, its pressed glow and the attack disc simply
+   * are never submitted. cfg.no_pad_art = 0 brings them back. */
+  if (cfg.no_pad_art && ra >= VK_DRAW_LO && ra < VK_DRAW_HI) {
+    static int logs;
+    if (logs < 3) {
+      logs++;
+      debugPrintf("pad: virtual-key draw suppressed (caller 0x%x)\n", ra);
+    }
+    g_blit_caller = prev;
+    return;
+  }
+  /* The two pad-bound left-column buttons: cut their icon draw calls at the
+   * source. Confined to UIPlayPorting_Draw's own ra range and to the button's
+   * own control rect, so no other UI blit can be caught by the test. */
+  if (cfg.no_pad_art && ra >= HUD_DRAW_LO && ra < HUD_DRAW_HI) {
+    for (int i = 0; i < 2; i++) {
+      if (!pad_menu_seen[i])
+        continue;
+      const long bx = pad_menu_rect[i][0], by = pad_menu_rect[i][1];
+      const long bw = pad_menu_rect[i][2], bh = pad_menu_rect[i][3];
+      if (bw <= 0 || bh <= 0 || x < bx - 4 || x > bx + bw + 4 ||
+          y < by - 4 || y > by + bh + 4)
+        continue;
+      static int logs;
+      if (logs < 6) {
+        logs++;
+        debugPrintf("pad: bound menu button %d draw suppressed (ra 0x%x at "
+                    "%ld,%ld rect %ld,%ld %ldx%ld)\n", i, ra, x, y,
+                    bx, by, bw, bh);
+      }
+      g_blit_caller = prev;
+      return;
+    }
+  }
+  /* The page-swap icon is gone in both places. Suppress the dedicated
+   * assign-page routine entirely, and the single field-HUD call whose anchor
+   * is the swap button. This is a call-site cut, not a screen-rectangle mask:
+   * the ra range is the HUD draw function itself. */
+  if (cfg.quick_layout) {
+    int drop = 0;
+    if (ra >= SWAP_SCROLL_LO && ra < SWAP_SCROLL_HI)
+      drop = 1;
+    else if (ra >= HUD_DRAW_LO && ra < HUD_DRAW_HI &&
+             x >= SWAP_BTN_X - 60 && x <= SWAP_BTN_X + SWAP_BTN_W + 60 &&
+             y >= SWAP_BTN_Y - 60 && y <= SWAP_BTN_Y + SWAP_BTN_H + 60)
+      drop = 1;
+    if (drop) {
+      static int logs;
+      if (logs < 4) {
+        logs++;
+        debugPrintf("quick: swap icon draw suppressed (ra 0x%x at %ld,%ld)\n",
+                    ra, x, y);
+      }
+      g_blit_caller = prev;
+      return;
+    }
+  }
+  if (grpx_draw_part_real)
+    grpx_draw_part_real(h, x, y, rect, mode, p5, p6);
+  g_blit_caller = prev;
+}
+
+/* GRPX_DrawPartFlip is an EIGHT-argument function, not seven.
+ *
+ * Verified at the engine's own call sites (e.g. 0x144454 `mov w7,#1`,
+ * 0x14f198 `mov w7,wzr`) and inside the function (0x121e94 `cmp w7,#0`):
+ * w7 picks the sign of the X/Y scale passed to SGL_DrawTexturePartFlip
+ * (-100/+100 versus +100/-100), i.e. which way the sprite is mirrored.
+ * Declaring the wrapper with seven arguments left x7 holding whatever our
+ * code happened to leave there, so mirrored art -- the character page's
+ * gold ">" stat arrows -- came out as "<" and drifted off its row.
+ * The eighth argument must be forwarded verbatim. */
+static void (*grpx_draw_part_flip_real)(void *, long, long, void *, long, long,
+                                        long, long);
+
+static void nx_grpx_draw_part_flip(void *h, long x, long y, void *rect,
+                                   long mode, long p5, long p6, long flip) {
+  const unsigned ra = (unsigned)((uintptr_t)__builtin_return_address(0) -
+                                 (uintptr_t)game_mod.load_virtbase);
+  /* One line per caller: tells us which pages use the flipped path and with
+   * which mirror argument, without flooding the log. */
+  {
+    static unsigned seen[32];
+    static int n, logs;
+    int dup = 0;
+    for (int i = 0; i < n; i++)
+      if (seen[i] == ra) { dup = 1; break; }
+    if (!dup && n < (int)(sizeof(seen) / sizeof(*seen))) {
+      seen[n++] = ra;
+      logs++;
+      debugPrintf("flip: caller 0x%x x=%ld y=%ld mode=%ld p5=%ld p6=%ld "
+                  "flip=%ld\n", ra, x, y, mode, p5, p6, flip);
+    }
+  }
+  if (hud_blit_hidden(x, y, p5, p6, ra))
+    return;
+  if (grpx_draw_part_flip_real)
+    grpx_draw_part_flip_real(h, x, y, rect, mode, p5, p6,
+                             cfg.flip_arg ? flip : 0);
+}
+
 /* per-frame summary, so a screen that issues thousands of calls can be judged
  * by where they land instead of by 9000 log lines */
 static unsigned batch_calls;
@@ -1253,6 +1560,12 @@ static long batch_x0, batch_y0, batch_x1, batch_y1;
  * logging below needs the real meaning. */
 static void drawpart_logged(void *tex, long x, long y, long p3, long p4,
                             long w, long h, long p7, long p8) {
+  /* Defined with the HUD block further down: 1 means "this blit belongs to a
+   * pad-bound HUD button that the pad now drives, drop it". */
+  const unsigned ra0 = (unsigned)((uintptr_t)__builtin_return_address(0) -
+                                  (uintptr_t)game_mod.load_virtbase);
+  if (hud_blit_hidden(x, y, w, h, ra0))
+    return;
   if (g_dump_left > 0) {
     g_dump_left--;
     debugPrintf("df: f%u tex %p dst %ld,%ld %ldx%ld src %ld,%ld\n", g_frame_no,
@@ -2348,6 +2661,44 @@ static void dlg_probe(const char *who, const char *s, int x, int y, int px,
   debugPrintf("dlg: %s y%d x%d px%d col %08x '%s'\n", who, y, x, px, col, s);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Story / class-description body colour.                                    */
+/*                                                                           */
+/* TEXTCTRL2_LineProcess consumes each "$X" code into a display unit's colour
+ * field; TEXTCTRL2_Draw then does, for EVERY span:                          */
+/*     ldr w0,[unit,#8]; GRPX_GetColorFromGRP; GRPX_SetFontColor;           */
+/*     GRPX_DrawSubStringWithFont2(original + unit.offset, unit.len, ...)    */
+/* So the string our nx_sub_string hook receives is a CODE-FREE VIEW of one
+ * span (the codes are outside the offset/len window) -- that is why
+ * `subraw: ... codes 0` and why text_draw_rich_line can never colour it.
+ * The emphasis colour survives ONLY in GRPX_SetFontColor's argument, which is
+ * 0xAABBGGRR (GRPX_SetFontColor 0x122848 splits it into r/g/b: low byte = r,
+ * next = g, next = b). Record it for TEXTCTRL2_Draw / DrawAsStep callers and
+ * use it as the pen; __builtin_bswap32 turns it into text.c's 0xRRGGBBAA.
+ * Every other caller is still forwarded unchanged.                          */
+/* ------------------------------------------------------------------------- */
+#define T2_DRAW_LO 0x1daf98u
+#define T2_DRAW_HI 0x1db288u
+static void (*grp_set_font_color_real)(unsigned long);
+static volatile unsigned g_story_font_color;
+static volatile unsigned g_story_font_color_frame = 0xFFFFFFFFu;
+
+static void nx_grpx_set_font_color(unsigned long a0) {
+  const unsigned ra = (unsigned)((uintptr_t)__builtin_return_address(0) -
+                                 (uintptr_t)game_mod.load_virtbase);
+  if (ra >= T2_DRAW_LO && ra < T2_DRAW_HI) {
+    g_story_font_color = (unsigned)a0;
+    g_story_font_color_frame = (unsigned)g_frame_no;
+    static int logs;
+    if (logs < 24) {
+      logs++;
+      debugPrintf("story: font colour %08x (ra 0x%x)\n", (unsigned)a0, ra);
+    }
+  }
+  if (grp_set_font_color_real)
+    grp_set_font_color_real(a0);
+}
+
 static unsigned long nx_sub_string(unsigned long a0, unsigned long a1,
                                    unsigned long a2, unsigned long a3,
                                    unsigned long a4, unsigned long a5,
@@ -2374,11 +2725,25 @@ static unsigned long nx_sub_string(unsigned long a0, unsigned long a1,
   if (px <= 0)
     px = 20;
 
-  GLfloat cc[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-  glGetFloatv(GL_CURRENT_COLOR, cc);
-  unsigned color = ((unsigned)(cc[0] * 255.0f) << 24) |
-                   ((unsigned)(cc[1] * 255.0f) << 16) |
-                   ((unsigned)(cc[2] * 255.0f) << 8) | 0xffu;
+  unsigned color;
+  if (g_story_font_color_frame == (unsigned)g_frame_no && g_story_font_color) {
+    /* TEXTCTRL2_Draw set this span's colour immediately before this call.
+     * GL_CURRENT_COLOR is always white in this port, so using it was the
+     * reason every story emphasis word came out plain. */
+    color = __builtin_bswap32(g_story_font_color);  /* AABBGGRR -> RRGGBBAA */
+    static int col_logs;
+    if (col_logs < 16) {
+      col_logs++;
+      debugPrintf("story: span pen %08x -> %08x\n",
+                  g_story_font_color, color);
+    }
+  } else {
+    GLfloat cc[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    glGetFloatv(GL_CURRENT_COLOR, cc);
+    color = ((unsigned)(cc[0] * 255.0f) << 24) |
+            ((unsigned)(cc[1] * 255.0f) << 16) |
+            ((unsigned)(cc[2] * 255.0f) << 8) | 0xffu;
+  }
   color = text_colour(color);
   /* Inner thoughts are written in parentheses and the original draws the whole
    * line dimmer than speech (#A4.. measured off the plate against the body's
@@ -2402,6 +2767,22 @@ static unsigned long nx_sub_string(unsigned long a0, unsigned long a1,
     }
   }
   dlg_probe("sub", str, (int)a2, (int)a3, px, color);
+  /* dlg_probe has a 16-row table that the character page's grpx lines fill
+   * before any dialogue arrives, so the story body's raw string was never
+   * visible. Keep an independent budget: whether this string still carries
+   * its $X codes decides if the emphasis can be drawn at all. */
+  {
+    static char last[128];
+    static int raw_logs;
+    char cur[128];
+    snprintf(cur, sizeof(cur), "%.*s", 120, str);
+    if (raw_logs < 60 && strcmp(last, cur)) {
+      raw_logs++;
+      snprintf(last, sizeof(last), "%s", cur);
+      debugPrintf("subraw: y%ld len%d col %08x codes %d '%s'\n",
+                  (long)a3, len, color, strchr(cur, '$') ? 1 : 0, cur);
+    }
+  }
   plate_probe("sub", str, (int)a2, (int)a3, color);
 
   if (sub_logs < 60) {
@@ -2448,6 +2829,24 @@ static fn_ctrl_child p_ctrl_child;
 static fn_ctrl_count p_ctrl_count;
 static fn_ctrl_proc p_ctrl_proc;
 static void (*p_delete_child)(void *parent, void *child);
+/* Event procs used to recognise a UI_PopupProcess info box's 确认 button by
+ * control TYPE + tree shape instead of hardcoded screen coordinates. */
+static void *ctrl_button_proc, *ctrl_scroll_proc;
+/* Event-proc identities used to tell a REAL clickable control from a plain
+ * container, a scrolling viewport or the drawn character figure. Read from
+ * libgame.so's own export table, never from hardcoded addresses:
+ *   0x130514 ControlObject_DefaultPressKey  (container: no click of its own)
+ *   0x13ddf4 ControlButton_EventProc        (buttons)
+ *   0x13e36c ControlItem_EventProc          (item / skill / bag cells)
+ *   0x13e72c ControlScroll_EventProc        (scroll viewport)
+ *   0x1499e0 UIEquip_CharacterEvent         (the character figure: not a button)
+ *   0x14d440 UIGameMenu_SubEvent            (the detail / description panel)
+ *   0x15a3f0 UIPlay_SkillEventProc          (quick slots) */
+static void *ctrl_item_proc, *ctrl_skill_proc, *ctrl_menu_sub_proc;
+/* ControlObject_SetShow was tried for hiding the pad-bound HUD buttons and
+ * does nothing: those controls keep 0 at +0x10 (not the 0x30/0x31 that
+ * ControlButton_Draw tests) and their art is painted straight from
+ * UIPlayPorting_Draw. The hide happens in hud_blit_hidden() instead. */
 
 /* ------------------------------------------------------------------------- */
 /* deleting a save slot                                                       */
@@ -2806,6 +3205,1411 @@ static void tree_tick(void) {
   dump_tree(root, 0);
 }
 
+/* ------------------------------------------------------------------------- */
+/* in-game HUD -> pad                                                        */
+/*                                                                           */
+/* The four controls the pad has to reach are read out of the engine's own
+ * control tree, by the IDs the tree dump shows on the play screen:
+ *   id  1  (  1,155  75x75  ) first button in the left column -> + key
+ *   id  3  (  1,309  75x75  ) the gear                        -> - key
+ *   id 20  (975,480 159x160 ) lower-right action disc         -> A
+ *   id 21  ( 10,388 252x252 ) lower-left direction pad        -> left stick
+ * Reading the live rects means no screenshot measuring and no hard-coded
+ * pixels: if the layout changes, the mapping follows it. input_hud_end()
+ * additionally requires the disc on the right and the pad on the lower left,
+ * so a menu page that happens to reuse those ids cannot turn HUD mode on.
+ *
+ * Those same controls are HIDDEN from the screen once HUD mode is confirmed:
+ * the pad drives them directly, so drawing them is only clutter.
+ *
+ * ControlObject_SetShow is the obvious lever and it does not work here: these
+ * four are not ControlButtons. Their proc is TouchHandle_ControlEventProc
+ * (0x15a7c4 -> 0x28dbd0) and their +0x10 holds 0, not the 0x30/0x31 that
+ * ControlButton_Draw tests, so SetShow(0) writes 0x31 into a field nobody
+ * reads on this path and the art stays. The play HUD is painted straight out
+ * of UIPlayPorting_Draw (0x15b3ac) through GRPX_DrawPart ->
+ * SGL_DrawTexturePartEx, so the hide is done on the blit instead: a part is
+ * dropped when its destination rect sits inside one of these control rects
+ * AND the call came from the HUD's own draw function. The caller check
+ * matters -- the map, the monsters and the drops are painted by other
+ * functions and must still show through the pad's transparent corners.
+ * ids 30..33 are the d-pad's four arrows, children of id 21.
+ * ------------------------------------------------------------------------- */
+static int hud_nodes;
+typedef struct { long x, y, w, h; } HudRect;
+static HudRect hud_hide_rects[12];
+static int hud_hide_count;
+/* 1 while a UI page container covers the play HUD (see hud_scan_node) */
+static int g_ui_page_open;
+
+/* The whole pad cluster's footprint. The ring that lights up while the stick
+ * is held is painted a few pixels wider than any of the controls above (its
+ * glow spills past the 380x380 disc), so the containment test dropped the pad
+ * but kept the glow. This box is the corner the cluster owns on the play HUD;
+ * nothing else the HUD draws lives in it, so everything inside is pad art.
+ *
+ * The ring is also drawn only while a direction key is held, which rules out
+ * "it is part of the static pad art": it is painted by an animation branch
+ * that offsets the quad by a pixel or two each frame, so a containment test
+ * with a 2px fudge still lets it through on most frames. For the play HUD a
+ * blit only has to OVERLAP this box to be pad art -- see the from_hud branch
+ * in hud_blit_hidden. */
+static const HudRect hud_pad_zone = { 0, 246, 420, 394 };
+
+static int hud_inside(const HudRect *r, long x, long y, long w, long h) {
+  return !(x < r->x - 2 || y < r->y - 2 || x + w > r->x + r->w + 2 ||
+           y + h > r->y + r->h + 2);
+}
+
+/* The page's × / back / skip buttons. The engine's own control tree gives
+ * their rectangles. Two shapes are recognised:
+ *   - a small square in the top-left corner = × / 返回  (e.g. id 213: 0,6 78x86)
+ *   - a wide short bar in the top-right    = skip      (id 381: 992,30 135x50)
+ * The event/cutscene layer has ONLY the skip bar, so prefer it when present.
+ * HUD buttons in the same corner (id 101..103, 78x81) fail the w > h test. */
+static HudRect corner_rect, skip_rect;
+static int have_corner, have_skip;
+
+static void corner_scan(void *node, int depth) {
+  if (!node || depth > 6 || !p_ctrl_count || !p_ctrl_child)
+    return;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    if (p_abs_rect) {
+      const CtrlRect r = p_abs_rect(c);
+      if (!have_skip && r.x >= 900 && r.y <= 100 && r.w >= 100 &&
+          r.w <= 220 && r.h >= 30 && r.h <= 80 && r.w > r.h + 30) {
+        have_skip = 1;
+        skip_rect.x = r.x; skip_rect.y = r.y;
+        skip_rect.w = r.w; skip_rect.h = r.h;
+      }
+      if (!have_corner && r.x <= 140 && r.y <= 140 && r.w >= 40 &&
+          r.w <= 240 && r.h >= 40 && r.h <= 240) {
+        have_corner = 1;
+        corner_rect.x = r.x; corner_rect.y = r.y;
+        corner_rect.w = r.w; corner_rect.h = r.h;
+      }
+    }
+    if (!have_corner || !have_skip)
+      corner_scan(c, depth + 1);
+  }
+}
+
+int ui_corner_button(long *cx, long *cy) {
+  have_corner = have_skip = 0;
+  unsigned char *b = (unsigned char *)input_engine_virtbase();
+  void *root = b ? (void *)probe_ptr((uintptr_t)b + 0x2b4140) : NULL;
+  if (!root)
+    return 0;
+  corner_scan(root, 0);
+  const HudRect *r = have_skip ? &skip_rect : (have_corner ? &corner_rect : NULL);
+  if (!r)
+    return 0;
+  *cx = r->x + r->w / 2;
+  *cy = r->y + r->h / 2;
+  return have_skip ? 2 : 1;      /* 2 = skip, 1 = × */
+}
+
+/* ------------------------------------------------------------------------- */
+/* The 确认 button of a UI_PopupProcess info box ("路障", NPC dialogue, ...).  */
+/*                                                                           */
+/* These boxes are NOT UIPopupMsg: they have no 0x2b8d78 base control, so     */
+/* popup_on() in input.c is false and ab_layer() reports a "popup page". A    */
+/* there used to be ignored. In the live control tree they look like this     */
+/* (ids change every run, proc addresses do not):                            */
+/*                                                                           */
+/*   page container  1137x640   proc ControlObject_DefaultPressKey            */
+/*     +- x / skip              proc ControlButton_EventProc                  */
+/*     +- dialog body                                                         */
+/*          +- body text       proc ControlScroll_EventProc                    */
+/*          +- 确认            proc ControlButton_EventProc                    */
+/*                                                                           */
+/* Recognise the DIALOG BODY by its children (a text scroll plus a button),   */
+/* then take that button. That is control semantics, not measured pixels:     */
+/* the only geometry used is relative ("button below the text", "button wider */
+/* than tall") and the parent being a full-screen page container, which keeps */
+/* unrelated panels (skill descriptions, the shortcut-assign page) out.       */
+/* ------------------------------------------------------------------------- */
+static HudRect confirm_rect;
+static int have_confirm;
+
+static void confirm_scan(void *node, void *parent, int depth) {
+  if (!node || depth > 6 || have_confirm || !p_ctrl_count || !p_ctrl_child ||
+      !p_abs_rect || !p_ctrl_proc)
+    return;
+  const int n = p_ctrl_count(node);
+  void *text = NULL, *button = NULL;
+  int typed = 0;
+  for (int i = 0; i < n && n <= 4; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    const uintptr_t pr = (uintptr_t)p_ctrl_proc(c);
+    if (ctrl_scroll_proc && pr == (uintptr_t)ctrl_scroll_proc) {
+      text = c;
+      typed++;
+    } else if (ctrl_button_proc && pr == (uintptr_t)ctrl_button_proc) {
+      if (!button)
+        button = c;
+      typed++;
+    }
+  }
+  if (text && button && typed >= 2 && n >= 2) {
+    const CtrlRect tr = p_abs_rect(text);
+    const CtrlRect br = p_abs_rect(button);
+    const CtrlRect pa = parent ? p_abs_rect(parent) : (CtrlRect){0, 0, 0, 0};
+    if (pa.w >= 1000 && pa.h >= 500 && br.y > tr.y + tr.h / 2 &&
+        br.w > br.h && br.w > 0 && br.h > 0) {
+      have_confirm = 1;
+      confirm_rect.x = br.x; confirm_rect.y = br.y;
+      confirm_rect.w = br.w; confirm_rect.h = br.h;
+      return;
+    }
+  }
+  for (int i = 0; i < n; i++)
+    confirm_scan(p_ctrl_child(node, i), node, depth + 1);
+}
+
+/* Centre of the 确认 button in the engine's 1137x640 layout, or 0. */
+int ui_confirm_button(long *cx, long *cy) {
+  have_confirm = 0;
+  if (!ctrl_button_proc || !ctrl_scroll_proc)
+    return 0;
+  unsigned char *b = (unsigned char *)input_engine_virtbase();
+  void *root = b ? (void *)probe_ptr((uintptr_t)b + 0x2b4140) : NULL;
+  if (!root)
+    return 0;
+  confirm_scan(root, NULL, 0);
+  if (!have_confirm) {
+    static int miss;
+    if (miss < 8) {
+      miss++;
+      debugPrintf("ui: no confirm button in the live tree\n");
+    }
+    return 0;
+  }
+  *cx = confirm_rect.x + confirm_rect.w / 2;
+  *cy = confirm_rect.y + confirm_rect.h / 2;
+  static int logs;
+  if (logs < 8) {
+    logs++;
+    debugPrintf("ui: confirm button centre (%ld,%ld) rect %ld,%ld %ldx%ld\n",
+                *cx, *cy, confirm_rect.x, confirm_rect.y,
+                confirm_rect.w, confirm_rect.h);
+  }
+  return 1;
+}
+
+/* Story dialogue is a full-screen ControlButton ("tap anywhere to continue"),
+ * not a UIPopupMsg with an OK callback. It lives in the page layer, never in
+ * the play HUD layer, so requiring w/h >= 1000/600 is enough to tell it apart.
+ * A must advance it; Y stays the attack / map-interact key. */
+static int ui_dialog_walk(void *node, int depth, long *cx, long *cy) {
+  if (!node || depth > 4 || !p_ctrl_count || !p_ctrl_child)
+    return 0;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    const CtrlRect r = p_abs_rect(c);
+    if (r.w >= 1000 && r.h >= 600 &&
+        p_ctrl_proc(c) == ctrl_button_proc) {
+      *cx = r.x + r.w / 2;
+      *cy = r.y + r.h / 2;
+      return 1;
+    }
+    if (ui_dialog_walk(c, depth + 1, cx, cy))
+      return 1;
+  }
+  return 0;
+}
+
+int ui_dialog_button(long *cx, long *cy) {
+  if (!ctrl_button_proc || !p_ctrl_count || !p_ctrl_child ||
+      !p_abs_rect || !p_ctrl_proc)
+    return 0;
+  unsigned char *b = (unsigned char *)input_engine_virtbase();
+  void *root = b ? (void *)probe_ptr((uintptr_t)b + 0x2b4140) : NULL;
+  return root ? ui_dialog_walk(root, 0, cx, cy) : 0;
+}
+
+/* Nearest live scroll viewport for a point (engine units). ControlScroll
+ * viewports are the only controls that own a real scroll rect; the long
+ * content inside them is drawn text, not controls. Used both to drive a
+ * manual right-stick scroll and to keep the focused skill inside view. */
+static int ui_scroll_walk(void *node, int depth, long rx, long ry,
+                          long *bx, long *by, long *bw, long *bh,
+                          long *best) {
+  if (!node || depth > 6 || !p_ctrl_count || !p_ctrl_child ||
+      !p_abs_rect || !p_ctrl_proc)
+    return 0;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    if (ctrl_scroll_proc && p_ctrl_proc(c) == ctrl_scroll_proc) {
+      const CtrlRect r = p_abs_rect(c);
+      if (r.w >= 250 && r.h >= 250) {
+        long dx = 0, dy = 0;
+        if (rx < r.x) dx = r.x - rx;
+        else if (rx > r.x + r.w) dx = rx - (r.x + r.w);
+        if (ry < r.y) dy = r.y - ry;
+        else if (ry > r.y + r.h) dy = ry - (r.y + r.h);
+        const long d = dx * dx + dy * dy;
+        if (*best < 0 || d < *best) {
+          *best = d;
+          *bx = r.x; *by = r.y; *bw = r.w; *bh = r.h;
+        }
+      }
+    }
+    ui_scroll_walk(c, depth + 1, rx, ry, bx, by, bw, bh, best);
+  }
+  return *best >= 0;
+}
+
+int ui_scroll_viewport(long rx, long ry, long *x, long *y,
+                       long *w, long *h) {
+  unsigned char *b = (unsigned char *)input_engine_virtbase();
+  void *root = b ? (void *)probe_ptr((uintptr_t)b + 0x2b4140) : NULL;
+  if (!root || !ctrl_scroll_proc || !p_ctrl_count || !p_ctrl_child ||
+      !p_abs_rect || !p_ctrl_proc)
+    return 0;
+  long best = -1;
+  return ui_scroll_walk(root, 0, rx, ry, x, y, w, h, &best);
+}
+
+/* One level back: the close cross belonging to the topmost detail panel.
+ * Those panels are UIGameMenu_SubEvent containers and carry a small square
+ * ControlButton as their own close control. Tapping it closes ONLY that panel;
+ * corner_tap() would close the whole menu instead. Restricting the search to
+ * DIRECT children of that panel keeps the character page's 67x67 "+" buttons
+ * (which live under ordinary containers) out of it. */
+static int ui_close_walk(void *node, int depth, long *cx, long *cy) {
+  if (!node || depth > 5 || !p_ctrl_count || !p_ctrl_child ||
+      !p_abs_rect || !p_ctrl_proc)
+    return 0;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    if (ctrl_menu_sub_proc && p_ctrl_proc(c) == ctrl_menu_sub_proc) {
+      const int m = p_ctrl_count(c);
+      for (int j = 0; j < m; j++) {
+        void *k = p_ctrl_child(c, j);
+        if (!k || p_ctrl_proc(k) != ctrl_button_proc)
+          continue;
+        const CtrlRect r = p_abs_rect(k);
+        if (r.w >= 55 && r.w <= 90 && r.h >= 55 && r.h <= 90) {
+          *cx = r.x + r.w / 2;
+          *cy = r.y + r.h / 2;
+          return 1;
+        }
+      }
+      /* Some panels use a wider close/cancel strip near the top instead of
+       * a square cross. Take the topmost ControlButton child, but only from
+       * the upper part of the panel so a bottom action button can never be
+       * mistaken for "back". */
+      const CtrlRect pr = p_abs_rect(c);
+      long bx = 0, by = 0;
+      int found = 0;
+      for (int j = 0; j < m; j++) {
+        void *k = p_ctrl_child(c, j);
+        if (!k || p_ctrl_proc(k) != ctrl_button_proc)
+          continue;
+        const CtrlRect r = p_abs_rect(k);
+        if (r.y > pr.y + 110)
+          continue;
+        if (!found || r.y < by) {
+          bx = r.x + r.w / 2;
+          by = r.y + r.h / 2;
+          found = 1;
+        }
+      }
+      if (found) {
+        *cx = bx;
+        *cy = by;
+        return 1;
+      }
+    }
+    if (ui_close_walk(c, depth + 1, cx, cy))
+      return 1;
+  }
+  return 0;
+}
+
+int ui_panel_close_button(long *cx, long *cy) {
+  if (!ctrl_button_proc || !ctrl_menu_sub_proc || !p_ctrl_count ||
+      !p_ctrl_child || !p_abs_rect || !p_ctrl_proc)
+    return 0;
+  unsigned char *b = (unsigned char *)input_engine_virtbase();
+  void *root = b ? (void *)probe_ptr((uintptr_t)b + 0x2b4140) : NULL;
+  return root ? ui_close_walk(root, 0, cx, cy) : 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* UIChoice: the NPC dialogue option list ("那么。。你想知道些什么呢？").      */
+/*                                                                           */
+/* UIChoice_CreateControl (0x145384) keeps its controls in globals:          */
+/*   +0x2b49e0  heap block holding one 0x7f8-byte record per option.         */
+/*              UIChoice_Exit frees it and stores NULL, so a non-NULL value   */
+/*              is the engine's own "this page is open" flag. The control     */
+/*              pointers below are NOT cleared on exit -- they are stale.     */
+/*   +0x2b49e8  base   462x423 dialog frame                                 */
+/*   +0x2b49f0  title                                                        */
+/*   +0x2b4a00  list    ControlScroll holding the option rows                */
+/*   +0x2b4a08  btns[]  one ControlButton per option, in display order       */
+/* UIChoice_ButtonListExe (0x1456d4) reads +0x2b4a00 to turn the selected    */
+/* row into the answer. Those rows never answered a tap in this port.         */
+/* Identify the row by the control's OWN absolute rect and hand the event     */
+/* straight to that control object -- the same direct dispatch the six quick  */
+/* slots use -- so neither the tree order nor a stale popup layer can eat it. */
+/* ------------------------------------------------------------------------- */
+#define CHOICE_ALLOC  0x2b49e0u
+#define CHOICE_BASE   0x2b49e8u
+#define CHOICE_LIST   0x2b4a00u
+#define CHOICE_BTNS   0x2b4a08u
+#define CHOICE_MAX    8
+
+/* Returns the option index whose own rect contains (ex,ey), or -1. */
+int ui_choice_button(long ex, long ey, void **obj) {
+  *obj = NULL;
+  unsigned char *vb = (unsigned char *)game_mod.load_virtbase;
+  if (!vb || !p_abs_rect)
+    return -1;
+  if (!*(void **)(vb + CHOICE_ALLOC))   /* UIChoice_Exit freed it: no page */
+    return -1;
+  void *base = *(void **)(vb + CHOICE_BASE);
+  void *list = *(void **)(vb + CHOICE_LIST);
+  if (!base || !list || !probe_mem_ok(base, 0x38) ||
+      !probe_mem_ok(list, 0x38))
+    return -1;
+  const CtrlRect fr = p_abs_rect(base);
+  if (fr.w < 200 || fr.h < 150 || ex < fr.x || ex >= fr.x + fr.w ||
+      ey < fr.y || ey >= fr.y + fr.h)
+    return -1;
+  void **btns = (void **)(vb + CHOICE_BTNS);
+  for (int i = 0; i < CHOICE_MAX; i++) {
+    void *b = btns[i];
+    if (!b || !probe_mem_ok(b, 0x38))
+      break;
+    const CtrlRect br = p_abs_rect(b);
+    /* a stale slot may hold some other global; only accept a row-sized rect
+     * that actually lies inside the dialog frame */
+    if (br.w < 100 || br.h < 20 || br.x < fr.x || br.y < fr.y ||
+        br.x + br.w > fr.x + fr.w || br.y + br.h > fr.y + fr.h)
+      continue;
+    if (ex >= br.x && ex < br.x + br.w && ey >= br.y && ey < br.y + br.h) {
+      *obj = b;
+      static int logs;
+      if (logs < 24) {
+        logs++;
+        debugPrintf("ui: choice row %d rect %ld,%ld %ldx%ld at (%ld,%ld) "
+                    "-> %p\n", i, br.x, br.y, br.w, br.h, ex, ey, b);
+      }
+      return i;
+    }
+  }
+  /* The row rects may still carry their parent's local origin (they are
+   * created as children of the list's content control). Rather than guess a
+   * pixel offset, hand the event to that content control and let the engine
+   * walk its own children -- it knows the real geometry. -2 = container. */
+  *obj = list;
+  static int miss;
+  if (miss < 12) {
+    miss++;
+    debugPrintf("ui: choice tap at (%ld,%ld) in frame %ld,%ld %ldx%ld; "
+                "no row rect matched, using content %p\n", ex, ey,
+                fr.x, fr.y, fr.w, fr.h, list);
+  }
+  return -2;
+}
+
+static int hud_overlaps(const HudRect *r, long x, long y, long w, long h) {
+  return !(x + w < r->x || x > r->x + r->w || y + h < r->y || y > r->y + r->h);
+}
+
+/* ------------------------------------------------------------------------- */
+/* quick-slot layout: the six buttons along the bottom-right arc              */
+/*                                                                           */
+/* TWO sets of six exist. In the field they are HUD control ids 8..13        */
+/* (UIPlay_SkillEventProc). The "请选择要设置的快捷键" page builds a SECOND    */
+/* set with UIShortcutMenu_Shortcut_EventProc (engine+0x161178). Its control  */
+/* IDS ARE DYNAMIC -- one run 334..339, the next 231..236 -- so that set is   */
+/* identified by its event PROC, never by id. Both sets are 80x80; slot      */
+/* order is tree order, which matches HUD ids 8..13.                         */
+/* ControlObject_GetRelativeRect reads x,y at obj+0x18 and w,h at obj+0x28;  */
+/* ControlObject_SetRect writes exactly those fields. Moving the relative    */
+/* rect moves BOTH the icon and the touch hit test.                          */
+/*                                                                           */
+/* hud_scan_node() caches the objects every 30 frames; quick_layout_frame()  */
+/* re-applies every frame, so a page that resets its rects is still covered.  */
+/* cfg.quick_pos holds six "x,y" pairs in slot order, engine 1137x640 units; */
+/* p_abs_rect() may include a parent offset, so the write compensates by     */
+/* (absolute - relative).                                                     */
+/* ------------------------------------------------------------------------- */
+static long quick_pos[6][2];
+static int quick_pos_ok, quick_parsed;
+static void *shortcut_proc;        /* UIShortcutMenu_Shortcut_EventProc */
+static int quick_assign_slot;      /* 0..6 while scanning one tree */
+static void *quick_objs[12];       /* 0..5 HUD, 6..11 assign page */
+
+static void quick_layout_parse(void) {
+  quick_parsed = 1;
+  quick_pos_ok = 0;
+  const char *p = cfg.quick_pos;
+  while (*p == '"' || *p == '\'' || *p == ' ')
+    p++;
+  for (int i = 0; i < 6; i++) {
+    if (!p || !*p)
+      break;
+    long x = 0, y = 0;
+    if (sscanf(p, "%ld,%ld", &x, &y) != 2)
+      break;
+    quick_pos[i][0] = x;
+    quick_pos[i][1] = y;
+    const char *semi = strchr(p, ';');
+    p = semi ? semi + 1 : NULL;
+    while (p && (*p == ' ' || *p == '"' || *p == '\''))
+      p++;
+    if (i == 5)
+      quick_pos_ok = 1;
+  }
+  debugPrintf("quick: layout %s (%d positions) '%s'\n",
+              cfg.quick_layout ? "on" : "off", quick_pos_ok ? 6 : 0,
+              cfg.quick_pos);
+  /* Publish the six rects to input.c: real screen touches on these buttons
+   * must survive the HUD touch block, otherwise the two lower-left slots and
+   * the right-hand cross cannot be assigned a shortcut. */
+  long qr[6][4];
+  for (int i = 0; i < 6; i++) {
+    qr[i][0] = quick_pos[i][0];
+    qr[i][1] = quick_pos[i][1];
+    qr[i][2] = 80;
+    qr[i][3] = 80;
+  }
+  input_set_quick_rects(qr, cfg.quick_layout && quick_pos_ok);
+  /* the page-swap button is R-only now, in the field and on the assign page */
+  input_set_swap_rect(SWAP_BTN_X, SWAP_BTN_Y, SWAP_BTN_W, SWAP_BTN_H,
+                      cfg.quick_layout && quick_pos_ok);
+}
+
+/* Write one slot's target into one control object. Idempotent: a page that
+ * already has the target rect is left alone. */
+static void quick_layout_apply_slot(void *c, int slot, const char *tag) {
+  if (!cfg.quick_layout || !quick_pos_ok || slot < 0 || slot > 5 || !p_abs_rect)
+    return;
+  const CtrlRect ar = p_abs_rect(c);
+  if (ar.w != 80 || ar.h != 80)
+    return;
+  volatile long *rel = (volatile long *)((unsigned char *)c + 0x18);
+  const long dx = ar.x - rel[0];       /* parent offset, normally 0 */
+  const long dy = ar.y - rel[1];
+  const long nx = quick_pos[slot][0] - dx;
+  const long ny = quick_pos[slot][1] - dy;
+  if (rel[0] == nx && rel[1] == ny)
+    return;
+  rel[0] = nx;
+  rel[1] = ny;
+  static int logs;
+  if (logs < 24) {
+    logs++;
+    debugPrintf("quick: %s slot %d %ld,%ld -> %ld,%ld\n", tag, slot,
+                ar.x, ar.y, nx + dx, ny + dy);
+  }
+}
+
+/* Every frame: re-apply to the cached objects. probe_mem_ok() keeps a page
+ * whose controls were destroyed from turning into a write to freed memory. */
+static void quick_layout_frame(void) {
+  if (!cfg.quick_layout || !quick_pos_ok)
+    return;
+  for (int i = 0; i < 12; i++) {
+    void *c = quick_objs[i];
+    if (!c || !probe_mem_ok(c, 0x38))
+      continue;
+    quick_layout_apply_slot(c, i % 6, i >= 6 ? "assign page" : "HUD");
+  }
+}
+
+/* The d-pad and the action disc do NOT answer screen touches: that is an
+ * existing rule in input.c's hud_touch_blocked(), which swallows any real
+ * finger inside the four HUD control rects. Do not duplicate it here by
+ * moving those controls' rects -- the stick and A are driven straight on
+ * their control objects, and their geometry is what input.c reads. */
+/* ------------------------------------------------------------------------- */
+/* R shoulder: swap ONLY the four right-hand quick slots                     */
+/*                                                                           */
+/* PLAYER_ScrollShortcut (0x1be5e0) flips a global page byte (p+6)%12: the   */
+/* 12 shortcut slots are two pages of six, so one press changes all six HUD  */
+/* buttons. The two lower-left buttons must stay fixed, so instead of calling */
+/* that function we exchange slots 0..3 with slots 6..9 in the shortcut      */
+/* array. PLAYER_MakeShortcut (0x1be2b4) initialises it at                   */
+/* *(void**)(vb+0x29e7f8), 12 entries of 16 bytes; the HUD reads page+i,     */
+/* i=0..5, so slots 4 and 5 -- the lower-left pair -- never move. The        */
+/* exchange is its own inverse: pressing R twice restores the configuration. */
+/* ------------------------------------------------------------------------- */
+#define SHORTCUT_ARRAY_GLOBAL 0x29e7f8u
+#define SHORTCUT_SLOT_SIZE    16
+#define SHORTCUT_PAGE_STRIDE  6
+#define QUICK_SWAP_SLOTS      4
+
+void quick_swap_fire(void) {
+  if (!cfg.quick_layout)
+    return;
+  unsigned char *vb = input_engine_virtbase();
+  if (!vb)
+    return;
+  unsigned char *arr = *(unsigned char *volatile *)(vb + SHORTCUT_ARRAY_GLOBAL);
+  if (!arr || !probe_mem_ok(arr, 12 * SHORTCUT_SLOT_SIZE)) {
+    debugPrintf("quick: R swap skipped (shortcut array %p)\n", arr);
+    return;
+  }
+  for (int i = 0; i < QUICK_SWAP_SLOTS; i++) {
+    unsigned char *a = arr + i * SHORTCUT_SLOT_SIZE;
+    unsigned char *b = arr + (SHORTCUT_PAGE_STRIDE + i) * SHORTCUT_SLOT_SIZE;
+    for (int j = 0; j < SHORTCUT_SLOT_SIZE; j++) {
+      const unsigned char t = a[j];
+      a[j] = b[j];
+      b[j] = t;
+    }
+  }
+  debugPrintf("quick: R swapped right-hand 4 slots (lower-left 2 fixed)\n");
+}
+
+/* Pad -> one quick slot. Fire straight on the HUD control object (the same
+ * SetSelectedControl / SetReleaseEvent path as the stick and A), so neither
+ * the HUD touch block nor the control-tree dispatch order can eat it. The
+ * HUD group quick_objs[0..5] is the one that actually uses a skill/item;
+ * the assign-page group [6..11] is only for registering shortcuts.
+ * Keys are bound to POSITIONS, so R's data swap never changes what a key
+ * does -- after a swap the same key still fires the button in the same spot. */
+void quick_slot_fire(int slot, int press) {
+  if (!cfg.quick_layout || !quick_pos_ok || slot < 0 || slot > 5)
+    return;
+  void *obj = quick_objs[slot];
+  if (!obj || !probe_mem_ok(obj, 0x38)) {
+    debugPrintf("quick: pad slot %d has no live control\n", slot);
+    return;
+  }
+  const long ex = quick_pos[slot][0] + 40;   /* centre of the 80x80 button */
+  const long ey = quick_pos[slot][1] + 40;
+  const int rc = input_fire_control(obj, ex, ey, press);
+  static int logs;
+  if (logs < 16) {
+    logs++;
+    debugPrintf("quick: pad slot %d %s -> %p rc %d\n", slot,
+                press ? "press" : "release", obj, rc);
+  }
+}
+
+static void hud_scan_node(void *node, int depth) {
+  if (!node || depth > 6 || hud_nodes > 400 || !p_ctrl_count || !p_ctrl_child)
+    return;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n && hud_nodes <= 400; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    hud_nodes++;
+    const unsigned id = p_ctrl_id ? p_ctrl_id(c) : 0;
+    /* HUD slots have stable ids. The shortcut-assign page's slots have
+     * dynamic ids but a fixed event proc, so match on the proc instead. */
+    int qslot = -1, qassign = 0;
+    if (id >= 8 && id <= 13) {
+      qslot = id - 8;
+    } else if (cfg.quick_layout && shortcut_proc && p_ctrl_proc &&
+               p_ctrl_proc(c) == shortcut_proc && p_abs_rect) {
+      const CtrlRect qr = p_abs_rect(c);
+      if (qr.w == 80 && qr.h == 80 && quick_assign_slot < 6) {
+        qslot = quick_assign_slot++;
+        qassign = 1;
+      }
+    }
+    if (qslot >= 0) {
+      quick_objs[qslot + (qassign ? 6 : 0)] = c;
+      quick_layout_apply_slot(c, qslot, qassign ? "assign page" : "HUD");
+    }
+    /* A page container is a full-screen control with a high id (id 212/221/380
+     * etc, 1137x640). When one is present the play HUD is covered, and dropping
+     * blits by the HUD rectangles would delete the page's own art -- exactly
+     * the inventory icons that sit in the lower-left pad corner. */
+    if (id >= 100 && p_abs_rect) {
+      const CtrlRect r = p_abs_rect(c);
+      if (r.w >= 1000 && r.h >= 500)
+        g_ui_page_open = 1;
+    }
+    int which = -1;
+    int hide = 0;
+    int bound_menu = -1;   /* 0 = id 1, 1 = id 3 */
+    switch (id) {
+    case 1:  which = HUD_BTN_PLUS;   hide = 1; bound_menu = 0; break;
+    case 3:  which = HUD_BTN_MINUS;  hide = 1; bound_menu = 1; break;
+    case 20: which = HUD_BTN_ACTION; hide = 1; break;
+    case 21: which = HUD_DPAD;       hide = 1; break;
+    /* id 22 is the 380x380 disc the pad sits in -- the control the direction
+     * proc looks up as virtual key 0x16 and tests the press point against.
+     * Its art is the golden ring that lights up while the stick is pushed, so
+     * it has to go with the rest even though nothing drives it. */
+    case 22: hide = 1; break;
+    case 30: case 31: case 32: case 33: hide = 1; break; /* d-pad arrows */
+    default: break;
+    }
+    if (bound_menu >= 0 && p_abs_rect) {
+      const CtrlRect mr = p_abs_rect(c);
+      pad_menu_rect[bound_menu][0] = mr.x;
+      pad_menu_rect[bound_menu][1] = mr.y;
+      pad_menu_rect[bound_menu][2] = mr.w;
+      pad_menu_rect[bound_menu][3] = mr.h;
+      pad_menu_seen[bound_menu] = 1;
+    }
+    if (which >= 0 && p_abs_rect) {
+      const CtrlRect r = p_abs_rect(c);
+      input_set_hud_rect(which, r.x, r.y, r.w, r.h);
+      /* the d-pad needs its object just as much as the buttons: the stick is
+       * pressed straight on this control (input.c pad_drive), and passing NULL
+       * here made every pad press a no-op -- that is why the stick "stopped
+       * working" when the touch path was dropped. */
+      input_set_hud_obj(which, c);
+    }
+    if (hide && p_abs_rect &&
+        hud_hide_count < (int)(sizeof(hud_hide_rects) / sizeof(*hud_hide_rects))) {
+      const CtrlRect r = p_abs_rect(c);
+      if (r.w > 0 && r.h > 0) {
+        hud_hide_rects[hud_hide_count].x = r.x;
+        hud_hide_rects[hud_hide_count].y = r.y;
+        hud_hide_rects[hud_hide_count].w = r.w;
+        hud_hide_rects[hud_hide_count].h = r.h;
+        hud_hide_count++;
+      }
+    }
+    hud_scan_node(c, depth + 1);
+  }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Settings-page navigation layout, read from the engine's own control tree. */
+/*                                                                           */
+/* A settings page is one full-screen container with a 784x98 tab bar holding
+ * six 98x98 tabs. Everything else tappable is a small control below y=110.
+ * No screenshot coordinates: the rects come from ControlObject_GetAbsoluteRect
+ * and the classification uses their sizes / relative positions only.        */
+/* ------------------------------------------------------------------------- */
+static NavItem nav_tabs_buf[NAV_MAX_TABS];
+static void *nav_tab_objs[NAV_MAX_TABS];   /* engine ControlObject for each tab */
+static NavItem nav_items_buf[NAV_MAX_ITEMS];
+static NavItem nav_back_item;
+static int nav_tabs_n, nav_items_n;
+static void *nav_page_obj, *nav_tab_obj;
+
+/* Four families of page live in the SAME control tree. The root keeps one
+ * full-screen 1137x640 child per layer, in stacking order: title, then the
+ * save list, then (in the new-game flow) the class screen, and the in-game
+ * six-tab settings menu replaces the front-end layers. The LAST recognisable
+ * one is the page on top -- that is the layer the player is looking at.
+ *
+ *   TITLE     369x124 开始游戏 + two 300x92 side buttons (y ~470..616)
+ *   SAVE      three 634x150 rows + a 100x100 back arrow
+ *   CLASS     six 116x114 badges + its own 292x64 开始游戏 + 100x100 back
+ *   SETTINGS  784x98 tab bar with six 98x98 tabs + a content panel
+ *
+ * Everything below is read from ControlObject_GetAbsoluteRect; no screenshot
+ * coordinates and no dynamic ids (those change on every launch). */
+#define NAV_MAX_PAGES 8
+static void *nav_pages[NAV_MAX_PAGES];
+static int nav_pages_n;
+/* Stale save rows / delete bins still sitting UNDER the modal class screen.
+ * nx_TouchHandle_Event drops every tap that lands on one of them, so the
+ * class page's preferred tap point must step around these rectangles. */
+#define NAV_MAX_SHADOW 8
+static CtrlRect nav_shadow[NAV_MAX_SHADOW];
+static int nav_shadow_n;
+
+static void nav_find_pages(void *node, int depth) {
+  if (!node || depth > 4 || nav_pages_n >= NAV_MAX_PAGES)
+    return;
+  const int n = p_ctrl_count ? p_ctrl_count(node) : 0;
+  for (int i = 0; i < n && nav_pages_n < NAV_MAX_PAGES; i++) {
+    void *c = p_ctrl_child ? p_ctrl_child(node, i) : NULL;
+    if (!c)
+      continue;
+    const CtrlRect r = p_abs_rect(c);
+    if (r.w >= 1100 && r.h >= 600)
+      nav_pages[nav_pages_n++] = c;   /* a layer; do not descend into it */
+    else
+      nav_find_pages(c, depth + 1);
+  }
+}
+
+typedef struct {
+  int tabbar, class_badge, class_start, save_row, title_start, title_side;
+} PageSig;
+
+static void nav_sig(void *node, int depth, PageSig *s) {
+  if (!node || depth > 4)
+    return;
+  const int n = p_ctrl_count ? p_ctrl_count(node) : 0;
+  for (int i = 0; i < n; i++) {
+    void *c = p_ctrl_child ? p_ctrl_child(node, i) : NULL;
+    if (!c)
+      continue;
+    const CtrlRect r = p_abs_rect(c);
+    if (r.w >= 700 && r.w <= 900 && r.h >= 70 && r.h <= 130 &&
+        p_ctrl_count(c) >= 5)
+      s->tabbar++;
+    if (r.w >= 100 && r.w <= 130 && r.h >= 100 && r.h <= 130)
+      s->class_badge++;
+    if (r.w >= 250 && r.w <= 350 && r.h >= 50 && r.h <= 80 && r.y > 300)
+      s->class_start++;
+    if (r.w >= 600 && r.w <= 660 && r.h >= 140 && r.h <= 160)
+      s->save_row++;
+    if (r.w >= 330 && r.w <= 400 && r.h >= 110 && r.h <= 140 && r.y > 400)
+      s->title_start++;
+    if (r.w >= 250 && r.w <= 350 && r.h >= 80 && r.h <= 110 && r.y > 400)
+      s->title_side++;
+    nav_sig(c, depth + 1, s);
+  }
+}
+
+static int nav_page_kind_of(void *page) {
+  PageSig s;
+  memset(&s, 0, sizeof(s));
+  nav_sig(page, 0, &s);
+  if (s.tabbar)
+    return NAV_PAGE_SETTINGS;
+  if (s.class_badge >= 4 && s.class_start)
+    return NAV_PAGE_CLASS;
+  if (s.save_row >= 2)
+    return NAV_PAGE_SAVE;
+  if (s.title_start && s.title_side >= 2)
+    return NAV_PAGE_TITLE;
+  return NAV_PAGE_NONE;
+}
+
+static void *nav_find_tabbar(void *node, int depth) {
+  if (!node || depth > 3)
+    return NULL;
+  const int n = p_ctrl_count ? p_ctrl_count(node) : 0;
+  for (int i = 0; i < n; i++) {
+    void *c = p_ctrl_child ? p_ctrl_child(node, i) : NULL;
+    if (!c)
+      continue;
+    const CtrlRect r = p_abs_rect(c);
+    if (r.w >= 700 && r.w <= 900 && r.h >= 70 && r.h <= 130 &&
+        p_ctrl_count(c) >= 5)
+      return c;
+    void *t = nav_find_tabbar(c, depth + 1);
+    if (t)
+      return t;
+  }
+  return NULL;
+}
+
+static void nav_add_shadow(const CtrlRect *r) {
+  if (nav_shadow_n >= NAV_MAX_SHADOW)
+    return;
+  nav_shadow[nav_shadow_n++] = *r;
+}
+
+static int nav_shadow_hit(long x, long y) {
+  for (int i = 0; i < nav_shadow_n; i++) {
+    const CtrlRect *r = &nav_shadow[i];
+    if (x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h)
+      return 1;
+  }
+  return 0;
+}
+
+/* Keep the tap inside the control's own rect, but off the stale save rows
+ * underneath the class layer. Scanning the control's band is pure control
+ * geometry -- it does not hard-code either the row or the badge positions. */
+static void nav_safe_point(NavItem *it) {
+  const long cx = it->x + it->w / 2;
+  it->tx = cx;
+  it->ty = it->y + it->h / 2;
+  if (!nav_shadow_n || !nav_shadow_hit(cx, it->ty))
+    return;
+  for (long y = it->y + 6; y < it->y + it->h - 6; y += 4) {
+    if (!nav_shadow_hit(cx, y)) {
+      it->ty = y;
+      return;
+    }
+  }
+}
+
+static void nav_add_item(const CtrlRect *r, int kind, int shape, int order) {
+  if (nav_items_n >= NAV_MAX_ITEMS)
+    return;
+  NavItem *it = &nav_items_buf[nav_items_n++];
+  it->x = r->x; it->y = r->y; it->w = r->w; it->h = r->h;
+  it->kind = (unsigned char)kind;
+  it->row = (unsigned char)order;
+  it->col = 0;
+  it->shape = (unsigned char)shape;
+  nav_safe_point(it);
+}
+
+/* Direct dispatch target for a tap on one of the six page tabs. The backpack
+ * tab (2/6) leaves a UIGameMenu_SubEvent panel at 88,0 409x431 in the tree;
+ * it starts at y=0 and swallows every press in x 88..497 -- which covers tab1
+ * (x=206..304) and tab2, but not tab3 onwards. That is why 2/6 -> 1/6 was the
+ * only broken switch: the normal tree walk handed the press to that panel.
+ * Handing it straight to the tab's own control object bypasses the stale
+ * panel, exactly like the quick-slot / UIChoice direct dispatch below. */
+static void *ui_tab_control_at(long x, long y) {
+  for (int i = 0; i < nav_tabs_n; i++) {
+    const NavItem *t = &nav_tabs_buf[i];
+    if (t->w <= 0 || t->h <= 0 || x < t->x || x >= t->x + t->w ||
+        y < t->y || y >= t->y + t->h)
+      continue;
+    void *o = nav_tab_objs[i];
+    if (o && probe_mem_ok(o, 0x38))
+      return o;
+  }
+  return NULL;
+}
+
+static NavItem *nav_add_title(const CtrlRect *r, int kind, int order) {
+  nav_add_item(r, kind, NAV_SHAPE_PILL, order);
+  return nav_items_n > 0 ? &nav_items_buf[nav_items_n - 1] : NULL;
+}
+
+/* The title buttons' control rect is a padded HIT box, not the visible art.
+ * In UI_TITLEMAIN_BUT_cn_s_001.png the three ovals measure 357x77 / 292x63 /
+ * 292x63 (alpha bounds) -- all 4.63:1 -- while the hit boxes are 369x124 and
+ * 300x92. Drawing the cursor on the hit box therefore puts a tall capsule
+ * around a flat oval. Shrink it to the oval: 92% of the hit width (the inner
+ * visible part, excluding the pointed end ornaments) with the atlas aspect.
+ * tx/ty were set to the ORIGINAL control centre by nav_add_item() and stay
+ * there -- a smaller highlight must never move the tap. */
+static void nav_title_art(NavItem *it) {
+  if (!it)
+    return;
+  const long aw = it->w * 92 / 100;
+  long ah = aw * 100 / 463;
+  if (ah > it->h - 8)
+    ah = it->h - 8;
+  if (ah < 20)
+    ah = 20;
+  it->x += (it->w - aw) / 2;
+  it->y += (it->h - ah) / 2;
+  it->w = aw;
+  it->h = ah;
+}
+
+/* Walk one page layer and publish its tappable controls. `kind` picks the
+ * control shapes/semantics; `back` is the page's own return arrow (B). */
+static void nav_collect_page(void *node, int depth, int kind) {
+  if (!node || depth > 5 || nav_items_n >= NAV_MAX_ITEMS)
+    return;
+  const int n = p_ctrl_count ? p_ctrl_count(node) : 0;
+  for (int i = 0; i < n; i++) {
+    void *c = p_ctrl_child ? p_ctrl_child(node, i) : NULL;
+    if (!c)
+      continue;
+    const CtrlRect r = p_abs_rect(c);
+    /* every front-end page except the title has a 100x100 return arrow at
+     * (0,0). Recognise it FIRST: it is also badge-sized on the class page,
+     * and must not enter the cursor list as a seventh class. */
+    const int is_back = kind != NAV_PAGE_TITLE && !nav_back_item.w &&
+                        r.x <= 20 && r.y <= 20 && r.w >= 80 && r.w <= 140 &&
+                        r.h >= 80 && r.h <= 140;
+    if (is_back) {
+      nav_back_item = (NavItem){ r.x, r.y, r.w, r.h,
+                                 r.x + r.w / 2, r.y + r.h / 2,
+                                 NAV_K_PLAIN, 0, 0, NAV_SHAPE_CIRCLE };
+    } else if (kind == NAV_PAGE_TITLE) {
+      if (r.y > 400 && r.w >= 330 && r.w <= 400 && r.h >= 110 && r.h <= 140)
+        nav_title_art(nav_add_title(&r, NAV_K_TITLE_START, 1));
+      else if (r.y > 400 && r.w >= 250 && r.w <= 350 && r.h >= 80 &&
+               r.h <= 110)
+        nav_title_art(nav_add_title(&r, NAV_K_TITLE_BTN, 0));
+    } else if (kind == NAV_PAGE_SAVE) {
+      if (r.w >= 600 && r.w <= 660 && r.h >= 140 && r.h <= 160)
+        nav_add_item(&r, NAV_K_SAVE_ROW, NAV_SHAPE_ROUNDRECT,
+                     r.y < 170 ? 0 : (r.y < 340 ? 1 : 2));
+      /* the 66x66 delete bins deliberately stay OUT of the cursor list:
+       * a stray A must never delete a save. The finger still reaches them. */
+    } else if (kind == NAV_PAGE_CLASS) {
+      if (r.w >= 100 && r.w <= 130 && r.h >= 100 && r.h <= 130)
+        nav_add_item(&r, NAV_K_CLASS, NAV_SHAPE_ROUNDRECT, i);
+      else if (r.w >= 250 && r.w <= 350 && r.h >= 50 && r.h <= 80 &&
+               r.y > 300)
+        nav_add_item(&r, NAV_K_START, NAV_SHAPE_PILL, 0);
+    }
+    nav_collect_page(c, depth + 1, kind);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Which panel is really on screen
+ *
+ * The item page stacks panels at IDENTICAL rectangles: the detail overlay
+ * ( 复活卷轴 + 使用 / 登录快捷键 / 粉碎 ) sits at 173,133 409x431 and the
+ * equipment-slot panel underneath it occupies exactly the same rect. A player
+ * must not be able to walk the cursor onto that hidden panel, so the navigator
+ * has to know which of two equal rects is the one drawn last.
+ *
+ * The two cases this page family produces:
+ *   - same parent, e.g. three list panels 173,133 409x431 -- the detail layer
+ *     is appended at the END of the child list, so the higher index wins;
+ *   - different parents, e.g. the overlay is a child of the page layer while
+ *     the panel it covers is a child of the 1137x431 content frame -- the
+ *     shallower node wins, because the frame's whole subtree is drawn before
+ *     the overlay is pushed on top.
+ *
+ * Full-screen frames (1137x640, 1137x431) share rects with each other all the
+ * time and neither covers the other, so they are excluded from the test.
+ * ------------------------------------------------------------------------- */
+#define NAV_MAX_BOX 64
+typedef struct {
+  void *obj;
+  CtrlRect r;
+  int depth;      /* distance from the page container */
+  int idx;        /* index among its parent's children (paint order) */
+} NavBox;
+static NavBox nav_boxes[NAV_MAX_BOX];
+static unsigned char nav_box_hidden[NAV_MAX_BOX];
+static int nav_box_n;
+
+static void nav_gather_boxes(void *node, int depth, int idx) {
+  (void)idx;
+  if (!node || depth > 5 || !p_ctrl_count || !p_ctrl_child || !p_abs_rect)
+    return;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    const CtrlRect r = p_abs_rect(c);
+    /* FULL-SCREEN layers matter too: a stale popup layer is often a second
+     * 1137x640 container at the very same rect as the page itself, containing
+     * yes/no buttons from a box that is no longer on screen. It must be
+     * treated as a layer like any other panel, not skipped. */
+    if (r.w < 80 || r.h < 80) {
+      nav_gather_boxes(c, depth + 1, i);
+      continue;
+    }
+    if (nav_box_n < NAV_MAX_BOX) {
+      NavBox *b = &nav_boxes[nav_box_n++];
+      b->obj = c;
+      b->r = r;
+      b->depth = depth;
+      b->idx = i;
+    }
+    nav_gather_boxes(c, depth + 1, i);
+  }
+}
+
+/* a is drawn after b (and therefore covers it) */
+static int nav_box_above(const NavBox *a, const NavBox *b) {
+  if (a->depth != b->depth)
+    return a->depth < b->depth;
+  return a->idx > b->idx;
+}
+
+static int nav_same_rect(const CtrlRect *a, const CtrlRect *b) {
+  return a->x == b->x && a->y == b->y && a->w == b->w && a->h == b->h;
+}
+
+static void nav_mark_hidden(void) {
+  memset(nav_box_hidden, 0, sizeof(nav_box_hidden));
+  for (int i = 0; i < nav_box_n; i++)
+    for (int j = 0; j < nav_box_n; j++) {
+      if (i == j || !nav_same_rect(&nav_boxes[i].r, &nav_boxes[j].r))
+        continue;
+      if (nav_box_above(&nav_boxes[j], &nav_boxes[i])) {
+        nav_box_hidden[i] = 1;
+        break;
+      }
+    }
+}
+
+/* 1 when THIS control is fully behind another panel at the same rect. Matching
+ * on the object and not on the rect is what makes the top layer reachable:
+ * three list panels share one rect, and only the last of them is visible. */
+static int nav_ctrl_hidden(void *obj) {
+  for (int i = 0; i < nav_box_n; i++)
+    if (nav_box_hidden[i] && nav_boxes[i].obj == obj)
+      return 1;
+  return 0;
+}
+
+/* A bare layout strip: its rect is exactly the union of its children, so it
+ * only exists to place them (the 使用 / 登录快捷键 / 粉碎 group is one). The
+ * player never activates it, so it must not take a cursor stop of its own. */
+static int nav_is_layout_strip(void *c) {
+  const int n = (p_ctrl_count && p_ctrl_child) ? p_ctrl_count(c) : 0;
+  if (n < 2)
+    return 0;
+  const CtrlRect outer = p_abs_rect(c);
+  CtrlRect u;
+  int first = 1;
+  for (int i = 0; i < n; i++) {
+    void *k = p_ctrl_child(c, i);
+    if (!k)
+      continue;
+    const CtrlRect r = p_abs_rect(k);
+    if (r.w <= 0 || r.h <= 0)
+      continue;
+    if (first) {
+      u = r; first = 0;
+      continue;
+    }
+    if (r.x < u.x) { u.w += u.x - r.x; u.x = r.x; }
+    if (r.y < u.y) { u.h += u.y - r.y; u.y = r.y; }
+    if (r.x + r.w > u.x + u.w) u.w = r.x + r.w - u.x;
+    if (r.y + r.h > u.y + u.h) u.h = r.y + r.h - u.y;
+  }
+  if (first)
+    return 0;
+  const long dx = u.x - outer.x, dy = u.y - outer.y;
+  const long dw = (u.x + u.w) - (outer.x + outer.w);
+  const long dh = (u.y + u.h) - (outer.y + outer.h);
+  return dx >= -3 && dx <= 3 && dy >= -3 && dy <= 3 &&
+         dw >= -3 && dw <= 3 && dh >= -3 && dh <= 3;
+}
+
+/* Whether a control can actually answer a tap, decided by the engine's own
+ * event proc instead of by its size. A 399x52 bar, the 157x157 character
+ * figure and the 377x55 button strip all LOOK like targets but are plain
+ * containers / drawings; only ControlButton and ControlItem (and the quick
+ * slots) own a click handler. Without this the cursor stops on frames,
+ * captions and the character portrait. */
+static int nav_is_actionable(void *c) {
+  if (!p_ctrl_proc || !ctrl_button_proc || !ctrl_item_proc)
+    return 1;                /* symbols unavailable: keep the old behaviour */
+  const void *pr = p_ctrl_proc(c);
+  return pr == ctrl_button_proc || pr == ctrl_item_proc ||
+         (ctrl_skill_proc && pr == ctrl_skill_proc);
+}
+
+static void nav_collect_items(void *node, int depth) {
+  if (!node || depth > 6 || !p_ctrl_count || !p_ctrl_child || !p_abs_rect)
+    return;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    const CtrlRect r = p_abs_rect(c);
+    /* a panel with the same rect as one drawn later is invisible */
+    if (nav_ctrl_hidden(c))
+      continue;
+    /* y >= 110 drops the tab row and the corner x; the size window drops
+     * full-width containers and tiny decorative quads. */
+    if (r.y >= 110 && r.w >= 40 && r.w <= 600 && r.h >= 30 && r.h <= 200 &&
+        !nav_is_layout_strip(c) && nav_is_actionable(c))
+      nav_add_item(&r, NAV_K_PLAIN, NAV_SHAPE_ROUNDRECT, 0);
+    nav_collect_items(c, depth + 1);
+  }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Skill icons.                                                              */
+/*                                                                           */
+/* The skill tree is a ControlScroll whose contents are NOT part of the root  */
+/* control tree. UISkill_SkillScrollDraw (0x162614) does this explicitly:     */
+/*                                                                           */
+/*     ldr  x0, [x22, #0x8a0]        ; UISkill's private icon group          */
+/*     loop i = 0 .. 14/16                                                    */
+/*         bl  ControlObject_GetChild(group, i)                              */
+/*         bl  ControlSkill_Draw(child)                                      */
+/*                                                                           */
+/* (the PLT slots resolve to those two symbols). ControlSkill_Draw then calls */
+/* the per-icon draw proc stored in data+0x10, which is UISkill_SkillDrawIcon */
+/* -- and that proc reads the child's ABSOLUTE rect. So the icons ARE real    */
+/* controls with real rects; they are simply drawn outside the normal tree    */
+/* walk, which is why nav_collect_items() never saw them and the pad cursor   */
+/* kept landing on the 82x42 column labels instead.                           */
+/*                                                                           */
+/* The group pointer is the global at vb+0x2b98a0 (adrp 0x2b9000 / ldr 0x8a0 */
+/* in UISkill_SkillScrollDraw). No screenshot coordinates and no guessed      */
+/* grid: every focus rect comes from ControlObject_GetAbsoluteRect.           */
+/* ------------------------------------------------------------------------- */
+#define UISKILL_ICON_GROUP_OFF 0x2b98a0
+
+/* The skill page is the only settings page with the three tall 46x118 side
+ * tabs (技能目录 / ...). A stale group pointer on another tab must not inject
+ * phantom icons, so confirm the shape in the live control tree first. */
+static void nav_count_side_tabs(void *node, int depth, int *n) {
+  if (!node || depth > 6 || !p_ctrl_count || !p_ctrl_child || !p_abs_rect)
+    return;
+  const int k = p_ctrl_count(node);
+  for (int i = 0; i < k; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    const CtrlRect r = p_abs_rect(c);
+    if (r.y >= 110 && r.w >= 40 && r.w <= 60 && r.h >= 100 && r.h <= 140 &&
+        nav_is_actionable(c))
+      (*n)++;
+    nav_count_side_tabs(c, depth + 1, n);
+  }
+}
+
+static int nav_collect_skill_icons(void *page) {
+  int side = 0;
+  nav_count_side_tabs(page, 0, &side);
+  unsigned char *vb = (unsigned char *)input_engine_virtbase();
+  void *g = vb ? (void *)probe_ptr((uintptr_t)vb + UISKILL_ICON_GROUP_OFF)
+               : NULL;
+  const int n = (g && p_ctrl_count) ? p_ctrl_count(g) : 0;
+  static int last_side = -1, last_n = -1;
+  if (side != last_side || n != last_n) {
+    last_side = side; last_n = n;
+    debugPrintf("skill: probe side=%d group=%p n=%d\n", side, g, n);
+  }
+  if (side < 2 || !g || !p_ctrl_child || !p_abs_rect || n < 9 || n > 32)
+    return 0;
+  const CtrlRect gr = p_abs_rect(g);
+  long vx = 0, vy = 0, vw = 0, vh = 0;
+  const int have_vp = ui_scroll_viewport(gr.x + gr.w / 2,
+                                        gr.y + gr.h / 2,
+                                        &vx, &vy, &vw, &vh);
+  /* ControlObject_GetAbsoluteRect normally already includes the group origin.
+   * If a build keeps the children group-relative, adding gr's origin is the
+   * only correction needed. Pick whichever makes the icon centres line up
+   * with the scroll viewport -- a consistency test, not a pixel guess. */
+  int shift = 0;
+  if (have_vp) {
+    int s0 = 0, s1 = 0;
+    for (int i = 0; i < n; i++) {
+      void *c = p_ctrl_child(g, i);
+      if (!c)
+        continue;
+      const CtrlRect r = p_abs_rect(c);
+      if (r.w < 40 || r.w > 140 || r.h < 40 || r.h > 140 ||
+          r.w * 2 < r.h || r.h * 2 < r.w)
+        continue;
+      const long cy = r.y + r.h / 2;
+      if (cy >= vy - 80 && cy <= vy + vh + 80) s0++;
+      if (cy + gr.y >= vy - 80 && cy + gr.y <= vy + vh + 80) s1++;
+    }
+    shift = s1 > s0;
+  }
+  int added = 0;
+  for (int i = 0; i < n; i++) {
+    void *c = p_ctrl_child(g, i);
+    if (!c)
+      continue;
+    CtrlRect r = p_abs_rect(c);
+    if (shift) {
+      r.x += gr.x;
+      r.y += gr.y;
+    }
+    if (r.w < 40 || r.w > 140 || r.h < 40 || r.h > 140 ||
+        r.w * 2 < r.h || r.h * 2 < r.w)
+      continue;
+    if (have_vp) {
+      /* only the left-hand skill viewport: icons may be scrolled out of it,
+       * but their x must stay inside that column */
+      const long cx = r.x + r.w / 2;
+      if (cx < vx - r.w || cx > vx + vw + r.w)
+        continue;
+    }
+    nav_add_item(&r, NAV_K_SKILL, NAV_SHAPE_CIRCLE, 0);
+    added++;
+  }
+  static int logs;
+  if (logs < 12 && (added || logs < 3)) {
+    logs++;
+    void *c0 = p_ctrl_child(g, 0);
+    const CtrlRect r0 = c0 ? p_abs_rect(c0) : (CtrlRect){ 0, 0, 0, 0 };
+    debugPrintf("skill: group=%p n=%d rect %ld,%ld %ldx%ld vp %ld,%ld %ldx%ld "
+                "shift=%d side=%d first %ld,%ld %ldx%ld -> %d icons\n",
+                g, n, gr.x, gr.y, gr.w, gr.h, vx, vy, vw, vh, shift, side,
+                r0.x, r0.y, r0.w, r0.h, added);
+  }
+  return added;
+}
+
+static void nav_collect_shadow(void *node, int depth) {
+  if (!node || depth > 6 || !p_ctrl_count || !p_ctrl_child || !p_abs_rect)
+    return;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    const CtrlRect r = p_abs_rect(c);
+    /* exactly the two shapes nx_TouchHandle_Event::is_save_page_hit drops */
+    if ((r.w >= 600 && r.w <= 660 && r.h >= 140 && r.h <= 160) ||
+        (r.w >= 60 && r.w <= 75 && r.h >= 60 && r.h <= 75 && r.x >= 780))
+      nav_add_shadow(&r);
+    nav_collect_shadow(c, depth + 1);
+  }
+}
+
+static void nav_scan(void) {
+  nav_page_obj = nav_tab_obj = NULL;
+  nav_tabs_n = nav_items_n = nav_shadow_n = 0;
+  memset(nav_tab_objs, 0, sizeof(nav_tab_objs));
+  memset(&nav_back_item, 0, sizeof(nav_back_item));
+  int kind = NAV_PAGE_NONE;
+  unsigned char *b = (unsigned char *)input_engine_virtbase();
+  void *root = b ? (void *)probe_ptr((uintptr_t)b + 0x2b4140) : NULL;
+  if (root && p_ctrl_count && p_ctrl_child && p_abs_rect) {
+    nav_pages_n = 0;
+    nav_find_pages(root, 0);
+    /* last recognisable full-screen layer wins: the class screen is pushed
+     * ON TOP of the save list, which is pushed on top of the title. */
+    for (int i = nav_pages_n - 1; i >= 0; i--) {
+      const int k = nav_page_kind_of(nav_pages[i]);
+      if (k != NAV_PAGE_NONE) {
+        nav_page_obj = nav_pages[i];
+        kind = k;
+        break;
+      }
+    }
+    if (nav_page_obj) {
+      if (kind == NAV_PAGE_SETTINGS) {
+        nav_tab_obj = nav_find_tabbar(nav_page_obj, 0);
+        if (nav_tab_obj) {
+          const int tn = p_ctrl_count(nav_tab_obj);
+          for (int i = 0; i < tn && nav_tabs_n < NAV_MAX_TABS; i++) {
+            void *c = p_ctrl_child(nav_tab_obj, i);
+            if (!c)
+              continue;
+            const CtrlRect r = p_abs_rect(c);
+            if (r.w < 60 || r.w > 140 || r.h < 60 || r.h > 140)
+              continue;
+            nav_tab_objs[nav_tabs_n] = c;
+            NavItem *it = &nav_tabs_buf[nav_tabs_n++];
+            it->x = r.x; it->y = r.y; it->w = r.w; it->h = r.h;
+            it->tx = r.x + r.w / 2; it->ty = r.y + r.h / 2;
+            it->kind = NAV_K_TAB; it->row = 0;
+            it->col = (unsigned char)i; it->shape = NAV_SHAPE_CIRCLE;
+          }
+          /* Work out which panels are behind an identical-rect panel BEFORE
+           * collecting, so the cursor cannot reach what the overlay hides. */
+          nav_box_n = 0;
+          /* Layer -1 is the page container itself. Any child at the same
+           * 1137x640 rect is a later layer (typically a stale yes/no popup)
+           * and is therefore treated as hidden. */
+          if (p_abs_rect) {
+            const CtrlRect pr = p_abs_rect(nav_page_obj);
+            nav_boxes[0] = (NavBox){ nav_page_obj, pr, -1, 0 };
+            nav_box_n = 1;
+          }
+          nav_gather_boxes(nav_page_obj, 0, 0);
+          nav_mark_hidden();
+          /* icons first: their index is stable across scroll rebuilds
+           * (child order), and nav_default_index() picks the first one */
+          nav_collect_skill_icons(nav_page_obj);
+          nav_collect_items(nav_page_obj, 0);
+        }
+      } else {
+        if (kind == NAV_PAGE_CLASS)
+          nav_collect_shadow(root, 0);
+        nav_collect_page(nav_page_obj, 0, kind);
+      }
+    }
+  }
+  /* A page with no collected controls is still a page: the tabs are there,
+   * so L/R must keep working. Requiring nav_items_n > 0 used to switch the
+   * navigator off on the task-detail tab and leak R into quick_swap_fire(). */
+  const int present = kind != NAV_PAGE_NONE &&
+                      (kind != NAV_PAGE_SETTINGS || nav_tabs_n > 0);
+  /* A tab switch rebuilds the page; tolerate a few empty frames instead of
+   * dropping the navigator (which would kick the user back to the title focus
+   * box in the middle of a page change). */
+  static int nav_miss;
+  if (!present && nav_miss < 8) {
+    nav_miss++;
+    return;
+  }
+  if (present)
+    nav_miss = 0;
+  /* The engine gives every rebuilt page layer a fresh control id. Pass it in
+   * the (now unused) stat_mode slot so input.c can tell "the tab tap really
+   * rebuilt the page" from "the engine ignored it and only our cursor moved". */
+  const int page_id = (present && nav_page_obj && p_ctrl_id)
+                         ? (int)p_ctrl_id(nav_page_obj) : 0;
+  input_set_nav(present, nav_tabs_buf, nav_tabs_n, nav_items_buf,
+                nav_items_n, page_id,
+                present ? kind : NAV_PAGE_NONE, &nav_back_item);
+  static int last_state = -1, last_kind = -1, last_n = -1, last_id = -1;
+  if (present != last_state || kind != last_kind ||
+      nav_items_n != last_n || page_id != last_id) {
+    last_state = present;
+    last_kind = kind;
+    last_n = nav_items_n;
+    last_id = page_id;
+    int hidden = 0;
+    for (int i = 0; i < nav_box_n; i++)
+      hidden += nav_box_hidden[i];
+    debugPrintf("nav: page %s kind %d id %d (%d tabs, %d controls, "
+                "%d shadow rows, %d panels, %d hidden)\n",
+                present ? "up" : "gone", kind, page_id,
+                nav_tabs_n, nav_items_n, nav_shadow_n,
+                nav_box_n, hidden);
+    for (int i = 0; i < nav_items_n && i < 24; i++)
+      debugPrintf("nav:   [%d] %4ld,%4ld %4ldx%-4ld kind %d\n", i,
+                  nav_items_buf[i].x, nav_items_buf[i].y,
+                  nav_items_buf[i].w, nav_items_buf[i].h,
+                  nav_items_buf[i].kind);
+  }
+}
+
+static void hud_tick(void) {
+  static int frames;
+  quick_layout_frame();          /* every frame, not just the scan frames */
+  static int nav_frames;
+  if (++nav_frames % 4 == 0)
+    nav_scan();                  /* a tap rebuilds the page within 4 frames */
+  if (++frames % 30)
+    return;
+  if (!quick_parsed)
+    quick_layout_parse();
+  unsigned char *b = (unsigned char *)input_engine_virtbase();
+  void *root = b ? (void *)probe_ptr((uintptr_t)b + 0x2b4140) : NULL;
+  if (!root)
+    return;
+  hud_nodes = 0;
+  hud_hide_count = 0;
+  g_ui_page_open = 0;
+  quick_assign_slot = 0;
+  input_hud_begin();
+  hud_scan_node(root, 0);
+  input_hud_end();
+  /* The rects only arm the blit filter after HUD mode is confirmed, so a menu
+   * page that reuses these ids keeps drawing its own buttons. */
+  if (!input_hud_present())
+    hud_hide_count = 0;
+  else if (hud_hide_count < (int)(sizeof(hud_hide_rects) /
+                                  sizeof(*hud_hide_rects))) {
+    hud_hide_rects[hud_hide_count++] = hud_pad_zone;
+  }
+  static int logs;
+  if (logs < 3 && hud_hide_count > 0) {
+    logs++;
+    debugPrintf("ui: %d pad-bound HUD controls hidden at the blit\n",
+                hud_hide_count);
+  }
+}
+
+/* RETIRED: a rectangle-based "hide everything in the pad corner" filter.
+ *
+ * This used to drop any blit whose destination landed inside the virtual pad's
+ * rectangles. That is not "don't draw the wheel" -- it is a crude mask over a
+ * screen region, and it deleted the inventory's equipment icons, map art and
+ * page decorations that happen to share those coordinates. The wheel is now
+ * suppressed at its source in nx_grpx_draw_part() (VK_DRAW_LO..VK_DRAW_HI),
+ * so no blit anywhere is ever dropped by position.
+ *
+ * Kept as a no-op so the three call sites stay untouched and easy to remove
+ * later. */
+static int hud_blit_hidden(long x, long y, long w, long h, unsigned direct) {
+  (void)x; (void)y; (void)w; (void)h; (void)direct;
+  return 0;
+}
+
 
 static void dump_control(void *obj) {
   if (!obj || obj_lines > 220)
@@ -2836,6 +4640,85 @@ static int colevent_forwarding;
 static long nx_ControlObject_EventProc(void *obj, long code, void *data,
                                        long extra) {
   colevent_depth++;
+  /* Page tabs first. A stale detail panel on the backpack tab covers the left
+   * half of the tab row and eats the press before the tab bar is reached. */
+  if (colevent_depth == 1 && !colevent_forwarding && data &&
+      (code == 0x17 || code == 0x18 || code == 0x19)) {
+    const long *tp = (const long *)data;
+    void *tab_obj = ui_tab_control_at(tp[0], tp[1]);
+    if (tab_obj) {
+      colevent_forwarding = 1;
+      const long trr = colevent_real
+                           ? colevent_real(tab_obj, code, data, extra) : 0;
+      colevent_forwarding = 0;
+      static int tablogs;
+      if (tablogs < 20) {
+        tablogs++;
+        debugPrintf("ui: tab code %04lx at (%ld,%ld) -> %p rc %ld\n",
+                    code, tp[0], tp[1], tab_obj, trr);
+      }
+      colevent_depth--;
+      return trr;
+    }
+  }
+  /* input.c lets a real touch through when it lands on one of the six quick
+   * buttons, even inside the blocked d-pad / action-disc rects. Hand that tap
+   * straight to the button's own control object: the normal tree walk would
+   * reach the virtual stick or the action disc first, and those two must NOT
+   * answer screen touches (they are driven by the pad on their objects).
+   * Prefer the shortcut-assign page's own slots while that page is up. */
+  if (colevent_depth == 1 && !colevent_forwarding && data &&
+      (code == 0x17 || code == 0x18 || code == 0x19) &&
+      cfg.quick_layout && quick_pos_ok) {
+    const long *pt = (const long *)data;
+    for (int s = 0; s < 6; s++) {
+      if (pt[0] < quick_pos[s][0] || pt[0] >= quick_pos[s][0] + 80 ||
+          pt[1] < quick_pos[s][1] || pt[1] >= quick_pos[s][1] + 80)
+        continue;
+      void *target = quick_objs[6 + s];
+      if (!target || !probe_mem_ok(target, 0x38))
+        target = quick_objs[s];
+      if (target && probe_mem_ok(target, 0x38)) {
+        colevent_forwarding = 1;
+        const long qr = colevent_real ? colevent_real(target, code, data, extra)
+                                     : 0;
+        colevent_forwarding = 0;
+        static int logs;
+        if (logs < 16) {
+          logs++;
+          debugPrintf("ui: quick slot %d code %04lx at (%ld,%ld) -> %p rc %ld\n",
+                      s, code, pt[0], pt[1], target, qr);
+        }
+        colevent_depth--;
+        return qr;
+      }
+      break;
+    }
+  }
+  /* UIChoice option rows live in the engine's own globals, not in the branch
+   * of the control tree TouchHandle reaches first. Hand their taps straight
+   * to the row control (same direct dispatch as the six quick slots), or the
+   * whole tree walk comes back empty and "点击无反应" is the result. */
+  if (colevent_depth == 1 && !colevent_forwarding && data &&
+      (code == 0x17 || code == 0x18 || code == 0x19)) {
+    const long *cpt = (const long *)data;
+    void *choice_obj = NULL;
+    const int crow = ui_choice_button(cpt[0], cpt[1], &choice_obj);
+    if (crow != -1 && choice_obj) {   /* >=0 = row, -2 = content control */
+      colevent_forwarding = 1;
+      const long cr = colevent_real
+                          ? colevent_real(choice_obj, code, data, extra) : 0;
+      colevent_forwarding = 0;
+      static int clogs;
+      if (clogs < 24) {
+        clogs++;
+        debugPrintf("ui: choice row %d code %04lx at (%ld,%ld) -> %p rc %ld\n",
+                    crow, code, cpt[0], cpt[1], choice_obj, cr);
+      }
+      colevent_depth--;
+      return cr;
+    }
+  }
   long r = colevent_real ? colevent_real(obj, code, data, extra) : 0;
   /* The description panel (the right-hand side of the skill / item windows) is
    * a SIBLING of the window's big content panel, and that panel's rectangle is
@@ -3180,7 +5063,7 @@ have_root:;
     (void)row_under(root, rx, ry, 0);
   }
   static int logs;
-  if (logs < 200) {
+  if (logs < 400) {
     logs++;
     unsigned char *lb = (unsigned char *)input_engine_virtbase();
     const void *live = lb ? (void *)probe_ptr((uintptr_t)lb + 0x2b4140) : NULL;
@@ -4555,6 +6438,112 @@ void nx_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
   const unsigned idx = frame_draw_index++;
   if (cfg.draw_skip > 0 && idx < (unsigned)cfg.draw_skip)
     return;                      /* A/B: leave this layer out entirely */
+  /* The lit pad ring -- the gold rune circle with two torches in the lower
+   * left, centred on the stick's press point (user screenshot 19:45) -- is a
+   * bare textured quad from UIPlayPorting_Draw (log: -3,376 278x276 tex 27,
+   * alpha 0.70, blit 0x15c014). The blit-level filter never catches it:
+   * GRPX_DrawPart's mode offsets / parameter layout mean hud_blit_hidden is
+   * given a different rectangle from the vertices that actually reach GL.
+   * Filter here instead, on the real vertices. Only quads the HUD itself asked
+   * for and only inside the corner the pad owns: the map and the monsters behind
+   * the pad come from other callers and keep their quads. */
+  if (cfg.hide_pad_zone && input_hud_present() && vptr && count >= 3 &&
+      count <= 64 && g_blit_caller >= HUD_DRAW_LO &&
+      g_blit_caller < HUD_DRAW_HI) {
+    const int comps = vsize > 1 ? vsize : 2;
+    const int vsz = (vtype == GL_SHORT) ? 2 : 4;
+    const int vstep = vstride ? vstride : comps * vsz;
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    for (GLsizei i = 0; i < count; i++) {
+      const unsigned char *q =
+          (const unsigned char *)vptr + (size_t)(first + i) * vstep;
+      float vx = 0, vy = 0;
+      if (vtype == GL_FLOAT) { vx = ((const float *)q)[0]; vy = ((const float *)q)[1]; }
+      else if (vtype == GL_SHORT) { vx = ((const short *)q)[0]; vy = ((const short *)q)[1]; }
+      else if (vtype == GL_FIXED) { vx = (float)((const int32_t *)q)[0]/65536.0f; vy = (float)((const int32_t *)q)[1]/65536.0f; }
+      else { vx = (float)((const int32_t *)q)[0]; vy = (float)((const int32_t *)q)[1]; }
+      if (vx < x0) x0 = vx;
+      if (vx > x1) x1 = vx;
+      if (vy < y0) y0 = vy;
+      if (vy > y1) y1 = vy;
+    }
+    if (hud_overlaps(&hud_pad_zone, (long)x0, (long)y0, (long)(x1 - x0),
+                     (long)(y1 - y0))) {
+      static int logs;
+      if (logs < 12) {
+        logs++;
+        debugPrintf("pad: dropped lit ring %.0f,%.0f %.0fx%.0f caller 0x%x\n",
+                    x0, y0, x1 - x0, y1 - y0, g_blit_caller);
+      }
+      return;
+    }
+  }
+  /* Pad-zone probe (cfg.pad_probe).
+   *
+   * The pad's own art is dropped at the blit, yet a golden halo still lights up
+   * in that corner while the stick is held -- and no blit in the corner is left
+   * to blame (hud_blit_hidden logs every keeper, and it is not among them). So
+   * the halo is not a texture part at all: it is submitted as a bare quad.
+   * This logs every quad that lands in the pad zone while a direction is being
+   * driven, with its texture and the caller, which is what names the source.
+   * pad_probe = 2 additionally drops them, as an A/B ("does the halo go away,
+   * and what else does"). */
+  if (cfg.pad_probe && vptr && count >= 3 && count <= 64 &&
+      input_hud_present() && input_pad_held()) {
+    const int comps = vsize > 1 ? vsize : 2;
+    const int vsz = (vtype == GL_SHORT) ? 2 : 4;
+    const int vstep = vstride ? vstride : comps * vsz;
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    for (GLsizei i = 0; i < count; i++) {
+      const unsigned char *q =
+          (const unsigned char *)vptr + (size_t)(first + i) * vstep;
+      float vx = 0, vy = 0;
+      if (vtype == GL_FLOAT) { vx = ((const float *)q)[0]; vy = ((const float *)q)[1]; }
+      else if (vtype == GL_SHORT) { vx = ((const short *)q)[0]; vy = ((const short *)q)[1]; }
+      else if (vtype == GL_FIXED) { vx = (float)((const int32_t *)q)[0]/65536.0f; vy = (float)((const int32_t *)q)[1]/65536.0f; }
+      else { vx = (float)((const int32_t *)q)[0]; vy = (float)((const int32_t *)q)[1]; }
+      if (vx < x0) x0 = vx;
+      if (vx > x1) x1 = vx;
+      if (vy < y0) y0 = vy;
+      if (vy > y1) y1 = vy;
+    }
+    if (hud_overlaps(&hud_pad_zone, (long)x0, (long)y0, (long)(x1 - x0),
+                     (long)(y1 - y0))) {
+      GLint pt = 0;
+      GLfloat pc[4] = { 0, 0, 0, 0 };
+      glGetIntegerv(GL_TEXTURE_BINDING_2D, &pt);
+      glGetFloatv(GL_CURRENT_COLOR, pc);
+      static struct { int x, y, w, h, t; } pseen[24];
+      static int pn;
+      int dup = 0;
+      for (int k = 0; k < pn; k++)
+        if (pseen[k].x == (int)x0 && pseen[k].y == (int)y0 &&
+            pseen[k].w == (int)(x1 - x0) && pseen[k].h == (int)(y1 - y0) &&
+            pseen[k].t == (int)pt) {
+          dup = 1;
+          break;
+        }
+      if (!dup && pn < (int)(sizeof(pseen) / sizeof(*pseen))) {
+        pseen[pn].x = (int)x0;
+        pseen[pn].y = (int)y0;
+        pseen[pn].w = (int)(x1 - x0);
+        pseen[pn].h = (int)(y1 - y0);
+        pseen[pn].t = (int)pt;
+        pn++;
+        debugPrintf("padgl: %.0f,%.0f %.0fx%.0f tex %d %s col %.2f %.2f %.2f "
+                    "%.2f blend %d n=%d ra 0x%x blit 0x%x\n",
+                    x0, y0, x1 - x0, y1 - y0, (int)pt,
+                    text_is_our_texture((unsigned)pt) ? "OURS" : "engine",
+                    pc[0], pc[1], pc[2], pc[3], (int)glIsEnabled(GL_BLEND),
+                    (int)count,
+                    (unsigned)((uintptr_t)__builtin_return_address(0) -
+                               (uintptr_t)game_mod.load_virtbase),
+                    g_blit_caller);
+      }
+      if (cfg.pad_probe >= 2 && !text_is_our_texture((unsigned)pt))
+        return;                  /* A/B: leave the halo out */
+    }
+  }
   /* How a filled string-image atlas is actually drawn: the rectangle, the
    * colour the engine multiplies it by and whether blending is on. Black on a
    * black plate is the difference between "the glyphs never made it into the
@@ -6483,6 +8472,18 @@ static unsigned long nx_grpx_draw_string(unsigned long a0, unsigned long a1,
                   dialog_name ? " (dialog name)" : "");
     }
   }
+  /* Equipment / character page footer: "Lv. 4 <class>" arrives as ONE string
+   * (log: dlg: grpx y508 x314 px20 col 684f30ff). The engine leaves it in a
+   * near-invisible dark brown and anchors it on the plate bottom. The player
+   * first asked for half a line up (-10px at px=20) and then eased it back
+   * down 5px, so the final offset is -5. Match this line only: the character
+   * page's separate "Lv. 4" and class labels sit at y~228/253 and are already
+   * gold through is_gold_text. */
+  if (!strncmp(str, "Lv.", 3) && strlen(str) > 8 && (int)a2 >= 470 &&
+      (int)a2 <= 560 && draw_x >= 200 && draw_x <= 450) {
+    color = 0xC6B992FFu;
+    draw_y -= 5;
+  }
   plate_probe("grpx", str, draw_x, draw_y, color);
   {
     /* character page: short strings in its left/centre columns */
@@ -6541,6 +8542,7 @@ static const so_override mercury_overrides[] = {
   { "MW_Graphic_DrawString",               (void *)probe_mw },
   { "CS_grpDrawString",                    (void *)probe_cs },
   { "GRPX_DrawSubStringWithFont2",         (void *)nx_sub_string },
+  { "GRPX_SetFontColor",                   (void *)nx_grpx_set_font_color },
   { "SGL_GetTextSize",                     (void *)nx_get_text_size },
   { "SGL_GetTextSizeInRect",               (void *)nx_get_text_size_in_rect },
   { "SGL_grpDrawStringWithFont",           (void *)nx_grp_draw_string },
@@ -6822,6 +8824,8 @@ static const so_override res_overrides[] = {
    * entry, and failing it left the input tree in a dead state). Keeping the
    * red-slot behaviour instead and faking the reply at the callback level. */
   { "SGL_DrawTexturePartEx",              (void *)drawpart_logged },
+  { "GRPX_DrawPart",                      (void *)nx_grpx_draw_part },
+  { "GRPX_DrawPartFlip",                  (void *)nx_grpx_draw_part_flip },
   { "TouchHandle_Event",                  (void *)nx_TouchHandle_Event },
   { "ControlObject_EventProc",            (void *)nx_ControlObject_EventProc },
   { "jGetUserDir",                        (void *)userdir_logged },
@@ -6915,6 +8919,8 @@ int main(int argc, char **argv) {
   fsopen_real = (void *)so_try_find_addr_rx(&game_mod, "CS_fsOpen");
   res_load_real = (void *)so_try_find_addr_rx(&game_mod, "RES_LoadToPool");
   drawpart_real = (void *)so_try_find_addr_rx(&game_mod, "SGL_DrawTexturePartEx");
+  grpx_draw_part_flip_real =
+      (void *)so_try_find_addr_rx(&game_mod, "GRPX_DrawPartFlip");
   popup_free_fn = (void (*)(void))so_try_find_addr_rx(&game_mod, "UIPopupMsg_Free");
   touch_delete_ctl = (void (*)(void *))so_try_find_addr_rx(&game_mod,
                                                           "TouchHandle_DeleteControl");
@@ -7098,8 +9104,39 @@ int main(int argc, char **argv) {
                                                     "ControlObject_GetCount");
   p_ctrl_proc = (fn_ctrl_proc)so_try_find_addr_rx(&game_mod,
                                                   "ControlObject_GetProc");
+  /* the shortcut-assign page's slot proc -- its control ids are dynamic */
+  shortcut_proc = (void *)so_try_find_addr_rx(
+      &game_mod, "UIShortcutMenu_Shortcut_EventProc");
+  debugPrintf("quick: shortcut-assign event proc %p\n", shortcut_proc);
+  ctrl_button_proc = (void *)so_try_find_addr_rx(&game_mod,
+                                                 "ControlButton_EventProc");
+  ctrl_scroll_proc = (void *)so_try_find_addr_rx(&game_mod,
+                                                 "ControlScroll_EventProc");
+  ctrl_item_proc = (void *)so_try_find_addr_rx(&game_mod,
+                                               "ControlItem_EventProc");
+  ctrl_skill_proc = (void *)so_try_find_addr_rx(&game_mod,
+                                                "UIPlay_SkillEventProc");
+  ctrl_menu_sub_proc = (void *)so_try_find_addr_rx(&game_mod,
+                                                   "UIGameMenu_SubEvent");
+  debugPrintf("ui: confirm procs button=%p scroll=%p item=%p skill=%p "
+              "menusub=%p\n", ctrl_button_proc, ctrl_scroll_proc,
+              ctrl_item_proc, ctrl_skill_proc, ctrl_menu_sub_proc);
   p_delete_child = (void (*)(void *, void *))so_try_find_addr_rx(
       &game_mod, "ControlObject_DeleteChild");
+  /* keep the engine's GRPX_DrawPart so the HUD blit filter can see its caller */
+  grpx_draw_part_real = (void (*)(void *, long, long, void *, long, long,
+                                  long))so_try_find_addr_rx(&game_mod,
+                                                            "GRPX_DrawPart");
+  /* so_try_find_addr_rx reads the ELF symbol table, not the GOT slot that
+   * so_set_overrides() patches, so this is still the ORIGINAL function; the
+   * story font-colour hook forwards every caller to it unchanged. */
+  grp_set_font_color_real = (void (*)(unsigned long))so_try_find_addr_rx(
+      &game_mod, "GRPX_SetFontColor");
+  debugPrintf("main: story font colour hook real=%p\n",
+              (void *)grp_set_font_color_real);
+  debugPrintf("main: hud blit filter %s (draw part %p)\n",
+              grpx_draw_part_real ? "ready" : "no GRPX_DrawPart",
+              (void *)grpx_draw_part_real);
   debugPrintf("main: slot flow trace exit=%p map=%p list=%p popup=%p\n",
               (void *)flow_exit_saveslot_real, (void *)flow_map_load_real,
               (void *)flow_create_list_real, (void *)flow_popup_info_real);
@@ -7173,6 +9210,8 @@ int main(int argc, char **argv) {
   /* now that the module is mapped at its final address, the engine's own
    * globals are readable */
   input_set_base((void *)game_mod.load_virtbase);
+  /* text.c reads the engine's own $X colour-code table at +0xbb9c8 */
+  text_set_engine_base((void *)game_mod.load_virtbase);
   so_flush_caches(&game_mod);
   if (hercules_loaded) {
     so_finalize(&herc_mod);
@@ -7216,6 +9255,173 @@ int main(int argc, char **argv) {
 static void http_connect_bridge(int handle, int result) {
   if (fn_http_cb)
     fn_http_cb(fake_env, NULL, handle, result);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Settings-page pad cursor.                                                 */
+/*                                                                           */
+/* The original game marks the selected control with a WARM GOLD glow that   */
+/* follows the widget's own shape: a ring around the round tab medallions,   */
+/* a rounded/glowing frame hugging an item cell or a stat row. It is not a    */
+/* square yellow box. Reproduce it as three concentric bands of a shape-     */
+/* conforming outline (wide amber halo -> orange gold -> near-white gold)    */
+/* drawn ~3 px outside the control's own rect.                              */
+/*                                                                           */
+/* Everything is scissored clears: no textures, no vertex arrays, no change  */
+/* to the engine's ES 1.1 pipeline state except the clear colour, which is   */
+/* restored. The rect comes from ControlObject_GetAbsoluteRect, never from a  */
+/* screenshot measurement.                                                  */
+/* ------------------------------------------------------------------------- */
+static void nav_clear_rect(int x, int y, int w, int h) {
+  if (w <= 0 || h <= 0)
+    return;
+  glScissor(x, y, w, h);
+  glClear(GL_COLOR_BUFFER_BIT);
+}
+
+/* Focus indicator without a frame: a small solid arrow just OUTSIDE the
+ * focused control's left edge. A bright arrow with a dark backing stays
+ * legible over both dark inventory cells and light dialog panels, and it
+ * never covers the control's own art. Seven scanlines make a > shape.
+ * No gold, no outline, no glow -- the user explicitly removed those. */
+static void nav_focus_marker(long nx, long ny, long nw, long nh) {
+  const float kx = (float)cfg.screen_width / 1137.0f;
+  const float ky = (float)cfg.screen_height / 640.0f;
+  int x = (int)(nx * kx) - 16;
+  if (x < 2)
+    x = 2;
+  const int cy = (int)((ny + nh / 2) * ky);
+  const int H = cfg.screen_height;
+  glEnable(GL_SCISSOR_TEST);
+  for (int pass = 0; pass < 2; pass++) {
+    /* pass 0: dark backing, pass 1: bright arrow */
+    if (pass)
+      glClearColor(1.0f, 1.0f, 0.92f, 1.0f);
+    else
+      glClearColor(0.05f, 0.05f, 0.05f, 1.0f);
+    for (int r = 0; r < 9; r++) {
+      const int t = r < 4 ? r : 8 - r;
+      const int w = 2 + t * 3 + (pass ? 0 : 3);
+      const int yy = cy - 9 + r * 2;
+      const int gy = H - yy - 2;
+      if (gy >= 0)
+        nav_clear_rect(x + (pass ? 3 : 0), gy, w, 2);
+    }
+  }
+  glDisable(GL_SCISSOR_TEST);
+  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+/* Crosshair for the free-cursor mode: dark backing + bright thin cross.
+ * Screen pixels already, so flip y for glScissor like every other overlay. */
+static void nav_cursor_mark(int x, int y) {
+  const int gy = cfg.screen_height - y;
+  glEnable(GL_SCISSOR_TEST);
+  for (int pass = 0; pass < 2; pass++) {
+    if (pass)
+      glClearColor(1.0f, 1.0f, 0.92f, 1.0f);
+    else
+      glClearColor(0.05f, 0.05f, 0.05f, 1.0f);
+    const int o = pass ? 1 : 0;
+    const int t = pass ? 2 : 4;
+    nav_clear_rect(x - 9 + o, gy - 1 + o, 18, t);
+    nav_clear_rect(x - 1 + o, gy - 9 + o, t, 18);
+  }
+  glDisable(GL_SCISSOR_TEST);
+  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+static void __attribute__((unused)) nav_gold_cursor(long nx, long ny, long nw, long nh, int shape) {
+  /* grow = how far OUTSIDE the control this band sits, th = band width
+   * measured inwards. Painting wide/dark first and narrow/bright last leaves
+   * an amber halo outside, an orange-gold band and a bright gold line right
+   * on the control's own edge -- the ordering the original art uses. */
+  struct NavBand { int grow, th; float r, g, b; };
+  static const struct NavBand band[] = {
+    { 5, 6, 0.46f, 0.22f, 0.04f },  /* outer amber halo  */
+    { 2, 4, 0.96f, 0.64f, 0.16f },  /* orange-gold band  */
+    { 0, 3, 1.00f, 0.95f, 0.74f },  /* bright inner line */
+  };
+  /* The title oval is flat and its art has no padding to spare: a 5 px halo
+   * around a 70 px tall ellipse would look bigger than the button again. */
+  static const struct NavBand eband[] = {
+    { 2, 4, 0.46f, 0.22f, 0.04f },
+    { 1, 3, 0.96f, 0.64f, 0.16f },
+    { 0, 2, 1.00f, 0.95f, 0.74f },
+  };
+  /* Scale the two axes independently. The layout is 1137x640 and the console
+   * renders 1280x720, but nothing guarantees the config keeps that aspect --
+   * one shared k stretched the highlight vertically against a horizontally
+   * stretched control, which is what made the band look thicker on top and
+   * bottom than along the long edges. */
+  const float kx = (float)cfg.screen_width / 1137.0f;
+  const float ky = (float)cfg.screen_height / 640.0f;
+  const int x0 = (int)(nx * kx), y0 = (int)(ny * ky);
+  const int bw = (int)(nw * kx) + 1, bh = (int)(nh * ky) + 1;
+  /* A very flat control (the title buttons, 4.63:1) has no room to spare, so
+   * it takes the narrow bands; ordinary pills keep the thicker set. */
+  const int flat = shape == NAV_SHAPE_ELLIPSE ||
+                   (shape == NAV_SHAPE_PILL && bw > bh * 3);
+  const struct NavBand *bd = flat ? eband : band;
+  /* glScissor counts y from the bottom of the framebuffer; engine coords
+   * count from the top, so flip here (same as every other overlay). */
+  const int base_gy = cfg.screen_height - y0 - bh;
+  const float pi2 = 6.2831853f;
+
+  glEnable(GL_SCISSOR_TEST);
+  for (unsigned b = 0; b < sizeof(band) / sizeof(band[0]); b++) {
+    const int g = bd[b].grow, T = bd[b].th;
+    const int X = x0 - g, Y = base_gy - g;
+    const int W = bw + 2 * g, H = bh + 2 * g;
+    glClearColor(bd[b].r, bd[b].g, bd[b].b, 1.0f);
+    if (shape == NAV_SHAPE_CIRCLE || shape == NAV_SHAPE_ELLIPSE) {
+      /* round tab medallion / 能力点 "+" / the flat title oval. The title
+       * ellipse is much wider than tall, so it needs a denser sample to read
+       * as a continuous gold line instead of a dotted arc. */
+      const float cx = X + W / 2.0f, cy = Y + H / 2.0f;
+      const float rx = W / 2.0f - T / 2.0f, ry = H / 2.0f - T / 2.0f;
+      if (rx <= 0 || ry <= 0)
+        continue;
+      const int N = (shape == NAV_SHAPE_ELLIPSE) ? 220 : 72;
+      for (int i = 0; i < N; i++) {
+        const float a = pi2 * (float)i / (float)N;
+        nav_clear_rect((int)(cx + rx * cosf(a)) - T / 2,
+                       (int)(cy + ry * sinf(a)) - T / 2, T, T);
+      }
+    } else {
+      /* Rounded rectangle / pill: four straight runs + four quarter arcs.
+       * For a pill the radius is exactly half the band's height, which leaves
+       * a flat top and bottom edge and semicircular ends -- the shape the
+       * title buttons' art actually has. An ellipse sample instead bulges in
+       * the middle and pinches at the ends. */
+      int R = (shape == NAV_SHAPE_PILL) ? H / 2 : (W < H ? W : H) / 5;
+      if (R > W / 2) R = W / 2;
+      if (R > H / 2) R = H / 2;
+      if (R < 2) R = 2;
+      if (W - 2 * R > 0) {
+        nav_clear_rect(X + R, Y, W - 2 * R, T);
+        nav_clear_rect(X + R, Y + H - T, W - 2 * R, T);
+      }
+      if (H - 2 * R > 0) {
+        nav_clear_rect(X, Y + R, T, H - 2 * R);
+        nav_clear_rect(X + W - T, Y + R, T, H - 2 * R);
+      }
+      const float rr = (float)R - T / 2.0f;
+      /* 12 steps per quarter keeps the arc continuous for a small band on a
+       * long pill as well as for a 90 px medallion */
+      for (int q = 0; q < 4; q++) {
+        const float ccx = (q == 0 || q == 3) ? X + W - R : X + R;
+        const float ccy = (q < 2) ? Y + H - R : Y + R;
+        for (int i = 0; i <= 12; i++) {
+          const float a = (q + (float)i / 12.0f) * (pi2 / 4.0f);
+          nav_clear_rect((int)(ccx + rr * cosf(a)) - T / 2,
+                         (int)(ccy + rr * sinf(a)) - T / 2, T, T);
+        }
+      }
+    }
+  }
+  glDisable(GL_SCISSOR_TEST);
+  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
 }
 
 static void engine_main(void *arg) {
@@ -7412,6 +9618,7 @@ static void engine_main(void *arg) {
     g_frame_no++;
     /* atlas work for the previous frame; kept out of the draw callbacks */
     strimg_pending_tick();
+    hud_tick();          /* refresh HUD rects before the pad reads them */
     input_update();
     /* the description pages scroll through their own control; the finger travel
      * is fed to it here, before the engine draws the page this frame */
@@ -7561,6 +9768,20 @@ static void engine_main(void *arg) {
           hb_logs++;
           debugPrintf("ui: hitbox overlay drew %d boxes (k=%.3f)\n", drawn, k);
         }
+      }
+    }
+    /* One highlight, last device wins: right stick -> crosshair (for the
+     * scrollable skill tree / description pages), d-pad -> small arrow beside
+     * the focused control. nav_gold_cursor() stays unused. */
+    if (input_nav_active()) {
+      int cx, cy;
+      if (input_nav_cursor(&cx, &cy)) {
+        nav_cursor_mark(cx, cy);
+      } else {
+        long nx, ny, nw, nh;
+        int shape = NAV_SHAPE_ROUNDRECT;
+        if (input_nav_highlight(&nx, &ny, &nw, &nh, &shape))
+          nav_focus_marker(nx, ny, nw, nh);
       }
     }
     if (input_injection_active() && cfg.overlay) {

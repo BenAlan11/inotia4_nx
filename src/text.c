@@ -528,33 +528,51 @@ static TextCache *render(const char *utf8, int px, unsigned color) {
 static int viewport_w = 1280, viewport_h = 720;
 
 /* $<letter> colour codes. The engine's text database uses them to switch the
- * pen colour mid-sentence (see note_code above). We only ever *see* them on the
- * nx_grp_draw_string path; the string-image path hands us an already stripped
- * string, which is why the emphasis inside the hint line was lost. The table
- * maps the letters we have actually observed; an unknown letter switches back
- * to the default colour rather than leaking whatever was current. */
+ * pen colour mid-sentence. X_TEXTCTRL_GetColorFromCode (0x144f3c) reads a
+ * 25-entry table at module+0xbb9c8, indexed by (code - 'A'), each entry packed
+ * as (a<<24)|(b<<16)|(g<<8)|r -- the same RGBA byte order as the engine's
+ * other colours. Cross-checks: $R = 0xFF0000FF (red), $W = 0xFFFFFFFF (white),
+ * $B = 0xFF000000 (black), $S = 0xFFFFB400 (sky blue), $T = 0xFFFF7878.
+ *
+ * The port used to carry a hand-written 10-letter subset. Codes the game does
+ * use but that list omitted -- $T, $Q, $L, $O, $P, $V among them -- fell
+ * through to the base pen and read as white, which is the "emphasis colour
+ * disappeared" symptom. Read the engine's own table instead: one source of
+ * truth, all 25 letters, no guessing. Values are returned as 0xRRGGBBAA,
+ * which is what render() packs into the texture. */
+static unsigned char *g_engine_base;
+
+void text_set_engine_base(void *base) {
+  g_engine_base = (unsigned char *)base;
+}
+
 static unsigned colour_for_code(unsigned char id) {
+  if (id >= 'a' && id <= 'z')
+    id = (unsigned char)(id - 'a' + 'A');
+  /* $B is the CLOSING code ("...$S每日奖励$B。"). Its table entry is black;
+   * the port must return to the caller's own pen colour instead, so treat it
+   * as the "back to base" sentinel text_draw_rich_line understands. */
+  if (id == 'B')
+    return 0xFFFFFFFFu;
+  if (g_engine_base && id >= 'A' && id <= 'Y') {
+    const unsigned raw =
+        *(volatile unsigned *)(g_engine_base + 0xbb9c8u +
+                               4u * (unsigned)(id - 'A'));
+    const unsigned r = raw & 0xffu, g = (raw >> 8) & 0xffu;
+    const unsigned b = (raw >> 16) & 0xffu, a = (raw >> 24) & 0xffu;
+    return (r << 24) | (g << 16) | (b << 8) | a;
+  }
+  /* module not mapped yet -- keep the legacy subset so early text still draws */
   switch (id) {
-  /* B is the BASE colour, not blue: every emphasised span in the database is
-   * closed by "$B" ("...可以获得$S每日奖励$B。"), so it is what the sentence
-   * returns to. S is the emphasis the original draws in blue -- "每日奖励",
-   * the numbers in a skill description, the HP range on a potion. R is the
-   * red warning used for a missing skill point.
-   *
-   * These are plain 0xRRGGBBAA now. They used to be written for the swapped
-   * byte order render() produced (see the texel packing there), which is why
-   * "S" held 0xFF4080FF: blue on screen, pink in the value. */
-  case 'B': return 0xFFFFFFFFu;   /* base / default */
-  case 'A': return 0xFF4040FFu;   /* accent: the popup title, same red as R */
-  case 'S': return 0x4080FFFFu;   /* emphasis, blue */
-  case 'R': return 0xFF4040FFu;   /* red            */
-  case 'G': return 0x40FF40FFu;   /* green          */
-  case 'Y': return 0xFFFF40FFu;   /* yellow         */
-  case 'C': return 0x40FFFFFFu;   /* cyan           */
-  case 'M': return 0xFF40FFFFu;   /* magenta        */
-  case 'W': return 0xFFFFFFFFu;   /* white          */
-  case 'K': return 0x101010FFu;   /* black          */
-  default:  return 0xFFFFFFFFu;   /* unknown: back to the default pen */
+  case 'A': case 'R': return 0xFF4040FFu;
+  case 'S': return 0x4080FFFFu;
+  case 'G': return 0x40FF40FFu;
+  case 'Y': return 0xFFFF40FFu;
+  case 'C': return 0x40FFFFFFu;
+  case 'M': return 0xFF40FFFFu;
+  case 'W': return 0xFFFFFFFFu;
+  case 'K': return 0x101010FFu;
+  default:  return 0xFFFFFFFFu;
   }
 }
 
@@ -1236,14 +1254,24 @@ static void text_draw_rich_line(const char *utf8, int x, int y, int px,
       if ((id >= 'A' && id <= 'Z') || (id >= 'a' && id <= 'z')) {
         if (o > 0) {
           run[o] = 0;
+          {
+            static int run_logs;
+            if (run_logs < 24 && cur != base) {
+              run_logs++;
+              debugPrintf("rich: colour run col %08x '%s'\n", cur, run);
+            }
+          }
           text_draw_engine_line(run, pen, y, px, cur);
           pen += text_measure_at(run, px);
           o = 0;
         }
         note_code(id);
         cur = colour_for_code(id);
-        if (cur == 0xFFFFFFFFu)
-          cur = base;              /* $B returns to the caller's own colour */
+        /* Only the CLOSING code returns to the caller's pen. $W is genuinely
+         * white in the engine's table and must not be swallowed by the old
+         * "any 0xFFFFFFFF means base" rule. */
+        if (id == 'B' || id == 'b')
+          cur = base;
         p++;
         continue;
       }
