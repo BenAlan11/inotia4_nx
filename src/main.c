@@ -2368,6 +2368,9 @@ static void desc_scroll_tick(void) {
   }
 }
 
+/* defined with the GL text hooks further down */
+static int is_shop_hint(const char *s);
+
 static void nx_textctrl_draw(void *ctrl, int x, int y) {
   if (!ctrl || !probe_mem_ok(ctrl, 0x24))
     return;
@@ -2387,6 +2390,19 @@ static void nx_textctrl_draw(void *ctrl, int x, int y) {
     if (miss_logs < 6) {
       miss_logs++;
       debugPrintf("text: textctrl %p has no stored string\n", ctrl);
+    }
+    return;
+  }
+  /* THIS is where the daily-reward tip is actually painted (a TEXTCTRL2 whose
+   * string comes from tctrl_lookup), not nx_grp_draw_string. Skipping it also
+   * arms the wide backing-plate filter in nx_glDrawArrays for this frame and
+   * the next one (the plate is submitted before the glyphs). */
+  if (is_shop_hint(str)) {
+    g_shop_hint_cur = 1;
+    static int logs;
+    if (logs < 3) {
+      logs++;
+      debugPrintf("shop: daily-reward hint textctrl suppressed\n");
     }
     return;
   }
