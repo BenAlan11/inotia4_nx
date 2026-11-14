@@ -6,8 +6,19 @@ reachable, so the same objects are created through the Git data API instead:
 blobs -> trees -> commit -> ref. The result is a normal commit in the repo; a
 clone of it is identical to what `git push` would have produced.
 
+The push is INCREMENTAL: the remote branch's tree is listed first, and only
+paths whose blob differs are uploaded. The new tree is created with
+`base_tree` pointing at the old one, so untouched files are not re-sent.
+That matters here -- a handful of snapshot NROs and source zips are ~9 MB and
+~5.5 MB each, and re-uploading all of them over the proxy takes minutes.
+
+Blob contents always come from the git object store (`git cat-file blob`),
+never from the working tree, so what lands on the remote is exactly what the
+local commit points at even when files have unstaged edits.
+
 Usage:
     GH_TOKEN=... python tools/gh_push.py BenAlan11/inotia4_nx main
+    GH_TOKEN=... python tools/gh_push.py BenAlan11/inotia4_nx main --full
 """
 import base64
 import json
@@ -70,17 +81,17 @@ def index_entries():
     return rows
 
 
-def same_blob(sha):
-    """git already has the object, but GitHub needs the blob created there."""
-    return sha
+def blob_bytes(sha):
+    """Exact bytes of the git object -- not what the working tree holds now."""
+    return subprocess.run(["git", "cat-file", "blob", sha],
+                          capture_output=True, check=True).stdout
 
 
-def make_blob(path):
-    with open(path, "rb") as f:
-        raw = f.read()
+def make_blob(sha):
+    raw = blob_bytes(sha)
     payload = {"content": base64.b64encode(raw).decode(), "encoding": "base64"}
     r = call("POST", "/repos/%s/git/blobs" % REPO, payload)
-    return r["sha"]
+    return r["sha"], len(raw)
 
 
 def build_tree(entries, prefix=""):
@@ -99,42 +110,79 @@ def build_tree(entries, prefix=""):
     return r["sha"]
 
 
+def remote_state(branch):
+    """-> (commit_sha or None, root_tree_sha or None, {path: blob sha})"""
+    try:
+        head = call("GET", "/repos/%s/git/ref/heads/%s" % (REPO, branch))
+    except SystemExit:
+        return None, None, {}
+    sha = head.get("object", {}).get("sha")
+    if not sha:
+        return None, None, {}
+    commit = call("GET", "/repos/%s/git/commits/%s" % (REPO, sha))
+    root = commit["tree"]["sha"]
+    listing = call("GET", "/repos/%s/git/trees/%s?recursive=1" % (REPO, root))
+    if listing.get("truncated"):
+        print("warning: remote tree listing was truncated")
+    blobs = {e["path"]: e["sha"] for e in listing.get("tree", [])
+             if e["type"] == "blob"}
+    return sha, root, blobs
+
+
 def main():
     if len(sys.argv) < 3:
-        sys.exit("usage: gh_push.py <owner/repo> <branch>")
+        sys.exit("usage: gh_push.py <owner/repo> <branch> [--full]")
     global REPO
     repo, branch = sys.argv[1], sys.argv[2]
+    full = "--full" in sys.argv[3:]
     REPO = repo
 
     rows = index_entries()
     print("%d files in the index" % len(rows))
 
-    entries, total = [], 0
-    for i, (path, mode, sha) in enumerate(rows, 1):
-        size = os.path.getsize(path)
-        total += size
-        blob = make_blob(path)
-        entries.append((path, mode, blob))
-        if i % 25 == 0 or i == len(rows):
-            print("  %d/%d blobs (%d KB)" % (i, len(rows), total // 1024))
+    parent, base_tree, remote_blobs = remote_state(branch)
+    print("remote %s at %s" % (branch, parent or "(missing)"))
 
-    tree = build_tree(entries)
-    print("tree", tree)
+    known = {p: s for p, _m, s in rows}
+    changed = [r for r in rows if remote_blobs.get(r[0]) != r[2]]
+    removed = [p for p in remote_blobs if p not in known]
+    if full or not base_tree:
+        changed = list(rows)
+        removed = []
+
+    print("%d to upload, %d deleted, %d unchanged"
+          % (len(changed), len(removed), len(rows) - len(changed)))
+
+    entries, total = [], 0
+    for i, (path, mode, sha) in enumerate(changed, 1):
+        blob, size = make_blob(sha)
+        total += size
+        entries.append({"path": path, "mode": mode, "type": "blob", "sha": blob})
+        print("  %2d/%d %-58s %8.1f KB" % (i, len(changed), path, size / 1024.0))
+    for path in removed:
+        entries.append({"path": path, "mode": "100644", "type": "blob",
+                        "sha": None})
+
+    if base_tree and not full:
+        try:
+            tree = call("POST", "/repos/%s/git/trees" % REPO,
+                        {"base_tree": base_tree, "tree": entries})["sha"]
+            print("tree %s (from base %s)" % (tree, base_tree[:8]))
+        except SystemExit as e:
+            print("incremental tree rejected (%s); falling back to a full tree" % e)
+            base_tree = None
+    if not base_tree:
+        tree = build_tree([(p, m, s) for p, m, s in rows])
+        print("tree %s (full)" % tree)
 
     msg = subprocess.run(["git", "log", "-1", "--pretty=%B"],
                          capture_output=True, text=True).stdout.strip()
     # keep the remote history: this commit continues whatever the branch points
     # at now (the first run found it missing and started an orphan)
-    parents = []
-    try:
-        head = call("GET", "/repos/%s/git/ref/heads/%s" % (REPO, branch))
-        if head.get("object", {}).get("sha"):
-            parents = [head["object"]["sha"]]
-    except SystemExit:
-        parents = []
     commit = call("POST", "/repos/%s/git/commits" % REPO,
-                  {"message": msg, "tree": tree, "parents": parents})
-    print("commit", commit["sha"])
+                  {"message": msg, "tree": tree,
+                   "parents": [parent] if parent else []})
+    print("commit", commit["sha"], "(%.1f MB uploaded)" % (total / 1048576.0))
 
     # point the branch at it (create if missing, force if it exists)
     try:
