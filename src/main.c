@@ -4312,6 +4312,43 @@ static void nav_collect_items(void *node, int depth) {
 }
 
 /* ------------------------------------------------------------------------- */
+/* "请选择要设置的快捷键" (shortcut-assign popup).                              */
+/*                                                                           */
+/* Its six 80x80 slots use UIShortcutMenu_Shortcut_EventProc, which           */
+/* nav_is_actionable() excludes on purpose: in the field the very same proc   */
+/* drives the HUD quick buttons, and letting the pad focus them there would   */
+/* fight the stick / face keys.  The popup is also NOT one of the four page   */
+/* shapes nav_page_kind_of() knows, so nav_page_obj keeps pointing at the     */
+/* layer underneath and nav_collect_items() never walks this layer at all.    */
+/*                                                                           */
+/* hud_scan_node() already tells the two sets apart: the field HUD slots have */
+/* stable ids 8..13, the assign-page slots have dynamic ids and are matched   */
+/* by proc instead.  Use the same distinction here, over the WHOLE root tree  */
+/* (not nav_page_obj), and collect only when exactly six are present.          */
+/* ------------------------------------------------------------------------- */
+static CtrlRect nav_slot_rects[6];
+static int nav_slot_n;
+
+static void nav_collect_shortcut_slots(void *node, int depth) {
+  if (!node || depth > 6 || nav_slot_n >= 6 || !p_ctrl_count || !p_ctrl_child)
+    return;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n && nav_slot_n < 6; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    const unsigned id = p_ctrl_id ? p_ctrl_id(c) : 0;
+    if (!(id >= 8 && id <= 13) && p_ctrl_proc && shortcut_proc &&
+        p_ctrl_proc(c) == shortcut_proc && p_abs_rect) {
+      const CtrlRect r = p_abs_rect(c);
+      if (r.w == 80 && r.h == 80)
+        nav_slot_rects[nav_slot_n++] = r;
+    }
+    nav_collect_shortcut_slots(c, depth + 1);
+  }
+}
+
+/* ------------------------------------------------------------------------- */
 /* Skill icons.                                                              */
 /*                                                                           */
 /* The skill tree is a ControlScroll whose contents are NOT part of the root  */
@@ -4515,8 +4552,34 @@ static void nav_scan(void) {
   /* A page with no collected controls is still a page: the tabs are there,
    * so L/R must keep working. Requiring nav_items_n > 0 used to switch the
    * navigator off on the task-detail tab and leak R into quick_swap_fire(). */
-  const int present = kind != NAV_PAGE_NONE &&
-                      (kind != NAV_PAGE_SETTINGS || nav_tabs_n > 0);
+  int present = kind != NAV_PAGE_NONE &&
+                (kind != NAV_PAGE_SETTINGS || nav_tabs_n > 0);
+
+  /* The shortcut-assign popup is modal: while it is up, the ONLY things the
+   * pad should be able to focus are its six slots.  Replace whatever the
+   * underlying page contributed, and report SETTINGS with zero tabs so A taps
+   * the focused slot, B closes the popup and L/R stay inert.  The slots are
+   * re-collected from the live tree every scan, so closing the popup restores
+   * the normal focus set on the very next scan instead of waiting for the
+   * 30-frame HUD object cache. */
+  nav_slot_n = 0;
+  if (root && shortcut_proc && cfg.quick_layout && quick_pos_ok)
+    nav_collect_shortcut_slots(root, 0);
+  if (nav_slot_n == 6) {
+    nav_tabs_n = 0;
+    nav_items_n = 0;
+    for (int i = 0; i < nav_slot_n; i++)
+      nav_add_item(&nav_slot_rects[i], NAV_K_PLAIN, NAV_SHAPE_CIRCLE, 0);
+    kind = NAV_PAGE_SETTINGS;
+    present = 1;
+    static int slog;
+    if (slog < 3) {
+      slog++;
+      debugPrintf("nav: shortcut-assign popup, %d slots as focus\n",
+                  nav_items_n);
+    }
+  }
+
   /* A tab switch rebuilds the page; tolerate a few empty frames instead of
    * dropping the navigator (which would kick the user back to the title focus
    * box in the middle of a page change). */
