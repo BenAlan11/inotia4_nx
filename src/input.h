@@ -86,6 +86,8 @@ void input_set_quick_rects(const long r[6][4], int enabled);
 /* The page-swap button (engine rect 1059,313 75x75, same spot on the
  * shortcut-assign page): it must never answer a real screen touch. */
 void input_set_swap_rect(long x, long y, long w, long h, int enabled);
+/* retired cash-shop basket: real finger touches on its rect are swallowed */
+void input_set_shop_rect(long x, long y, long w, long h, int enabled);
 /* R shoulder replaces that button. Implemented in main.c (data swap). */
 void quick_swap_fire(void);
 /* Fire a press/release straight on one control object, using the same

@@ -1392,6 +1392,17 @@ static unsigned drawpart_calls;
 static volatile long pad_menu_rect[2][4];
 static volatile int  pad_menu_seen[2];
 
+/* Cash-shop basket (HUD control id 2, rect 1,232 75x75 in the field tree).
+ * Its rect is read from the engine's own control tree, not measured off a
+ * screenshot: the blit cut below and the touch veto in input.c both use it. */
+static volatile long shop_btn_rect[4];
+static volatile int  shop_btn_seen;
+/* The wide black plate under the daily-reward tip shares its geometry with
+ * every other tutorial hint, so it can only be dropped on frames where our
+ * text drawer actually saw the retired line (current OR previous frame: the
+ * plate is submitted before the glyphs). */
+static volatile int g_shop_hint_cur, g_shop_hint_prev;
+
 /* The virtual-key layer's own draw loop inside UIPlayPorting_Draw:
  *   0x15bf98  InputLayer_GetVirtualKey / ControlObject_GetCount / GetHead
  *   0x15c024  loop: GetRelativeRect, GetID, branch on id 0x14/0x15/0x16
@@ -1476,6 +1487,25 @@ static void nx_grpx_draw_part(void *h, long x, long y, void *rect, long mode,
         debugPrintf("pad: bound menu button %d draw suppressed (ra 0x%x at "
                     "%ld,%ld rect %ld,%ld %ldx%ld)\n", i, ra, x, y,
                     bx, by, bw, bh);
+      }
+      g_blit_caller = prev;
+      return;
+    }
+  }
+  /* Retired cash-shop basket. Cut its icon at the GRPX_DrawPart call site by
+   * the button's OWN control rect (same mechanism as the two pad-bound menu
+   * buttons above), never by a screen-region quad mask. No config key: the
+   * online store is gone unconditionally. */
+  if (shop_btn_seen) {
+    const long bx = shop_btn_rect[0], by = shop_btn_rect[1];
+    const long bw = shop_btn_rect[2], bh = shop_btn_rect[3];
+    if (bw > 0 && bh > 0 && x >= bx - 8 && x <= bx + bw + 8 &&
+        y >= by - 8 && y <= by + bh + 8) {
+      static int logs;
+      if (logs < 6) {
+        logs++;
+        debugPrintf("shop: basket draw suppressed (ra 0x%x at %ld,%ld "
+                    "rect %ld,%ld %ldx%ld)\n", ra, x, y, bx, by, bw, bh);
       }
       g_blit_caller = prev;
       return;
@@ -3861,6 +3891,26 @@ static void hud_scan_node(void *node, int depth) {
     case 30: case 31: case 32: case 33: hide = 1; break; /* d-pad arrows */
     default: break;
     }
+    /* id 2 is the cash-shop basket on the field HUD. Publish its real rect
+     * for the draw cut and the touch veto; size-guarded so an unrelated id 2
+     * on some other page cannot arm either of them. */
+    if (id == 2 && p_abs_rect) {
+      const CtrlRect sr = p_abs_rect(c);
+      if (sr.w >= 40 && sr.w <= 120 && sr.h >= 40 && sr.h <= 120) {
+        shop_btn_rect[0] = sr.x;
+        shop_btn_rect[1] = sr.y;
+        shop_btn_rect[2] = sr.w;
+        shop_btn_rect[3] = sr.h;
+        shop_btn_seen = 1;
+        input_set_shop_rect(sr.x, sr.y, sr.w, sr.h, 1);
+        static int logs;
+        if (logs < 3) {
+          logs++;
+          debugPrintf("shop: basket at %ld,%ld %ldx%ld (draw+touch retired)\n",
+                      sr.x, sr.y, sr.w, sr.h);
+        }
+      }
+    }
     if (bound_menu >= 0 && p_abs_rect) {
       const CtrlRect mr = p_abs_rect(c);
       pad_menu_rect[bound_menu][0] = mr.x;
@@ -4621,26 +4671,12 @@ static void nav_scan(void) {
   }
 }
 
-/* declared early: hud_tick() drives the deferred offline-shop scene build */
-static void (*store_enter_real)(long);
-static void (*store_scene_init)(void);
-static int store_offline_pending;
-
 static void hud_tick(void) {
   static int frames;
+  /* rotate the hint-plate suppression window once per frame */
+  g_shop_hint_prev = g_shop_hint_cur;
+  g_shop_hint_cur = 0;
   quick_layout_frame();          /* every frame, not just the scan frames */
-  /* Build the offline shop one frame AFTER the button press: the scene
-   * builder creates ~10 controls and must not run inside the button's own
-   * event dispatch. */
-  if (store_offline_pending) {
-    store_offline_pending = 0;
-    if (store_scene_init) {
-      store_scene_init();
-      debugPrintf("store: offline INAPP scene built\n");
-    } else {
-      debugPrintf("store: offline scene symbol missing\n");
-    }
-  }
   static int nav_frames;
   if (++nav_frames % 4 == 0)
     nav_scan();                  /* a tap rebuilds the page within 4 frames */
@@ -4656,6 +4692,8 @@ static void hud_tick(void) {
   hud_hide_count = 0;
   g_ui_page_open = 0;
   quick_assign_slot = 0;
+  shop_btn_seen = 0;
+  input_set_shop_rect(0, 0, 0, 0, 0);
   input_hud_begin();
   hud_scan_node(root, 0);
   input_hud_end();
@@ -6519,6 +6557,40 @@ void nx_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
   const unsigned idx = frame_draw_index++;
   if (cfg.draw_skip > 0 && idx < (unsigned)cfg.draw_skip)
     return;                      /* A/B: leave this layer out entirely */
+  /* Retired daily-reward hint: drop only its own wide backing plate, and only
+   * on frames where the matching line was seen. Geometry is strict (one wide
+   * ~20 px strip at y 152..172); every other plate in the game is untouched.
+   * This is a text-driven cut, not a screen-region mask. */
+  if ((g_shop_hint_cur || g_shop_hint_prev) && vptr && count == 4) {
+    const int comps = vsize > 1 ? vsize : 2;
+    const int vsz = (vtype == GL_SHORT) ? 2 : 4;
+    const int vstep = vstride ? vstride : comps * vsz;
+    float hx0 = 1e9f, hy0 = 1e9f, hx1 = -1e9f, hy1 = -1e9f;
+    for (GLsizei i = 0; i < count; i++) {
+      const unsigned char *q =
+          (const unsigned char *)vptr + (size_t)(first + i) * vstep;
+      float vx = 0, vy = 0;
+      if (vtype == GL_FLOAT) { vx = ((const float *)q)[0]; vy = ((const float *)q)[1]; }
+      else if (vtype == GL_SHORT) { vx = ((const short *)q)[0]; vy = ((const short *)q)[1]; }
+      else if (vtype == GL_FIXED) { vx = (float)((const int32_t *)q)[0]/65536.0f; vy = (float)((const int32_t *)q)[1]/65536.0f; }
+      else { vx = (float)((const int32_t *)q)[0]; vy = (float)((const int32_t *)q)[1]; }
+      if (vx < hx0) hx0 = vx;
+      if (vx > hx1) hx1 = vx;
+      if (vy < hy0) hy0 = vy;
+      if (vy > hy1) hy1 = vy;
+    }
+    const float hw = hx1 - hx0, hh = hy1 - hy0;
+    if (hw >= 900.0f && hh >= 8.0f && hh <= 40.0f &&
+        hy0 >= 135.0f && hy1 <= 190.0f) {
+      static int logs;
+      if (logs < 4) {
+        logs++;
+        debugPrintf("shop: hint plate suppressed (%.0f,%.0f %.0fx%.0f)\n",
+                    hx0, hy0, hw, hh);
+      }
+      return;
+    }
+  }
   /* The lit pad ring -- the gold rune circle with two torches in the lower
    * left, centred on the stick's press point (user screenshot 19:45) -- is a
    * bare textured quad from UIPlayPorting_Draw (log: -3,376 278x276 tex 27,
@@ -7835,6 +7907,16 @@ static unsigned long nx_grp_draw_string_simple(
   return 0;
 }
 
+/* The "点击左侧闪烁的收费商店按钮，可以获得$S每日奖励$B" tip belongs to the
+ * retired online store. Match on the line itself (UTF-8), not on its screen
+ * rectangle: other tutorial hints share the same wide black plate and must
+ * keep theirs. */
+static int is_shop_hint(const char *s) {
+  if (!s || !probe_mem_ok(s, 1))
+    return 0;
+  return strstr(s, "收费商店") || strstr(s, "每日奖励");
+}
+
 static unsigned long nx_grp_draw_string(unsigned long a0, unsigned long a1,
                                         unsigned long a2, unsigned long a3,
                                         unsigned long a4, unsigned long a5,
@@ -7846,6 +7928,15 @@ static unsigned long nx_grp_draw_string(unsigned long a0, unsigned long a1,
     return 0;
   if (!cfg.draw_text)
     return 0;
+  if (is_shop_hint(str)) {
+    g_shop_hint_cur = 1;
+    static int logs;
+    if (logs < 3) {
+      logs++;
+      debugPrintf("shop: daily-reward hint text suppressed\n");
+    }
+    return 0;
+  }
 
   const int len = (int)a4;
   const int x = (int)a1;
@@ -7967,6 +8058,11 @@ static unsigned long nx_textctrl_create_imgstring(unsigned long a0,
    * screen there is nothing the image can add, so do not hand it over. Strings
    * we have NOT drawn keep their image (strimg_fill paints those). */
   const char *shown = (const char *)(uintptr_t)a1;
+  /* Our drawer drops the daily-reward line, so `ours` would be false and the
+   * engine's own (rasteriser-less, gold-smear) string image would survive.
+   * Drop it explicitly for this one line. */
+  if (is_shop_hint(shown))
+    return 0;
   int ours = 0;
   if (shown && probe_mem_ok(shown, 1)) {
     char plain[192];
@@ -8708,105 +8804,37 @@ static const so_override save_overrides[] = {
  *   +0x18 currency      +0x20 price (double)
  *   +0x28 displayPrice  +0x30 an int (coinsReward)
  */
-static void *g_store_products;     /* kept alive: the engine may hold pointers */
-
-#define STORE_REC_SIZE 0x68
-#define STORE_MAX_PRODUCTS 32
-
-static unsigned long store_product_info(unsigned long a0, unsigned long a1,
-                                        unsigned long a2, unsigned long a3,
-                                        unsigned long a4, unsigned long a5,
-                                        unsigned long a6, unsigned long a7) {
+/* ------------------------------------------------------------------------- */
+/* Online cash shop -- RETIRED                                                */
+/*                                                                           */
+/* The basket (HUD control id 2) is no longer drawn and its rect no longer     */
+/* answers a finger (nx_grpx_draw_part / input_set_shop_rect). The tip text    */
+/* about the flashing cash-shop button is dropped in nx_grp_draw_string and    */
+/* nx_textctrl_create_imgstring. This makes sure NO other path can still       */
+/* start the online store:                                                    */
+/*                                                                           */
+/*   UIPlay_CallInAppShopProc -> NetworkStore_Enter(0) -> opcode 0x42         */
+/*     -> InApp_SelectTarget -> CS_IapV4MarketConnect -> Java IAP layer       */
+/*     -> CS_IapV4GetProductInfo -> InAppV4ProductInfoCB -> INAPP scenes      */
+/*                                                                           */
+/* All three entry points are no-ops at the PLT, so the network state machine, */
+/* the fake product table and the six INAPP scenes are never reached. The     */
+/* earlier offline-shop experiment (building Scene_Init_POPUP_SC_INAPP_*      */
+/* directly) has been removed on request.                                     */
+/* ------------------------------------------------------------------------- */
+static unsigned long store_noop8(unsigned long a0, unsigned long a1,
+                                 unsigned long a2, unsigned long a3,
+                                 unsigned long a4, unsigned long a5,
+                                 unsigned long a6, unsigned long a7) {
   (void)a0; (void)a1; (void)a2; (void)a3;
   (void)a4; (void)a5; (void)a6; (void)a7;
-  if (!iap_product_cb)
-    return 0;
-  /* the engine's own list of product ids: GOT slot 0x29fb48 holds a pointer to
-   * an array of char* built from the APK's product names */
-  char **ids = *(char ***)((uintptr_t)game_mod.load_virtbase + 0x29fb48);
-  int n = 0;
-  while (ids && ids[n] && n < STORE_MAX_PRODUCTS)
-    n++;
-  if (n <= 0) {
-    debugPrintf("store: no expected product ids, product info not built\n");
-    return 0;
-  }
-  if (!g_store_products) {
-    unsigned char *recs = calloc((size_t)n, STORE_REC_SIZE);
-    if (!recs)
-      return 0;
-    for (int i = 0; i < n; i++) {
-      unsigned char *r = recs + (size_t)i * STORE_REC_SIZE;
-      char buf[64];
-      *(char **)(r + 0x00) = strdup("inapp");          /* productType */
-      *(char **)(r + 0x08) = strdup(ids[i]);           /* id            */
-      *(char **)(r + 0x18) = strdup("CNY");            /* currency      */
-      *(double *)(r + 0x20) = 6.0;                     /* price         */
-      snprintf(buf, sizeof(buf), "\xC2\xA5%.2f", 6.0);   /* ¥6.00         */
-      *(char **)(r + 0x28) = strdup(buf);              /* displayPrice  */
-      *(int *)(r + 0x30) = 0;                          /* coinsReward   */
-    }
-    g_store_products = recs;
-    debugPrintf("store: built %d product record(s), first id '%s'\n", n, ids[0]);
-  }
-  iap_product_cb(0, NULL, n, g_store_products);
-  /* The callback's own tail call is C2S_HubBeginWithFlow, which ends in
-   * Network_SendData(0x42, ...): the store is driven by the game's own server
-   * protocol (Network_SendData -> server -> Network_NextInterrup -> next state),
-   * so it cannot leave its "connecting" state offline and never builds a page.
-   * Forcing NetworkStore_SetState() here does not help -- the state handlers read
-   * the received-item list, which is only filled from those server replies. */
-  {
-    void *recs = *(void **)((uintptr_t)game_mod.load_virtbase + 0x2d8508);
-    debugPrintf("store: received list %p count %ld\n", recs,
-                recs ? *(long *)recs : -1L);
-  }
   return 0;
 }
 
-/* Every state change goes through here, so the log shows exactly who moves the
- * store forward (or back to 0). */
-static void (*store_set_state_real)(long);
-static void store_set_state_logged(long st) {
-  debugPrintf("store: state %ld\n", st);
-  if (store_set_state_real)
-    store_set_state_real(st);
-}
-
-/* ------------------------------------------------------------------------- */
-/* Offline cash shop                                                          */
-/*                                                                           */
-/* The shopping-basket button calls NetworkStore_Enter(0), which sets the      */
-/* state machine to 1/3 and (via NetworkStore_Process) sends opcode 0x42 to   */
-/* the game server.  The reply is what fills NetworkStore_pPageList and moves */
-/* the machine to the states that push Scene_Init_POPUP_SC_INAPP_*.  Offline  */
-/* that reply never comes, so the screen just goes dark.  Forcing state 4 is  */
-/* useless -- the jump table at 0xbd192 shows state 4 is a different branch;  */
-/* the scene builders themselves are at 0x1fc648..0x1fd878 and create the    */
-/* whole control tree (UIInApp_CreateBaseControl / MenuGroup / MainControl /  */
-/* CreateControl) before NetworkStore_InitializeMenuData + UIInApp_Enter.     */
-/*                                                                           */
-/* So: let the real Enter() do its bookkeeping, park the state machine outside */
-/* 1..13 (Process becomes a no-op instead of resending 0x42), then build the  */
-/* GEMSHOP scene directly on the NEXT frame so we are out of the button's     */
-/* event stack.  No fake product data: the shop opens with whatever local      */
-/* page list exists, and every purchase path stays inert offline.             */
-/* ------------------------------------------------------------------------- */
-static void nx_store_enter(long type) {
-  debugPrintf("store: offline enter(%ld)\n", type);
-  if (store_enter_real)
-    store_enter_real(type);
-  unsigned char *b = (unsigned char *)input_engine_virtbase();
-  if (b)
-    *(volatile long *)(b + 0x2d84d0) = 15;   /* outside the 1..13 jump table */
-  store_offline_pending = 1;
-}
-
 static const so_override store_overrides[] = {
-  /* the only piece of the IAP chain that has to be answered locally */
-  { "CS_IapV4GetProductInfo",       (void *)store_product_info },
-  { "NetworkStore_SetState",        (void *)store_set_state_logged },
-  { "NetworkStore_Enter",           (void *)nx_store_enter },
+  { "UIPlay_CallInAppShopProc", (void *)store_noop8 },
+  { "NetworkStore_Enter",       (void *)store_noop8 },
+  { "CS_IapV4GetProductInfo",   (void *)store_noop8 },
 };
 
 /* ------------------------------------------------------------------------- */
@@ -9142,14 +9170,6 @@ int main(int argc, char **argv) {
                    (int)(sizeof(mercury_overrides) / sizeof(*mercury_overrides)));
   so_set_overrides(save_overrides,
                    (int)(sizeof(save_overrides) / sizeof(*save_overrides)));
-  store_set_state_real = (void (*)(long))so_try_find_addr_rx(
-      &game_mod, "NetworkStore_SetState");
-  store_enter_real = (void (*)(long))so_try_find_addr_rx(
-      &game_mod, "NetworkStore_Enter");
-  store_scene_init = (void (*)(void))so_try_find_addr_rx(
-      &game_mod, "Scene_Init_POPUP_SC_INAPP_GEMSHOP");
-  debugPrintf("store: offline enter=%p scene=%p\n",
-              (void *)store_enter_real, (void *)store_scene_init);
   so_set_overrides(store_overrides,
                    (int)(sizeof(store_overrides) / sizeof(*store_overrides)));
   if (cfg.text_trace) {

@@ -1245,10 +1245,47 @@ static int hud_swap_hit(float sx, float sy) {
          sy >= y - 4 && sy <= y + h + 4;
 }
 
+/* The cash-shop basket (HUD control id 2) is retired: no icon, no daily-reward
+ * hint, no online store. Its rect is published by hud_scan_node() from the
+ * engine's own control tree; swallow every real finger touch on it BEFORE the
+ * page-swap / quick-slot / nav whitelists get a chance to pass it through. */
+static volatile long g_shop_r[4];
+static volatile int g_shop_on;
+
+void input_set_shop_rect(long x, long y, long w, long h, int enabled) {
+  g_shop_on = enabled;
+  g_shop_r[0] = x;
+  g_shop_r[1] = y;
+  g_shop_r[2] = w;
+  g_shop_r[3] = h;
+}
+
+static int hud_shop_hit(float sx, float sy) {
+  if (!g_shop_on)
+    return 0;
+  int ew = input_engine_screen_w(), eh = input_engine_screen_h();
+  if (ew <= 0) ew = 1137;
+  if (eh <= 0) eh = 640;
+  const float x = (float)g_shop_r[0] * scr_w / (float)ew;
+  const float y = (float)g_shop_r[1] * scr_h / (float)eh;
+  const float w = (float)g_shop_r[2] * scr_w / (float)ew;
+  const float h = (float)g_shop_r[3] * scr_h / (float)eh;
+  return w > 0 && h > 0 && sx >= x - 4 && sx <= x + w + 4 &&
+         sy >= y - 4 && sy <= y + h + 4;
+}
+
 /* forward: defined with the navigation tables below */
 static int hud_nav_hit(float sx, float sy);
 
 static int hud_touch_blocked(float sx, float sy) {
+  if (hud_shop_hit(sx, sy)) {
+    static int logs;
+    if (logs < 8) {
+      logs++;
+      debugPrintf("input: cash-shop touch swallowed (%.0f,%.0f)\n", sx, sy);
+    }
+    return 1;
+  }
   if (hud_swap_hit(sx, sy)) {
     static int logs;
     if (logs < 8) {
@@ -1375,28 +1412,28 @@ static int nav_grace;           /* frames the pad stays owned during a rebuild *
 static int nav_page_serial;
 static int nav_tab_pending, nav_tab_wait, nav_tab_retry;
 static int nav_tab_serial_before;
-static long nav_tab_prev_x, nav_tab_target_x;
-static unsigned long nav_tab_fp_before;
-static void nav_tab_confirm(void);
-
-/* Content fingerprint: two different tabs can publish the same number of
- * controls, so the id alone is not enough -- and the engine may reuse a page
- * object. Combine the count with the shape/position of the first and last
- * focus item. Scrolling only changes y on the skill page, and a tab switch is
- * never issued mid-scroll, so this stays stable during the confirmation. */
-static unsigned long nav_content_fp(void) {
-  unsigned long h = (unsigned long)nav_nitems;
-  if (nav_nitems > 0) {
-    const NavItem *f = &nav_items[0];
-    h = h * 31u + (unsigned long)f->kind;
-    h = h * 31u + (unsigned long)(f->x + f->y * 3 + f->w + f->h * 7);
-    if (nav_nitems > 1) {
-      const NavItem *l = &nav_items[nav_nitems - 1];
-      h = h * 31u + (unsigned long)(l->x + l->y * 3 + l->w * 5 + l->kind);
-    }
-  }
-  return h;
-}
+static long nav_tab_prev_x, nav_tab_target_x;
+static unsigned long nav_tab_fp_before;
+static void nav_tab_confirm(void);
+
+/* Content fingerprint: two different tabs can publish the same number of
+ * controls, so the id alone is not enough -- and the engine may reuse a page
+ * object. Combine the count with the shape/position of the first and last
+ * focus item. Scrolling only changes y on the skill page, and a tab switch is
+ * never issued mid-scroll, so this stays stable during the confirmation. */
+static unsigned long nav_content_fp(void) {
+  unsigned long h = (unsigned long)nav_nitems;
+  if (nav_nitems > 0) {
+    const NavItem *f = &nav_items[0];
+    h = h * 31u + (unsigned long)f->kind;
+    h = h * 31u + (unsigned long)(f->x + f->y * 3 + f->w + f->h * 7);
+    if (nav_nitems > 1) {
+      const NavItem *l = &nav_items[nav_nitems - 1];
+      h = h * 31u + (unsigned long)(l->x + l->y * 3 + l->w * 5 + l->kind);
+    }
+  }
+  return h;
+}
 static int nav_panel_closed;    /* last B already closed the top panel */
 static int nav_opener_valid;
 static long nav_opener_x, nav_opener_y;  /* control that opened the panel */
