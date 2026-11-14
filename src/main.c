@@ -4621,9 +4621,26 @@ static void nav_scan(void) {
   }
 }
 
+/* declared early: hud_tick() drives the deferred offline-shop scene build */
+static void (*store_enter_real)(long);
+static void (*store_scene_init)(void);
+static int store_offline_pending;
+
 static void hud_tick(void) {
   static int frames;
   quick_layout_frame();          /* every frame, not just the scan frames */
+  /* Build the offline shop one frame AFTER the button press: the scene
+   * builder creates ~10 controls and must not run inside the button's own
+   * event dispatch. */
+  if (store_offline_pending) {
+    store_offline_pending = 0;
+    if (store_scene_init) {
+      store_scene_init();
+      debugPrintf("store: offline INAPP scene built\n");
+    } else {
+      debugPrintf("store: offline scene symbol missing\n");
+    }
+  }
   static int nav_frames;
   if (++nav_frames % 4 == 0)
     nav_scan();                  /* a tap rebuilds the page within 4 frames */
@@ -8756,10 +8773,40 @@ static void store_set_state_logged(long st) {
     store_set_state_real(st);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Offline cash shop                                                          */
+/*                                                                           */
+/* The shopping-basket button calls NetworkStore_Enter(0), which sets the      */
+/* state machine to 1/3 and (via NetworkStore_Process) sends opcode 0x42 to   */
+/* the game server.  The reply is what fills NetworkStore_pPageList and moves */
+/* the machine to the states that push Scene_Init_POPUP_SC_INAPP_*.  Offline  */
+/* that reply never comes, so the screen just goes dark.  Forcing state 4 is  */
+/* useless -- the jump table at 0xbd192 shows state 4 is a different branch;  */
+/* the scene builders themselves are at 0x1fc648..0x1fd878 and create the    */
+/* whole control tree (UIInApp_CreateBaseControl / MenuGroup / MainControl /  */
+/* CreateControl) before NetworkStore_InitializeMenuData + UIInApp_Enter.     */
+/*                                                                           */
+/* So: let the real Enter() do its bookkeeping, park the state machine outside */
+/* 1..13 (Process becomes a no-op instead of resending 0x42), then build the  */
+/* GEMSHOP scene directly on the NEXT frame so we are out of the button's     */
+/* event stack.  No fake product data: the shop opens with whatever local      */
+/* page list exists, and every purchase path stays inert offline.             */
+/* ------------------------------------------------------------------------- */
+static void nx_store_enter(long type) {
+  debugPrintf("store: offline enter(%ld)\n", type);
+  if (store_enter_real)
+    store_enter_real(type);
+  unsigned char *b = (unsigned char *)input_engine_virtbase();
+  if (b)
+    *(volatile long *)(b + 0x2d84d0) = 15;   /* outside the 1..13 jump table */
+  store_offline_pending = 1;
+}
+
 static const so_override store_overrides[] = {
   /* the only piece of the IAP chain that has to be answered locally */
   { "CS_IapV4GetProductInfo",       (void *)store_product_info },
   { "NetworkStore_SetState",        (void *)store_set_state_logged },
+  { "NetworkStore_Enter",           (void *)nx_store_enter },
 };
 
 /* ------------------------------------------------------------------------- */
@@ -9097,6 +9144,12 @@ int main(int argc, char **argv) {
                    (int)(sizeof(save_overrides) / sizeof(*save_overrides)));
   store_set_state_real = (void (*)(long))so_try_find_addr_rx(
       &game_mod, "NetworkStore_SetState");
+  store_enter_real = (void (*)(long))so_try_find_addr_rx(
+      &game_mod, "NetworkStore_Enter");
+  store_scene_init = (void (*)(void))so_try_find_addr_rx(
+      &game_mod, "Scene_Init_POPUP_SC_INAPP_GEMSHOP");
+  debugPrintf("store: offline enter=%p scene=%p\n",
+              (void *)store_enter_real, (void *)store_scene_init);
   so_set_overrides(store_overrides,
                    (int)(sizeof(store_overrides) / sizeof(*store_overrides)));
   if (cfg.text_trace) {
