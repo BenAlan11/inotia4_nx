@@ -25,7 +25,10 @@
 #define STB_VORBIS_HEADER_ONLY
 #include "third_party/stb_vorbis.c"
 
-#define MAX_SFX      96
+/* The SE folder has 170 distinct Ogg files and the engine creates each one by
+ * name.  With 96 slots the later screens silently got id -1 ("load failed"),
+ * which is one more reason nothing was ever heard. */
+#define MAX_SFX      256
 #define MAX_VOICES   24
 #define OUT_CHANNELS 2
 #define AUDOUT_BUFFERS 4
@@ -55,9 +58,14 @@ static Voice voices[MAX_VOICES];
 static stb_vorbis *bgm;
 static int bgm_channels;
 static int bgm_rate;
-static s16 bgm_buf[4096 * 2];
+/* Every bundled BGM is 44.1 kHz while audout runs at 48 kHz.  Decode into a
+ * raw buffer at the file's rate, then linearly resample into bgm_buf.  The
+ * output can be ~9% longer than the input, hence the 8192-frame headroom. */
+static s16 bgm_raw[4096 * 2];
+static s16 bgm_buf[8192 * 2];
 static int bgm_buf_frames;
 static int bgm_buf_pos;
+static double bgm_phase;
 static int bgm_playing;
 static int bgm_loop = 1;
 static float bgm_gain = 0.8f;
@@ -83,17 +91,21 @@ static void decode_to_pcm(const char *path, s16 **out, size_t *frames, int *chan
   }
   *channels = ch;
   *frames = (size_t)n;
-  /* audout and the mixer run at 48 kHz stereo: resample mono/other rates here
-   * rather than carrying a rate converter through the mixer */
-  if (ch == OUT_CHANNELS && rate == cfg.audio_freq) {
+  /* audout's device rate is fixed at 48 kHz regardless of cfg.audio_freq
+   * (that key only sizes the buffer).  Every bundled Ogg is 44.1 kHz and the
+   * SE files are mono, so resample AND expand to stereo here rather than
+   * carrying a rate converter through the mixer. */
+  const int out_rate = (int)audoutGetSampleRate();
+  const int dst_rate = out_rate > 0 ? out_rate : 48000;
+  if (ch == OUT_CHANNELS && rate == dst_rate) {
     *out = pcm;
     return;
   }
-  const size_t out_n = (size_t)((double)n * cfg.audio_freq / (double)rate) + 1;
+  const size_t out_n = (size_t)((double)n * dst_rate / (double)rate) + 1;
   s16 *dst = calloc(out_n * OUT_CHANNELS, sizeof(s16));
   if (!dst) { free(pcm); *out = NULL; *frames = 0; return; }
   for (size_t i = 0; i < out_n; i++) {
-    const double src = (double)i * rate / cfg.audio_freq;
+    const double src = (double)i * rate / dst_rate;
     const size_t s0 = (size_t)src;
     if (s0 >= (size_t)n) break;
     for (int c = 0; c < OUT_CHANNELS; c++) {
@@ -185,7 +197,10 @@ int audio_bgm_load(const char *path) {
   bgm_rate = info.sample_rate;
   bgm_buf_frames = 0;
   bgm_buf_pos = 0;
-  debugPrintf("audio: BGM '%s' %d ch %d Hz\n", path, bgm_channels, bgm_rate);
+  bgm_phase = 0;
+  bgm_playing = 0;
+  debugPrintf("audio: BGM '%s' %d ch %d Hz -> device %u Hz\n", path,
+              bgm_channels, bgm_rate, audoutGetSampleRate());
   return 0;
 }
 
@@ -220,21 +235,45 @@ static int refill_bgm(void) {
     return 0;
   const int want = 4096;
   int got = stb_vorbis_get_samples_short_interleaved(bgm, OUT_CHANNELS,
-                                                     bgm_buf, want * OUT_CHANNELS);
+                                                     bgm_raw, want * OUT_CHANNELS);
   if (got <= 0) {
     if (bgm_loop) {
       stb_vorbis_seek_start(bgm);
+      bgm_phase = 0;
       got = stb_vorbis_get_samples_short_interleaved(bgm, OUT_CHANNELS,
-                                                     bgm_buf, want * OUT_CHANNELS);
+                                                     bgm_raw, want * OUT_CHANNELS);
     }
     if (got <= 0) {
       bgm_playing = 0;
       return 0;
     }
   }
-  bgm_buf_frames = got;
+
+  const int dst_rate = audoutGetSampleRate() > 0
+                           ? (int)audoutGetSampleRate() : 48000;
+  const double step = bgm_rate > 0
+                          ? (double)bgm_rate / (double)dst_rate : 1.0;
+  int out = 0;
+  double pos = bgm_phase;
+  const int cap = (int)(sizeof(bgm_buf) / (sizeof(s16) * OUT_CHANNELS));
+  while (pos + 1.0 < got && out < cap) {
+    const size_t i = (size_t)pos;
+    const double f = pos - (double)i;
+    for (int c = 0; c < OUT_CHANNELS; c++) {
+      const double a = bgm_raw[i * OUT_CHANNELS + c];
+      const double b = bgm_raw[(i + 1) * OUT_CHANNELS + c];
+      bgm_buf[out * OUT_CHANNELS + c] = (s16)(a + (b - a) * f);
+    }
+    out++;
+    pos += step;
+  }
+  /* carry the sub-frame phase into the next decoded block */
+  bgm_phase = pos - got;
+  if (bgm_phase < 0) bgm_phase = 0;
+  if (bgm_phase >= 1.0) bgm_phase = 0;
+  bgm_buf_frames = out;
   bgm_buf_pos = 0;
-  return got;
+  return out;
 }
 
 static void mix(s16 *dst, int frames) {
@@ -297,14 +336,23 @@ static void mix(s16 *dst, int frames) {
 
 static void audio_thread(void *arg) {
   (void)arg;
+  static u64 last_beat;
+  static int wait_diags, mix_diags;
   while (running) {
     AudioOutBuffer *released = NULL;
     u32 count = 0;
-    /* the wait times out after a second, so this doubles as a heartbeat: it
-     * keeps ticking while the main thread is inside the engine, which is how a
-     * stall gets told apart from a crash when there is no debugger around */
-    if (R_FAILED(audoutWaitPlayFinish(&released, &count, 1000000))) {
-      static u64 last_beat;
+    /* audoutWaitPlayFinish() takes NANOSECONDS.  1000000 was 1 ms, not the
+     * "one second" the old comment claimed, so the thread spun ~1000x/s and
+     * libnx's eventClear() at the top of the wait raced the release signal.
+     * One 1024-frame buffer at 48 kHz is 21.3 ms; 33 ms is a full period. */
+    const Result rc = audoutWaitPlayFinish(&released, &count, 33333333ULL);
+    if (R_FAILED(rc)) {
+      if (wait_diags < 8) {
+        wait_diags++;
+        debugPrintf("audio: wait rc 0x%x released=%p count=%u state=%d\n",
+                    rc, (void *)released, count,
+                    (int)audoutGetDeviceState());
+      }
       const u64 now = armGetSystemTick();
       if (now - last_beat >= armGetSystemTickFreq()) {
         last_beat = now;
@@ -316,8 +364,8 @@ static void audio_thread(void *arg) {
           ((char *)probe)[0] = 1;
           free(probe);
         }
-        debugPrintf("audio: alive (malloc %s, jni %s)\n",
-                    probe ? "ok" : "FAILED", jni_last_method());
+        debugPrintf("audio: alive (malloc %s, jni %s, mixed %d)\n",
+                    probe ? "ok" : "FAILED", jni_last_method(), mix_diags);
       }
       continue;
     }
@@ -327,7 +375,12 @@ static void audio_thread(void *arg) {
     mutexLock(&lock);
     mix(buf, out_frames);
     mutexUnlock(&lock);
-    audoutAppendAudioOutBuffer(released);
+    const Result arc = audoutAppendAudioOutBuffer(released);
+    if (mix_diags < 5) {
+      mix_diags++;
+      debugPrintf("audio: MIX %d frames buffer=%p append rc 0x%x\n",
+                  out_frames, (void *)released, arc);
+    }
   }
 }
 
@@ -351,16 +404,25 @@ void audio_init(void) {
     out_buffers[i].buffer = out_data[i];
     out_buffers[i].buffer_size = out_buffer_bytes;
     out_buffers[i].data_size = out_buffer_bytes;
-    audoutAppendAudioOutBuffer(&out_buffers[i]);
+    /* The old code ignored this result.  If the service refuses all four
+     * buffers, the mixer thread waits forever for a release that can never
+     * happen and the game is silent with no error anywhere. */
+    const Result rc = audoutAppendAudioOutBuffer(&out_buffers[i]);
+    debugPrintf("audio: append %d (%d bytes @ %p) rc 0x%x\n",
+                i, out_buffer_bytes, out_data[i], rc);
   }
 
   running = 1;
-  threadCreate(&thread, audio_thread, NULL, NULL, 0x8000, 0x1C, -2);
+  const Result trc = threadCreate(&thread, audio_thread, NULL, NULL,
+                                  0x8000, 0x1C, -2);
+  debugPrintf("audio: thread create rc 0x%x\n", trc);
   threadStart(&thread);
 
   sfx_gain = cfg.sfx_volume / 100.0f;
   bgm_gain = cfg.music_volume / 100.0f;
-  debugPrintf("audio: audout %d Hz, %d frames/buffer, %d buffers\n",
+  debugPrintf("audio: audout device %u Hz / %u ch, mixer %d Hz, "
+              "%d frames/buffer, %d buffers\n",
+              audoutGetSampleRate(), audoutGetChannelCount(),
               cfg.audio_freq, out_frames, AUDOUT_BUFFERS);
 }
 

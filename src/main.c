@@ -39,6 +39,7 @@
 #include "jni_fake.h"
 #include "egl_helper.h"
 #include "audio.h"
+#include "audio_bridge.h"
 #include "text.h"
 #include "input.h"
 
@@ -8838,6 +8839,24 @@ static const so_override res_overrides[] = {
   { "_ZN15ResourceManager15FindInformationEj", (void *)rm_find_logged },
 };
 
+/* Replace the engine's Java-backed sound API at the C level.  On Android
+ * CS_mdaSound* forwards everything into CSoundManager through JNI; here the
+ * fake JNIEnv cannot service it (see audio_bridge.c for the full diagnosis),
+ * so it is the one place where a no-op shell has been silently swallowing
+ * every sound since the port began. */
+static const so_override audio_overrides[] = {
+  { "CS_mdaSoundCreate",        (void *)nx_mda_sound_create },
+  { "CS_mdaSoundPrepare",       (void *)nx_mda_sound_prepare },
+  { "CS_mdaSoundPlay",          (void *)nx_mda_sound_play },
+  { "CS_mdaSoundStop",          (void *)nx_mda_sound_stop },
+  { "CS_mdaSoundDestroy",       (void *)nx_mda_sound_destroy },
+  { "CS_mdaSoundPause",         (void *)nx_mda_sound_pause },
+  { "CS_mdaSoundResume",        (void *)nx_mda_sound_resume },
+  { "CS_mdaSoundSetVolume",     (void *)nx_mda_sound_set_volume },
+  { "CS_mdaSoundGetVolume",     (void *)nx_mda_sound_get_volume },
+  { "CS_mdaStopAll",            (void *)nx_mda_stop_all },
+};
+
 static const so_override probe_overrides[] = {
   { "GAME_ExitSaveSlotSelectCharacter",    (void *)probe_exit_saveslot },
   { "MAP_Load",                            (void *)probe_map_load },
@@ -9183,6 +9202,13 @@ int main(int argc, char **argv) {
                 (unsigned)(sizeof(drm_overrides) / sizeof(*drm_overrides)));
   }
 
+  /* Deliberately outside the skip_drm branch: sound is unrelated to the DRM
+   * patch set and must work whichever config the player uses. */
+  so_set_overrides(audio_overrides,
+                   (int)(sizeof(audio_overrides) / sizeof(*audio_overrides)));
+  debugPrintf("main: %u audio entry points overridden\n",
+              (unsigned)(sizeof(audio_overrides) / sizeof(*audio_overrides)));
+
   so_relocate(&game_mod);
   const int missing = so_resolve(&game_mod, dynlib_functions, dynlib_numfunctions, 1);
   if (missing)
@@ -9238,7 +9264,7 @@ int main(int argc, char **argv) {
   text_set_default_size(cfg.text_px > 0 ? cfg.text_px
                                         : 26 * cfg.text_px_scale / 100);
   jni_init();
-
+  audio_bridge_init();
 
   /* Run the engine on the launching thread. A dedicated thread with a larger
    * stack was tried and made hardware worse (it died a step earlier), so the
