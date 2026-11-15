@@ -272,12 +272,18 @@ static int clip_active, clip_top, clip_x1, clip_y1;
 static unsigned str_hash(const char *s);
 extern int input_take_drag_dy(void);
 extern int input_drag_start(float *x, float *y);
+/* defined with the control-tree safety layer below */
+static int ctrl_object_ok(const void *c);
 /* ControlObject_GetAbsoluteRect(obj, out) -- out is {x, y, w, h} in engine units.
  * The out pointer travels in x8 (the ARM64 indirect result register), which a
  * plain C call cannot express, so it is invoked through a one-instruction
  * trampoline. */
 static void (*ctrl_abs_rect)(void *, void *);
 static void abs_rect_call(void *obj, int *out) {
+  /* GetAbsoluteRect walks the parent chain. A control left over from the
+   * previous scene can still be mapped while its +0xa0 is recycled garbage. */
+  if (!ctrl_object_ok(obj))
+    return;                       /* out keeps the caller's defaults */
   register void *r0 __asm__("x0") = obj;
   register int *r8 __asm__("x8") = out;
   __asm__ __volatile__("blr %2"
@@ -1399,9 +1405,9 @@ static volatile long shop_btn_rect[4];
 static volatile int  shop_btn_seen;
 /* The wide black plate under the daily-reward tip shares its geometry with
  * every other tutorial hint, so it can only be dropped on frames where our
- * text drawer actually saw the retired line (current OR previous frame: the
- * plate is submitted before the glyphs). */
-static volatile int g_shop_hint_cur, g_shop_hint_prev;
+ * text drawer recently saw the retired line. The plate is submitted BEFORE
+ * the glyphs, hence a multi-frame hold instead of a one-frame flag. */
+static volatile int g_shop_hint_hold;
 
 /* The virtual-key layer's own draw loop inside UIPlayPorting_Draw:
  *   0x15bf98  InputLayer_GetVirtualKey / ControlObject_GetCount / GetHead
@@ -2296,7 +2302,7 @@ static void desc_scroll_tick(void) {
   if (!base || !ctrl_get_data)
     return;
   void *sc = *(void **)(base + DESC_SCROLL_GLOBAL);
-  if (!sc || !probe_mem_ok(sc, 0x20))
+  if (!sc || !ctrl_object_ok(sc))
     return;
   void *sd = ctrl_get_data(sc);
   if (!sd || !probe_mem_ok(sd, 0xb0))
@@ -2395,10 +2401,10 @@ static void nx_textctrl_draw(void *ctrl, int x, int y) {
   }
   /* THIS is where the daily-reward tip is actually painted (a TEXTCTRL2 whose
    * string comes from tctrl_lookup), not nx_grp_draw_string. Skipping it also
-   * arms the wide backing-plate filter in nx_glDrawArrays for this frame and
-   * the next one (the plate is submitted before the glyphs). */
+   * arms the wide backing-plate filter in nx_glDrawArrays for the next few
+   * frames (the plate is submitted before the glyphs). */
   if (is_shop_hint(str)) {
-    g_shop_hint_cur = 1;
+    g_shop_hint_hold = 12;
     static int logs;
     if (logs < 3) {
       logs++;
@@ -2876,6 +2882,86 @@ static fn_ctrl_child p_ctrl_child;
 static fn_ctrl_count p_ctrl_count;
 static fn_ctrl_proc p_ctrl_proc;
 static void (*p_delete_child)(void *parent, void *child);
+
+/* ------------------------------------------------------------------------- *
+ * Scene-switch safety net.
+ *
+ * libgame.so rebuilds the whole control tree at every scene change (picking a
+ * class, entering a battle, returning to the map). Every pointer this port
+ * keeps across frames -- quick_objs, last_good_root, nav_page_obj, ... -- and
+ * every pointer read live out of an engine global (the description panel at
+ * +0x2b5a28 is one) can then point into heap that is still mapped but has
+ * been reused. ControlObject_GetAbsoluteRect walks the +0xa0 parent chain, so
+ * one recycled word is a data abort (2168-0002). That is the COMMON cause of
+ * the 20:03 opening-cutscene crash and the 00:33 battle-end crash, even
+ * though their callers were completely different (quick-slot layout vs. the
+ * description-panel hit test).
+ *
+ * Guard at the choke points instead of patching 50+ call sites: resolve the
+ * engine's tree accessors once during startup and hand every caller a
+ * validating wrapper. A rejected object yields an empty rect / no children /
+ * no event, never a call into the engine.
+ * ------------------------------------------------------------------------- */
+static fn_abs_rect   abs_rect_engine;
+static fn_ctrl_id    ctrl_id_engine;
+static fn_ctrl_child ctrl_child_engine;
+static fn_ctrl_count ctrl_count_engine;
+
+static int ctrl_object_ok(const void *c) {
+  if (!probe_mem_ok(c, 0xb0))
+    return 0;
+  /* ControlObject_GetChild uses an inline LINKEDLIST at +0xa8 (head at +0),
+   * whose items have next at +0x10 and data at +0x08. The engine calls
+   * LINKEDLISTITEM_getData() on those nodes without any check: a recycled
+   * object whose list head became 1 crashed at engine+0x13357c
+   * (ldr x0,[x0,#8] -> address 9) during a shop "yes" press. Validate the
+   * head chain once here so every p_ctrl_child()/p_ctrl_count() caller is
+   * covered, not just the diagnostic that happened to trip over it. */
+  const void *node = *(void *const volatile *)((const unsigned char *)c + 0xa8);
+  for (int k = 0; k < 8 && node; k++) {
+    if (!probe_mem_ok(node, 0x20))
+      return 0;
+    node = *(void *const volatile *)((const unsigned char *)node + 0x10);
+  }
+  /* Mirror the recursion in ControlObject_GetAbsolutePoint: each level reads
+   * [obj+0xa0] and dereferences it. Eight levels is deeper than any UI tree
+   * here, and a recycled pointer fails the mapping test long before that. */
+  const void *p = c;
+  for (int depth = 0; depth < 8 && p; depth++) {
+    if (!probe_mem_ok(p, 0xb0))
+      return 0;
+    /* ControlObject_GetCount/GetChild read the child count at +0x78 and walk
+     * the embedded list at +0xa8. A recycled object can keep a perfectly
+     * plausible parent chain while that list is garbage, and the engine
+     * dereferences LINKEDLISTITEM nodes without checks (09:03 shop-sell crash:
+     * a list node of 1 -> ldr x0,[x0,#8] -> address 9). Real controls have
+     * well under 128 children (class screen ~37 controls total, save list 26). */
+    const unsigned kids = *(const volatile unsigned *)
+        ((const unsigned char *)p + 0x78);
+    if (kids > 128)
+      return 0;
+    p = *(void *const volatile *)((const unsigned char *)p + 0xa0);
+  }
+  return 1;
+}
+
+static CtrlRect safe_abs_rect(void *c) {
+  const CtrlRect empty = { 0, 0, 0, 0 };
+  return ctrl_object_ok(c) && abs_rect_engine ? abs_rect_engine(c) : empty;
+}
+static unsigned safe_ctrl_id(void *c) {
+  return ctrl_object_ok(c) && ctrl_id_engine ? ctrl_id_engine(c) : 0u;
+}
+static void *safe_ctrl_child(void *c, int i) {
+  return ctrl_object_ok(c) && ctrl_child_engine ? ctrl_child_engine(c, i) : NULL;
+}
+static int safe_ctrl_count(void *c) {
+  return ctrl_object_ok(c) && ctrl_count_engine ? ctrl_count_engine(c) : 0;
+}
+static long safe_colevent(void *c, long code, void *data, long extra) {
+  return ctrl_object_ok(c) && colevent_real
+             ? colevent_real(c, code, data, extra) : 0;
+}
 /* Event procs used to recognise a UI_PopupProcess info box's 确认 button by
  * control TYPE + tree shape instead of hardcoded screen coordinates. */
 static void *ctrl_button_proc, *ctrl_scroll_proc;
@@ -2909,6 +2995,8 @@ static void *ctrl_item_proc, *ctrl_skill_proc, *ctrl_menu_sub_proc;
  * the game would have done with a server answer of "already gone". So the bin
  * tap records which slot it was for, and the OK button performs the deletion
  * here. The engine's own path still runs afterwards, unchanged. */
+/* defined with the input-tree helpers further down */
+static int screen_has_save_rows(void);
 static int pending_delete_slot = -1;   /* 0..2 while a bin-tap confirm is up */
 static int delete_request;             /* slot + 1, performed from the main loop */
 static int refresh_list_frames;        /* rebuild the save page after deleting */
@@ -2990,31 +3078,38 @@ static unsigned popup_queue_count(void) {
 }
 
 static void note_bin_tap(void *root, int x, int y, unsigned popups_before) {
+  /* Clear first: a stale pending slot survives into the 45-frame fallback and
+   * would run the engine's delete handler on whatever page is up by then. */
+  pending_delete_slot = -1;
+  bin_del_ctl = NULL;
   if (!root || !p_abs_rect)
     return;
-  void *c = find_small_control(root, x, y, 0);
-  if (!c) {
-    pending_delete_slot = -1;
+  /* A 67x67 "是" button at x=934 in the ability-point confirm dialog was
+   * mistaken for a save-slot bin. The fallback then called
+   * SaveSlot_SlotButtonDelExe off the save page, where SAVE_GetSaveSlot()
+   * returns NULL and the handler dereferences it (2168-0002, 08:46). Only the
+   * real save list, with its 634x150 rows, may arm a bin tap. */
+  if (!screen_has_save_rows())
     return;
-  }
+  void *c = find_small_control(root, x, y, 0);
+  if (!c)
+    return;
   const CtrlRect r = p_abs_rect(c);
-  /* the bin column sits at the right edge of each slot row, and the three bins
-   * are at y = 134 / 300 / 466 on this page -- matching the row exactly keeps a
-   * "是" button in some other dialog from being mistaken for one */
+  /* The bin column is at x=848, 66x66, at y = 134 / 300 / 466. Require that
+   * column itself, not merely "somewhere on the right half of the screen". */
   static const int row_y[3] = { 134, 300, 466 };
   int slot = -1;
   for (int i = 0; i < 3; i++)
     if (r.y >= row_y[i] - 14 && r.y <= row_y[i] + 14)
       slot = i;
-  if (r.x < 800 || slot < 0) {
-    pending_delete_slot = -1;
+  if (r.x < 820 || r.x > 880 || r.w < 55 || r.w > 80 ||
+      r.h < 55 || r.h > 80 || slot < 0)
     return;
-  }
   pending_delete_slot = slot;
   bin_tap_frame = (int)g_frame_no;
   bin_tap_popups = popups_before;
   bin_del_ctl = c;   /* kept for the log only; nothing acts on it */
-  debugPrintf("save: bin tapped, assuming slot %d (rect %d,%d %dx%d)\n",
+  debugPrintf("save: bin tapped, assuming slot %d (rect %ld,%ld %ldx%ld)\n",
               pending_delete_slot, r.x, r.y, r.w, r.h);
 }
 
@@ -3092,8 +3187,18 @@ static void delete_fallback_tick(void) {
   del_fallback_frames = 0;
   void *bin = bin_del_ctl;
   bin_del_ctl = NULL;                 /* one attempt per tap */
+  /* Never invoke the engine's delete handler off the save page. It calls
+   * SAVE_GetSaveSlot() and dereferences the result without a NULL check, so a
+   * misidentified tap on any other dialog is a data abort. Belt and braces:
+   * re-check the page and the control object here too. */
+  if (!screen_has_save_rows() || !ctrl_object_ok(bin)) {
+    debugPrintf("save: delete fallback skipped (not on the save page)\n");
+    pending_delete_slot = -1;
+    return;
+  }
   debugPrintf("save: bin tap was swallowed, running the delete handler for "
               "slot %d\n", pending_delete_slot);
+  debugFlush();   /* keep the last line on the SD card if the handler aborts */
   del_button_real(bin);
 }
 
@@ -3211,6 +3316,8 @@ static void kill_stale_overlay(void) {
           debugPrintf("ui: deleting stale overlay %p (child %d at %ld,%ld)\n",
                       c, j, r.x, r.y);
         }
+        if (!ctrl_object_ok(root) || !ctrl_object_ok(c))
+          return;
         p_delete_child(root, c);
         return;
       }
@@ -3751,10 +3858,36 @@ static void quick_layout_parse(void) {
 static void quick_layout_apply_slot(void *c, int slot, const char *tag) {
   if (!cfg.quick_layout || !quick_pos_ok || slot < 0 || slot > 5 || !p_abs_rect)
     return;
+  /* quick_objs[] survives for up to 30 frames. Leaving the class screen for
+   * the opening cutscene rebuilds the whole control tree: a cached pointer is
+   * still readable, but its +0xa0 parent field is now recycled heap data.
+   * ControlObject_GetAbsoluteRect recurses through that parent, which on real
+   * hardware is a data abort at engine+0x130a0c (Atmosphere 2168-0002); the
+   * emulator's heap happened to keep plausible values there. Validate the
+   * object from its OWN fields before handing it to the engine. */
+  if (!probe_mem_ok(c, 0xb0))
+    return;
+  volatile long *rel = (volatile long *)((unsigned char *)c + 0x18);
+  if (rel[2] != 80 || rel[3] != 80) {   /* relative w/h at +0x28 / +0x30 */
+    static int logs;
+    if (logs < 8) {
+      logs++;
+      debugPrintf("quick: stale %s slot %d rejected (rect %ldx%ld)\n",
+                  tag, slot, rel[2], rel[3]);
+    }
+    return;
+  }
+  void *parent = *(void *volatile *)((unsigned char *)c + 0xa0);
+  if (parent) {
+    if (!probe_mem_ok(parent, 0xb0))
+      return;
+    void *gp = *(void *volatile *)((unsigned char *)parent + 0xa0);
+    if (gp && !probe_mem_ok(gp, 0xb0))
+      return;
+  }
   const CtrlRect ar = p_abs_rect(c);
   if (ar.w != 80 || ar.h != 80)
     return;
-  volatile long *rel = (volatile long *)((unsigned char *)c + 0x18);
   const long dx = ar.x - rel[0];       /* parent offset, normally 0 */
   const long dy = ar.y - rel[1];
   const long nx = quick_pos[slot][0] - dx;
@@ -3778,7 +3911,7 @@ static void quick_layout_frame(void) {
     return;
   for (int i = 0; i < 12; i++) {
     void *c = quick_objs[i];
-    if (!c || !probe_mem_ok(c, 0x38))
+    if (!c || !probe_mem_ok(c, 0xb0))
       continue;
     quick_layout_apply_slot(c, i % 6, i >= 6 ? "assign page" : "HUD");
   }
@@ -3840,7 +3973,7 @@ void quick_slot_fire(int slot, int press) {
   if (!cfg.quick_layout || !quick_pos_ok || slot < 0 || slot > 5)
     return;
   void *obj = quick_objs[slot];
-  if (!obj || !probe_mem_ok(obj, 0x38)) {
+  if (!obj || !probe_mem_ok(obj, 0xb0)) {
     debugPrintf("quick: pad slot %d has no live control\n", slot);
     return;
   }
@@ -3973,6 +4106,25 @@ static NavItem nav_items_buf[NAV_MAX_ITEMS];
 static NavItem nav_back_item;
 static int nav_tabs_n, nav_items_n;
 static void *nav_page_obj, *nav_tab_obj;
+
+/* Every scene change rebuilds the control tree. Drop every pointer the port
+ * keeps across frames so the next scan re-collects from the live tree. The
+ * validating wrappers are the real crash guard; this stops the port from
+ * acting on a stale-but-mapped object in the first place. */
+static void scene_caches_reset(void) {
+  memset(quick_objs, 0, sizeof(quick_objs));
+  last_good_root = NULL;
+  nav_page_obj = NULL;
+  nav_tab_obj = NULL;
+  pending_ctl = NULL;
+  bin_del_ctl = NULL;
+  hud_nodes = 0;
+  hud_hide_count = 0;
+  g_ui_page_open = 0;
+  quick_assign_slot = 0;
+  shop_btn_seen = 0;
+  g_shop_hint_hold = 0;
+}
 
 /* Four families of page live in the SAME control tree. The root keeps one
  * full-screen 1137x640 child per layer, in stacking order: title, then the
@@ -4689,9 +4841,12 @@ static void nav_scan(void) {
 
 static void hud_tick(void) {
   static int frames;
-  /* rotate the hint-plate suppression window once per frame */
-  g_shop_hint_prev = g_shop_hint_cur;
-  g_shop_hint_cur = 0;
+  /* The backing plate is submitted BEFORE the glyphs, so a one-frame flag
+   * always let the first plate through, and a two-frame window let it flicker
+   * back whenever the text skipped a frame. Hold the suppression for a short
+   * run of frames after the retired line was last seen. */
+  if (g_shop_hint_hold > 0)
+    g_shop_hint_hold--;
   quick_layout_frame();          /* every frame, not just the scan frames */
   static int nav_frames;
   if (++nav_frames % 4 == 0)
@@ -4708,6 +4863,10 @@ static void hud_tick(void) {
   hud_hide_count = 0;
   g_ui_page_open = 0;
   quick_assign_slot = 0;
+  /* The tree is rebuilt on a scene change. Drop every cached slot first, so
+   * hud_scan_node() publishes only objects that are live in THIS tree; a slot
+   * that is not found stays NULL instead of pointing into freed controls. */
+  memset(quick_objs, 0, sizeof(quick_objs));
   shop_btn_seen = 0;
   input_set_shop_rect(0, 0, 0, 0, 0);
   input_hud_begin();
@@ -4769,12 +4928,116 @@ static void dump_control(void *obj) {
 }
 
 /* depth of the dispatch recursion (see the forwarding rule below) */
+/* The shop's sell/yes-no controls live in a layer that is a SIBLING of the
+ * item grid, and TouchHandle_Event can pick the grid layer as its root. The
+ * engine then either hits an item cell or comes back empty ("sell does
+ * nothing"). Find the real ControlButton under the point across ALL layers of
+ * the live tree and hand the event straight to it. Item cells use a different
+ * event proc (0x13e36c) so they are never mistaken for buttons. */
+static void *live_button_at(void *node, long x, long y, int depth) {
+  if (!node || depth > 6 || !p_ctrl_count || !p_ctrl_child || !p_abs_rect ||
+      !p_ctrl_proc || !ctrl_button_proc)
+    return NULL;
+  const int n = p_ctrl_count(node);
+  for (int i = n - 1; i >= 0; i--) {      /* last child is drawn on top */
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    void *sub = live_button_at(c, x, y, depth + 1);
+    if (sub)
+      return sub;
+    const CtrlRect r = p_abs_rect(c);
+    if (r.w >= 40 && r.w <= 400 && r.h >= 25 && r.h <= 120 &&
+        x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h &&
+        p_ctrl_proc(c) == ctrl_button_proc)
+      return c;
+  }
+  return NULL;
+}
+
 static int colevent_depth;
 static int colevent_forwarding;
 
+/* A sell / yes-no button can be covered by a 74x74 item cell in a sibling
+ * layer. The engine's hit test then returns 1 FOR THE CELL, so an r==0
+ * fallback never gets a chance -- that is the intermittent "tap hits the grid
+ * behind the button". Detect the overlap and dispatch BEFORE the engine. */
+/* Is this the shop / inventory page? Its two 4x4 grids are 74x74 ControlItem
+ * cells. The engine's cell hit boxes are LARGER than the logged rects, so a
+ * point-in-rect test can miss the very cell that ate the tap; gate on the page
+ * as a whole instead. */
+static int shop_page_has_grid(void *node, int depth) {
+  if (!node || depth > 6 || !p_ctrl_count || !p_ctrl_child || !p_abs_rect ||
+      !p_ctrl_proc || !ctrl_item_proc)
+    return 0;
+  int cells = 0;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    const CtrlRect r = p_abs_rect(c);
+    if (r.w >= 60 && r.w <= 90 && r.h >= 60 && r.h <= 90 &&
+        p_ctrl_proc(c) == ctrl_item_proc)
+      cells++;
+    if (shop_page_has_grid(c, depth + 1))
+      return 1;
+    if (cells >= 8)
+      return 1;
+  }
+  return cells >= 8;
+}
+
+/* Returns the button's result, or -1 when normal dispatch should proceed. */
+static long shop_button_pre_dispatch(const long *pt, long code, void *data,
+                                     long extra, void *obj) {
+  unsigned char *vb = (unsigned char *)game_mod.load_virtbase;
+  void *dp = vb ? *(void **)(vb + 0x2b5a28) : NULL;
+  void *page = (dp && ctrl_object_ok(dp))
+                   ? *(void *const volatile *)((unsigned char *)dp + 0xa0)
+                   : NULL;
+  /* While the shop page is up, any real button under the point wins: the
+   * grids behind the panel must not answer that tap ("shield the occluded
+   * area"). Pages without the item grids keep the engine's normal dispatch. */
+  if (!page || !ctrl_object_ok(page) || !shop_page_has_grid(page, 0))
+    return -1;
+  void *btn = live_button_at(page, pt[0], pt[1], 0);
+  if (!btn || btn == obj)
+    return -1;
+  colevent_forwarding = 1;
+  const long r = safe_colevent(btn, code, data, extra);
+  colevent_forwarding = 0;
+  static int logs;
+  if (logs < 16) {
+    logs++;
+    debugPrintf("ui: shop button %p pre-dispatch code %04lx at (%ld,%ld) "
+                "-> %ld\n", btn, code, pt[0], pt[1], r);
+  }
+  return r;
+}
+
 static long nx_ControlObject_EventProc(void *obj, long code, void *data,
                                        long extra) {
+  /* A control left over from the previous scene must not reach any engine
+   * call here -- even the log path asks GetAbsoluteRect for its rectangle. */
+  if (obj && !ctrl_object_ok(obj)) {
+    static int stale_logs;
+    if (stale_logs < 8) {
+      stale_logs++;
+      debugPrintf("ui: stale control %p rejected at event dispatch\n", obj);
+    }
+    return 0;
+  }
   colevent_depth++;
+  if (colevent_depth == 1 && !colevent_forwarding && data &&
+      (code == 0x17 || code == 0x18)) {
+    const long pr = shop_button_pre_dispatch((const long *)data, code, data,
+                                             extra, obj);
+    if (pr >= 0) {
+      colevent_depth--;
+      return pr;
+    }
+  }
   /* Page tabs first. A stale detail panel on the backpack tab covers the left
    * half of the tab row and eats the press before the tab bar is reached. */
   if (colevent_depth == 1 && !colevent_forwarding && data &&
@@ -4784,7 +5047,7 @@ static long nx_ControlObject_EventProc(void *obj, long code, void *data,
     if (tab_obj) {
       colevent_forwarding = 1;
       const long trr = colevent_real
-                           ? colevent_real(tab_obj, code, data, extra) : 0;
+                           ? safe_colevent(tab_obj, code, data, extra) : 0;
       colevent_forwarding = 0;
       static int tablogs;
       if (tablogs < 20) {
@@ -4815,7 +5078,7 @@ static long nx_ControlObject_EventProc(void *obj, long code, void *data,
         target = quick_objs[s];
       if (target && probe_mem_ok(target, 0x38)) {
         colevent_forwarding = 1;
-        const long qr = colevent_real ? colevent_real(target, code, data, extra)
+        const long qr = colevent_real ? safe_colevent(target, code, data, extra)
                                      : 0;
         colevent_forwarding = 0;
         static int logs;
@@ -4842,7 +5105,7 @@ static long nx_ControlObject_EventProc(void *obj, long code, void *data,
     if (crow != -1 && choice_obj) {   /* >=0 = row, -2 = content control */
       colevent_forwarding = 1;
       const long cr = colevent_real
-                          ? colevent_real(choice_obj, code, data, extra) : 0;
+                          ? safe_colevent(choice_obj, code, data, extra) : 0;
       colevent_forwarding = 0;
       static int clogs;
       if (clogs < 24) {
@@ -4854,7 +5117,7 @@ static long nx_ControlObject_EventProc(void *obj, long code, void *data,
       return cr;
     }
   }
-  long r = colevent_real ? colevent_real(obj, code, data, extra) : 0;
+  long r = colevent_real ? safe_colevent(obj, code, data, extra) : 0;
   /* The description panel (the right-hand side of the skill / item windows) is
    * a SIBLING of the window's big content panel, and that panel's rectangle is
    * the whole window (1137x431) -- so the dispatch walks it first, gets 0 back
@@ -4866,26 +5129,32 @@ static long nx_ControlObject_EventProc(void *obj, long code, void *data,
    * panel here. */
   if (r == 0 && colevent_depth == 1 && !colevent_forwarding &&
       (code == 0x17 || code == 0x18 || code == 0x19) && data) {
+    const long *pt = (const long *)data;
+    /* The engine did not claim this press -- usually because TouchHandle_Event
+     * routed it to the item-grid layer while the sell / yes-no buttons live in
+     * a sibling layer. Do NOT forward to the 409x431 info panel container
+     * (that used to run its close path and shut the shop); find the actual
+     * button under the point in the live tree and dispatch to it instead. */
+    /* Start from the info panel's PARENT: in the shop tree that is the page
+     * container holding the confirm box, the info panel and the item grid as
+     * siblings. Searching the whole live root instead would also reach HUD
+     * buttons hidden behind the shop and fire spurious actions. */
     unsigned char *vb = (unsigned char *)game_mod.load_virtbase;
     void *dp = vb ? *(void **)(vb + 0x2b5a28) : NULL;
-    const long *pt = (const long *)data;
-    if (dp && dp != obj && p_abs_rect) {
-      const CtrlRect dpr = p_abs_rect(dp);
-      if (dpr.w >= 100 && dpr.h >= 60 && pt[0] >= dpr.x &&
-          pt[0] < dpr.x + dpr.w && pt[1] >= dpr.y && pt[1] < dpr.y + dpr.h &&
-          !(pt[0] >= 645 && pt[0] < 1003 && pt[1] >= 193 && pt[1] < 493)) {
-        colevent_forwarding = 1;
-        r = colevent_real(dp, code, data, extra);
-        colevent_forwarding = 0;
-        {
-          static int fl;
-          if (fl < 12) {
-            fl++;
-            debugPrintf("ui: desc panel %p rect %ld,%ld %ldx%ld forwarded "
-                        "code %04lx at (%ld,%ld) -> %ld\n", dp, dpr.x, dpr.y,
-                        dpr.w, dpr.h, code, pt[0], pt[1], r);
-          }
-        }
+    void *page = (dp && ctrl_object_ok(dp))
+                     ? *(void *const volatile *)((unsigned char *)dp + 0xa0)
+                     : NULL;
+    void *btn = (page && ctrl_object_ok(page))
+                    ? live_button_at(page, pt[0], pt[1], 0) : NULL;
+    if (btn && btn != obj) {
+      colevent_forwarding = 1;
+      r = safe_colevent(btn, code, data, extra);
+      colevent_forwarding = 0;
+      static int logs;
+      if (logs < 16) {
+        logs++;
+        debugPrintf("ui: cross-layer button %p code %04lx at (%ld,%ld) "
+                    "-> %ld\n", btn, code, pt[0], pt[1], r);
       }
     }
   }
@@ -5028,6 +5297,17 @@ static int screen_has_save_rows(void) {
 }
 
 static long nx_TouchHandle_Event(void *root, long code, long coord, long extra) {
+  /* Scene changes rebuild the tree. A root that no longer validates must not
+   * be handed to the engine's hit test; the fallback below picks the live one. */
+  if (root && !ctrl_object_ok(root)) {
+    static int stale_logs;
+    if (stale_logs < 8) {
+      stale_logs++;
+      debugPrintf("ui: stale event root %p dropped (using live root)\n", root);
+    }
+    root = NULL;
+    scene_caches_reset();
+  }
   /* After the Hive prompt is cancelled the engine clears InputLayer's root
    * (global 0x2b4000+0x140) and never restores it, so every later tap hits
    * TouchHandle_Event with root NULL and dies in the hit test. Keep the last
@@ -5083,7 +5363,7 @@ static long nx_TouchHandle_Event(void *root, long code, long coord, long extra) 
     }
     {
       void *box = popup_base_real ? popup_base_real() : NULL;
-      if (box && probe_mem_ok(box, 8) && box != root) {
+      if (box && ctrl_object_ok(box) && box != root) {
         static int box_logs;
         if (box_logs < 6) {
           box_logs++;
@@ -5174,8 +5454,14 @@ have_root:;
    * from here was tried and removed: the engine's own SaveSlot_SlotButtonExe
    * already stores it, and poking engine state from the touch path garbled the
    * UI (the screen flickered and the hit test went dead). */
+  /* row_under() is a pure save-page diagnostic (its result is only logged),
+   * but it recursively walks GetChild/GetAbsoluteRect on every release. On a
+   * shop / ability confirm dialog that tree belongs to another scene and its
+   * child lists are recycled -- which is how pressing "是" data-aborted inside
+   * LINKEDLISTITEM_getData. Gate it on the real save list. */
   if ((code & 0xffff) == 0x18 && coord &&
-      probe_mem_ok((const void *)(uintptr_t)coord, 16)) {
+      probe_mem_ok((const void *)(uintptr_t)coord, 16) &&
+      screen_has_save_rows()) {
     const int px = (int)*(volatile long *)(uintptr_t)coord;
     const int py = (int)*(volatile long *)((uintptr_t)coord + 8);
     const int row = row_under(root, px, py, 0);
@@ -5184,6 +5470,16 @@ have_root:;
                   select_scene_up);
   }
   const unsigned popups_before = popup_queue_count();
+  /* root may have been replaced above with the topmost layer, a message box or
+   * the live layer root -- all engine pointers. Re-check the final value. */
+  if (root && !ctrl_object_ok(root)) {
+    static int stale_logs;
+    if (stale_logs < 8) {
+      stale_logs++;
+      debugPrintf("ui: stale substituted root %p rejected\n", root);
+    }
+    return 0;
+  }
   const long r = touch_event_real ? touch_event_real(root, code, coord, extra) : 0;
   /* 0x18 is the single-pointer release, i.e. a completed tap. Recording it
    * *after* the engine has dispatched the event means the handler for the
@@ -5193,9 +5489,9 @@ have_root:;
     const int rx = (int)*(volatile long *)(uintptr_t)coord;
     const int ry = (int)*(volatile long *)((uintptr_t)coord + 8);
     note_bin_tap(root, rx, ry, popups_before);
-    /* which row the player actually picked, and what the engine now holds as
-     * its current slot -- the two disagreeing is "the save lands one row over" */
-    (void)row_under(root, rx, ry, 0);
+    /* which row the player actually picked -- same save-page-only walk */
+    if (screen_has_save_rows())
+      (void)row_under(root, rx, ry, 0);
   }
   static int logs;
   if (logs < 400) {
@@ -6577,7 +6873,7 @@ void nx_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
    * on frames where the matching line was seen. Geometry is strict (one wide
    * ~20 px strip at y 152..172); every other plate in the game is untouched.
    * This is a text-driven cut, not a screen-region mask. */
-  if ((g_shop_hint_cur || g_shop_hint_prev) && vptr && count == 4) {
+  if (g_shop_hint_hold > 0 && vptr && count == 4) {
     const int comps = vsize > 1 ? vsize : 2;
     const int vsz = (vtype == GL_SHORT) ? 2 : 4;
     const int vstep = vstride ? vstride : comps * vsz;
@@ -6744,9 +7040,12 @@ void nx_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
       GLfloat c4[4] = { 0, 0, 0, 0 };
       glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt4);
       glGetFloatv(GL_CURRENT_COLOR, c4);
+      /* The leading f%u needs its own argument. Without it every conversion
+       * shifts by one and %s ends up reading a colour float as a char*, which
+       * is the data abort seen when a battle shout arms this quad dump. */
       debugPrintf("dfq: f%u %.0f,%.0f %.0fx%.0f tex %d %s col %.2f %.2f %.2f %.2f "
                   "blend %d n=%d\n",
-                  qx0, qy0, qx1 - qx0, qy1 - qy0, (int)bt4,
+                  g_frame_no, qx0, qy0, qx1 - qx0, qy1 - qy0, (int)bt4,
                   text_is_our_texture((unsigned)bt4) ? "OURS" : "engine",
                   c4[0], c4[1], c4[2], c4[3], (int)glIsEnabled(GL_BLEND),
                   (int)count);
@@ -7602,6 +7901,7 @@ static void ui_state_line(const char *why) {
       force_new_game_flag("class screen init");                                \
     }                                                                          \
     if (realvar == flow_map_load_real && flow_map_load_real) {                  \
+      scene_caches_reset();                                                \
       select_scene_up = 0;   /* the game started; the save page is gone */      \
     }                                                                          \
     return r;                                                                   \
@@ -7945,7 +8245,7 @@ static unsigned long nx_grp_draw_string(unsigned long a0, unsigned long a1,
   if (!cfg.draw_text)
     return 0;
   if (is_shop_hint(str)) {
-    g_shop_hint_cur = 1;
+    g_shop_hint_hold = 12;
     static int logs;
     if (logs < 3) {
       logs++;
@@ -9266,13 +9566,22 @@ int main(int argc, char **argv) {
                                      unsigned long, unsigned long,
                                      unsigned long, unsigned long))
       so_try_find_addr_rx(&game_mod, "SGL_grpDrawStringWithFont");
-  p_abs_rect = (fn_abs_rect)so_try_find_addr_rx(&game_mod,
+  /* Install the scene-switch safety net: resolve the real accessors once and
+   * give every caller the validating wrappers (see the block near the fn_*
+   * typedefs). Without this each of the 50+ p_abs_rect() sites is a potential
+   * data abort after a scene change. */
+  abs_rect_engine = (fn_abs_rect)so_try_find_addr_rx(&game_mod,
                                                 "ControlObject_GetAbsoluteRect");
-  p_ctrl_id = (fn_ctrl_id)so_try_find_addr_rx(&game_mod, "ControlObject_GetID");
-  p_ctrl_child = (fn_ctrl_child)so_try_find_addr_rx(&game_mod,
+  ctrl_id_engine = (fn_ctrl_id)so_try_find_addr_rx(&game_mod,
+                                                  "ControlObject_GetID");
+  ctrl_child_engine = (fn_ctrl_child)so_try_find_addr_rx(&game_mod,
                                                     "ControlObject_GetChild");
-  p_ctrl_count = (fn_ctrl_count)so_try_find_addr_rx(&game_mod,
+  ctrl_count_engine = (fn_ctrl_count)so_try_find_addr_rx(&game_mod,
                                                     "ControlObject_GetCount");
+  p_abs_rect   = abs_rect_engine   ? safe_abs_rect   : NULL;
+  p_ctrl_id    = ctrl_id_engine    ? safe_ctrl_id    : NULL;
+  p_ctrl_child = ctrl_child_engine ? safe_ctrl_child : NULL;
+  p_ctrl_count = ctrl_count_engine ? safe_ctrl_count : NULL;
   p_ctrl_proc = (fn_ctrl_proc)so_try_find_addr_rx(&game_mod,
                                                   "ControlObject_GetProc");
   /* the shortcut-assign page's slot proc -- its control ids are dynamic */
@@ -10152,6 +10461,9 @@ static void engine_main(void *arg) {
      * keeps the console cool during long sessions */
     if (frames_since_boost_reset < 10 && ++frames_since_boost_reset == 10)
       cpu_boost(0);
+
+    /* one SD-card flush per frame instead of one per log line */
+    debugFlush();
 
     if (++frames == 60)
       debugPrintf("main: 60 frames done\n");

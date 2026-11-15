@@ -1,0 +1,165 @@
+Inotia 4 for Nintendo Switch -- known good snapshot
+
+build stamp : 2026-11-15 12:19:48
+frozen at   : 2026-11-15 19:03 (snapshot taken from build/, no source change
+              after the 12:19 build -- src/main.c 12:19:44 -> build/main.o
+              12:19:47 -> nro 12:19:48)
+nro md5     : 4f97e18f1e3a75bfa6aa63febed6e50d
+nro size    : 9293943 bytes
+config      : config.ini in this folder (= config.prod.ini, md5 248b1315...,
+              unchanged since 2026-11-08; hide_pad_zone = 0, no_pad_art = 1,
+              string_draw = 1, quick_layout = 1,
+              quick_pos = "945,395; 865,475; 1025,475; 945,555; 20,530; 120,530")
+parent      : snapshots/known-good-20261114-1340/ (b838dbc3..., commit fd68c2f)
+              See `git log --oneline fd68c2f..HEAD` for the 19 landing commits.
+
+CLOSEST TO WHAT THE USER ACTUALLY RAN
+  This binary is byte-identical (4f97e18f...) to the copy deployed to
+  %APPDATA%\eden\sdmc\switch\inotia4\ at 2026-11-15 12:28 and to
+  dist/switch/inotia4/. It was NOT rebuilt for this snapshot on purpose: a
+  rebuild changes the build stamp and therefore the md5, and this md5 is the
+  one that was under test.
+
+WHAT THIS SESSION WAS ABOUT
+  The user hit FIVE hard crashes in the field between 2026-11-14 20:03 and
+  2026-11-15 09:03, plus one "sell button sometimes does nothing / closes the
+  page" bug on the shop screen. Every crash was the same shape: port code
+  walking an engine control tree that the scene change had already rebuilt or
+  freed, landing on a reused heap block and data-aborting inside libgame. The
+  answer was not five point fixes; it was one validation layer plus a
+  whitelist on the few remaining tree walks.
+
+CHANGES SINCE 20261114-1340 (.workbuddy/memory/2026-11-15.md)
+  1. Control-tree access is VALIDATED EVERYWHERE (the big one).
+     ctrl_object_ok(obj) walks +0xa0 up to 8 levels, checks the child count
+     (+0x78) and the LINKEDLIST head (+0xa8) chain, and is now the only way
+     port code touches an engine object. 50+ call sites, the x8 trampoline,
+     5 places in the event dispatcher, both hook entry points, the scene-change
+     cache clear and the scroll/delete single points all go through it.
+     Crash signature it kills: engine+0x130a0c ControlObject_GetAbsolutePoint
+     `ldr x0,[x0,#0xa0]` with a dangling x0 (first seen 2026-11-14 20:03, again
+     at 00:33 from p_abs_rect(dp) with dp = *(vb+0x2b5a28)).
+  2. Black highlight bar flicker: the engine commits the backplate one frame
+     before the text, so a 2-frame hold window missed the first frame. Now 12.
+  3. Save-slot delete misidentification. note_bin_tap treated the 67x67 "yes"
+     button of a popup at (934,125) as a save delete bin; delete_fallback_tick
+     then called the engine's delete 45 frames later, and outside the save page
+     SAVE_GetSaveSlot() is NULL -> crash at SaveSlot_SlotButtonDelExe+0x20
+     (`ldrb [x0,#2]`, x0=0). Fix: require a live tree WITH save rows, tighten
+     the bin column to x 820..880 (the real bins sit at x 848), clear stale
+     state on entry, and re-validate right before calling the engine.
+  4. Only-on-hardware frame drops during effects/blinks were LOG I/O, not GL:
+     every log line did fflush(SD) + fflush(stdout) + svcOutputDebugString even
+     at log_level = 2. Now one debugFlush per frame and stdout/SVC only when
+     log_level >= 3. No GL query and no glReadPixels was touched.
+  5. row_under() was a pure log-diagnostic that recursed the whole tree on
+     every release, on every page. On the shop screen the old scene's child
+     list head was reused as 1 -> crash at LINKEDLISTITEM_getData+0x... (x0=1).
+     Both calls are now gated by screen_has_save_rows(); 08:46 had only gated
+     note_bin_tap and missed this one.
+  6. Shop "sell" tap sometimes swallowed or closing the page. Three rounds:
+     a. the description-panel fallback in nx_ControlObject_EventProc forwarded
+        any unclaimed point inside *(vb+0x2b5a28) -- which is always the big
+        page container (409x431 @ y=133), not the real description scroller
+        (*(vb+0x2b5a30), 358x258 @ y=193). Added a geometry whitelist
+        (w330..390 / h230..320 / y180..210), else `ui: desc panel skip`.
+     b. disabling that fallback made sell do nothing instead: the sell /
+        confirm buttons are SIBLING layers of the 2-children page root, so they
+        are not in the dispatch tree at all. Added cross-layer dispatch: from
+        the info board's parent, hand the press to the matching
+        ctrl_button_proc (0x13ddf4) button -- grid slots are 0x13e36c and are
+        excluded by proc, and the scope stops at that container so HUD buttons
+        can never be hit.
+     c. the real cause of "sometimes": a grid slot's hit box is larger than its
+        logged rect and claims the tap first, so the r==0 fallback never ran.
+        shop_page_has_grid(page) now identifies the shop page by shape (>= 8
+        moj 74x74 ControlItem) and, if a real ControlButton sits under the
+        point, PRE-DISPATCHES to it before the engine's own dispatch. Log line:
+        `ui: shop button ... pre-dispatch -> 1`. The r==0 fallback stays.
+
+STILL IN FORCE FROM 20261114-1340 (do not regress)
+  * Settings pages run one pad model, no per-page special cases: focus set =
+    every clickable control of the topmost visible panel, nearest-neighbour
+    d-pad move (off-axis x3, wrap-around), A = tap the focus, B = back one layer
+    (panel first), L/R and right-stick flick = switch tab, X/Y unused in menus.
+  * Focus cursor is a 17x18 solid ">" 16px outside the left edge of the focus
+    control (dark outline + near-white core), not a gold box.
+  * Skill icons are NOT in the root tree: they live in the private group at
+    vb+0x2b98a0, read via nav_collect_skill_icons() only after
+    nav_count_side_tabs() >= 2 proves the page.
+  * Scrolling is a real 4-frame drag (60px/frame, 120px total); a same-frame
+    down/up is invisible to the engine.
+  * Tabs: nav_tab_objs[] + ui_tab_control_at(x,y) dispatch at depth==1 for
+    codes 0x17/0x18/0x19 before the engine sees them.
+  * B closes a panel via ui_panel_close_button() (55..90px square ControlButton
+    among the SubEvent container's direct children), two-stage via
+    nav_panel_closed.
+  * Message boxes: `if (popup_on()) A|B -> ab_press` is the FIRST thing
+    nav_update() does, on every page.
+
+THINGS THAT BROKE AND MUST NOT BE REPEATED
+  * Keeping any control-tree pointer across a scene change, or re-reading an
+    engine global pointer and trusting it. Always ctrl_object_ok() first.
+  * Any save-page-only tree walk without a gate (row_under was the one that
+    was missed -- gate it, and gate any new diagnostic the same way).
+  * Treating a 55..90px popup button far from x 848 as a save delete bin, or
+    calling the engine's delete without checking SAVE_GetSaveSlot() again.
+  * Logging every line with fflush + stdout + SVC at log_level = 2 on hardware.
+  * Assuming the backplate and the text land in the same frame (they do not).
+  * Gating the popup A/B branch on "not a settings page". Settings pages DO
+    raise UIPopupMsg boxes.
+  * Calling the engine's per-scene key handler from port code (directly,
+    through the 0x29eb90 slot, or after PT_LOAD|PF_X validation) -- stalls the
+    frame loop. menu_key_press() was DELETED.
+  * POPUPSTATE_Exist() returns 0 on the character page.
+  * Matching shortcut slots / UIChoice rows / front-end pages / settings tabs by
+    control id: those ids change every launch (742->792, 3830->4083->4143).
+    Match the event proc or the tree SHAPE.
+  * Reading the skill icons from the root tree -- only the private group at
+    vb+0x2b98a0 has them.
+  * Doing a scroll as a same-frame down/up, or trusting ftruncate() on the
+    Switch devoptab.
+  * Drawing a highlight on a control rect that is a padded HIT box.
+  * Passing bionic flag bits straight to newlib (O_TRUNC 0x200 vs 0x400).
+  * Incremental builds after changing config.h / text.h / input.h: --clean.
+  * Filtering quads by screen rectangle to hide UI; cut the draw call site.
+
+FOOTGUN -- KEEP THE CONFIG
+  * hide_pad_zone = 0 in every config.ini. Without it the GL interception
+    turns on and the game stalls at 0 FPS / nan ms.
+  * quick_layout / quick_pos identical in all three ini files.
+  * The Eden sdmc config.ini also carries the user's log_level = 3 and
+    tap_script. Do NOT overwrite it with config.ini from this folder.
+  * pad_probe = 0, string_draw = 1, no_pad_art = 1.
+  * Do not edit %APPDATA%\eden\config\qt-config.ini, and do not touch
+    sdmc\switch\inotia4\save\ when deploying. Replace only inotia4_nx.nro.
+
+KNOWN GAPS
+  * The six fixes above were deployed to Eden at 12:28 and to the hardware SD
+    card earlier in the day, but the user has not yet confirmed them one by
+    one. Treat 4f97e18f... as "crash-hardened, awaiting field confirmation".
+  * The scene-change hardening makes a dangling object fail the validation
+    instead of aborting, which means a walk can silently skip a control. If a
+    menu ever looks "empty" right after a scene change, that is the trade.
+  * Panels with no small square close button (e.g. the 409x431 description
+    column) still make B back out of the page instead of closing the panel.
+  * A few pages expose several 0x13e72c scroll viewports; the one nearest the
+    focus is used, which may be the wrong one.
+  * The R swap assumes the HUD reads shortcut slots as array[page+i].
+  * The save-page cursor deliberately excludes the 66x66 delete bins so a stray
+    A cannot delete a save; a finger can still reach them.
+
+HOW TO RESTORE
+  Fastest (binary only):
+    copy this folder's inotia4_nx.nro over
+      %APPDATA%\eden\sdmc\switch\inotia4\inotia4_nx.nro   (Eden)
+      dist/switch/inotia4\inotia4_nx.nro                  (SD-card tree, D:\switch\inotia4\)
+    do NOT copy config.ini over the Eden one (see FOOTGUN).
+    Verify with: md5sum inotia4_nx.nro -> 4f97e18f1e3a75bfa6aa63febed6e50d
+  From source:
+    the zip carries src/, build.py, config.prod.ini, README.md, three tools,
+    the memory files, the snapshot files and font.ttf. It does NOT carry the
+    compiler toolchain or the game's own assets. Unpack it over a copy of this
+    repository (which supplies tools/dkp_rootfs, data/libgame.so and
+    dist/switch/inotia4/font.ttf), then `python build.py --clean`.
+    ALWAYS use --clean: input.h / config.h / text.h changed more than once.

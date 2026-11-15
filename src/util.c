@@ -60,17 +60,29 @@ void debugPrintf(const char *fmt, ...) {
   va_end(va);
 
   mutexLock(&log_mutex);
-  if (log_file) {
-    fputs(buf, log_file);
-    fflush(log_file);       /* a crash right after this line must still show it */
+  if (log_file)
+    fputs(buf, log_file);   /* buffered; the frame loop flushes once per frame */
+  /* The nxlink console and the kernel debug string are bring-up facilities.
+   * Each line used to cost two flushes plus an SVC even when nobody was
+   * listening. On the console's SD card that is a synchronous write per line,
+   * and during effects / blinking tips the log gets chatty enough to stutter --
+   * which never showed up in Eden (host SSD, cheap SVCs). log_level >= 3 keeps
+   * the old behaviour for bring-up. */
+  if (cfg.log_level >= 3) {
+    fputs(buf, stdout);
+    fflush(stdout);
+    svcOutputDebugString(buf, strlen(buf));
   }
-  /* nxlinkStdio() dup2's stdout onto the socket, so this is what the PC sees.
-   * When nothing is listening it lands on the null console and costs a memcpy. */
-  fputs(buf, stdout);
-  fflush(stdout);
   mutexUnlock(&log_mutex);
+}
 
-  svcOutputDebugString(buf, strlen(buf));
+void debugFlush(void) {
+  if (!log_ready)
+    return;
+  mutexLock(&log_mutex);
+  if (log_file)
+    fflush(log_file);       /* a crash now loses at most the current frame */
+  mutexUnlock(&log_mutex);
 }
 
 void cpu_boost(int on) {
