@@ -81,11 +81,12 @@
 - 远端 `BenAlan11/inotia4_nx`（PAT 有写权限）。**git push 本机不通**（代理只放行 api.github.com），
   用 `GH_TOKEN=... python tools/gh_push.py BenAlan11/inotia4_nx main`（Git Data API）。
   游戏本体/APK/存档/工具链不进仓库。
-- 最新可恢复点：`snapshots/known-good-20261114-1340/`（NRO md5 `b838dbc3…`，
-  build stamp 13:22:43，未重编译=正在跑的那份），提交 `fd68c2f`；
-  上一恢复点 `known-good-20261110-1245`（`051ab32c…`，`bd37dc2`）。
-- 远端可能滞后：本机 `git push` 挂住（auth/代理），要用 GH_TOKEN 跑 gh_push.py，
-  而该脚本会把**索引里所有文件**重新传一遍——仓库里囤了 7 代 nro+zip ≈100MB，
-  推一次很慢。要提速就按 .gitignore 的既定策略只留当前+上一代（`git rm --cached`
-  旧代，本地文件不删）。
+- 最新可恢复点：`snapshots/known-good-20261115-1903/`（NRO md5 `4f97e18f…`，
+  build stamp 12:19:48，未重编译=12:28 部署到 Eden 的那份），提交 `aae9082`，
+  远端 head `8a7b04a1`；上一恢复点 `known-good-20261114-1340`（`b838dbc3…`，`fd68c2f`）。
+- 远端可能滞后：本机 `git push` 挂住（auth/代理），要用 GH_TOKEN 跑 gh_push.py。
+  该脚本已是**增量**（比对远端树，只传差异 + base_tree 建树），2026-11-15 实测
+  12 文件/14.9MB 只要 23 秒。索引已按 .gitignore 既定策略收敛到「当前+上一代」
+  （`git rm --cached` 旧代，本地文件不删），不要再往库里囤第 3 代以前的大文件。
+- `snapshots/sdcard-before-*/` 是推卡前的旧 nro 备份，已忽略，不进库。
 - `debug.log` 启动时轮转，grep 要先限定「本轮新增日志」再判断。
