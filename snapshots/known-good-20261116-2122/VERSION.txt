@@ -1,0 +1,170 @@
+Inotia 4 for Nintendo Switch -- known good snapshot
+
+build stamp : 2026-11-16 21:19:46
+frozen at   : 2026-11-16 21:22 (user confirmed all three touch bugs fixed at
+              21:22; the binary is the one that was under test, NOT rebuilt)
+nro md5     : 28c6ed8864dd41707dca02cbd389f9f2
+nro size    : 9298039 bytes
+config      : config.ini in this folder (= config.prod.ini, md5 248b1315...,
+              unchanged since 2026-11-08; hide_pad_zone = 0, no_pad_art = 1,
+              string_draw = 1, quick_layout = 1,
+              quick_pos = "945,395; 865,475; 1025,475; 945,555; 20,530; 120,530")
+parent      : snapshots/known-good-20261115-1903/ (4f97e18f..., commit aae9082)
+              See `git log --oneline aae9082..HEAD` for the 10 landing commits.
+
+CLOSEST TO WHAT THE USER ACTUALLY RAN
+  Byte-identical (28c6ed88...) to the copy deployed to
+  %APPDATA%\eden\sdmc\switch\inotia4\ at 2026-11-16 21:20 and to
+  dist/switch/inotia4/. Not rebuilt for the snapshot: a rebuild changes the
+  build stamp and therefore the md5, and this md5 is the one under test.
+
+WHAT THIS SESSION WAS ABOUT
+  The 20261115-1903 snapshot shipped a regression: on the skill page the
+  right-hand description-panel buttons ("learn", "assign shortcut") did nothing,
+  and on the merchant page a band of the item grid was dead. Both turned out to
+  be the SAME class of bug -- a control in the tree that the player cannot see
+  (or cannot reach) still claiming the tap -- and both took several rounds
+  because the port had been guessing at geometry instead of asking the tree.
+
+CHANGES SINCE 20261115-1903 (.workbuddy/memory/2026-11-16.md)
+  1. Skill / item description panel events are FORWARDED again (the regression).
+     The right panel *(vb+0x2b5a28) is a SIBLING of the window's 1137x431
+     content panel, so the engine's tree walk never reaches its buttons; since
+     2026-11-14 the only path was "on r==0 at depth==1, forward to the panel".
+     e337d17 gated that forward on a geometry whitelist whose condition could
+     never be true, and 9b5b70d then deleted the forward outright. Restored, and
+     now split by page shape so the shop keeps its own cross-layer dispatch.
+  2. The scroll-viewport rectangle no longer slices a button in half.
+     The hardcoded exclusion 645..1003 x 193..493 was applied to all event
+     codes. Scrolling needs a drag, i.e. a 0x19 MOVE, so only 0x19 is left to
+     the port's own scroll; presses and releases are always forwarded.
+  3. Description-panel taps are dispatched STRAIGHT to the ControlButton under
+     the point, not forwarded to the panel. The panel's first child is its
+     scroll control, which claimed the press and made the same point behave
+     differently depending on where the press started.
+  4. The description panel's bottom row has dead strips. The row is 377x55 but
+     the two buttons only cover 704..955, so 126 px of visible bar had no
+     hitbox; those points now snap to the nearest button (min_row_w >= 350 so
+     narrow confirm rows are never snapped).
+  5. Buttons on that row are REBUILT BY THE ENGINE on every layout pass -- the
+     scroll control and the row keep their ids for the whole session while the
+     buttons run 222/223, 224/225, ... 284/286, 298/300. A press recorded its
+     state on one object and the release arrived at a brand new one, whose
+     release path is a no-op. That is the real shape of "only one half works".
+     The press is now replayed when the release lands on a rebuilt object with
+     the same rect. Identity is compared by p_ctrl_id, NOT by pointer: the
+     rebuild happens IN PLACE (same address 0x210ac78330, ids 351 -> 353).
+  6. desc_row_dispatch() claims the row BEFORE the engine's hit test.
+     The engine's own dispatch claimed the right half of the button and ran
+     nothing (code 0017 at (930,520) -> 1, while (857,520) -> 0), so the old
+     r==0 fallback could only ever repair one half. Now the port looks for the
+     button first and returns 1, so both halves take the same path.
+  7. Only VISIBLE buttons answer: ControlObject_IsShow (0x130fec) is
+     `ldr w8,[x0,#0x10]; cmp #0x30; cset eq`, SetShow(false) writes 0x31.
+  8. ... and the object's own state is only half of it: ControlObject_SetShow
+     does NOT propagate to children, so the merchant page's hidden confirm
+     dialog (id 431,145 450x350) keeps fully "shown" children. Its 是/否
+     buttons (476/711,420 125x55) played the press SOUND and ate the tap while
+     the dialog was invisible -- "the grid does nothing but I hear a click".
+     ctrl_hidden_container() walks the +0xa0 chain for raw +0x10 == 0x31 and
+     both live_button_at() and nx_ControlObject_EventProc() reject them.
+     Reading the raw word instead of IsShow() is deliberate: IsShow() returns 0
+     for every state that is not 0x30, including containers that were never
+     initialised, and gating on that kills the whole UI.
+
+WHAT THE USER CONFIRMED
+  * skill page: "learn" works, "assign shortcut" works left half, right half
+    and right edge (21:19 "已正常")
+  * merchant page: the previously dead grid band works, selection sound only
+    when a cell is actually selected
+  * description text drag-scroll still works (the press is not stolen)
+
+STILL IN FORCE FROM EARLIER SNAPSHOTS (do not regress)
+  * ctrl_object_ok(obj) on every control-tree access (scene-change crashes).
+  * Shop: shop_page_has_grid(page) identifies the page by SHAPE (>= 8 moj 74x74
+    ControlItem), and its pre-dispatch keeps the cross-layer button path.
+  * Settings pages run one pad model, nearest-neighbour d-pad move, A = tap the
+    focus, B = back one layer, L/R and right-stick flick = switch tab.
+  * Focus cursor is a 17x18 solid ">" 16px outside the left edge, not a gold box.
+  * Skill icons live in the private group at vb+0x2b98a0, not in the root tree.
+  * Scrolling is a real 4-frame drag (60px/frame); a same-frame down/up is
+    invisible to the engine.
+  * Save delete: bin column tightened to x 820..880, SAVE_GetSaveSlot()
+    re-validated before the call.
+  * Message boxes: `if (popup_on()) A|B -> ab_press` is the FIRST thing
+    nav_update() does, on every page.
+
+THINGS THAT BROKE AND MUST NOT BE REPEATED
+  * Guessing at geometry instead of asking the tree. Four rounds were wasted on
+    (821,270)/(821,342) as "the right half of the button" -- the buttons are at
+    y=495, those points were inside the scroll viewport's text area.
+  * Disabling a working event path to fix an unrelated page. The 11-15 shop
+    fix deleted the description-panel forward and broke two skill-page buttons
+    for a day. Split by page shape, never by "turn it off".
+  * Excluding a whole RECTANGLE for a code-specific concern. The scroll guard
+    must key on the event code (0x19), not on where the finger is.
+  * Comparing rebuilt controls by POINTER. The engine reuses the address; only
+    p_ctrl_id tells the two objects apart.
+  * Trusting ControlObject_IsShow() alone for "can the player see this".
+    SetShow does not propagate; check the ancestors' raw +0x10 == 0x31.
+  * Hooking the draw path to filter geometry (screen-rectangle quad filters);
+    cut the draw call site instead.
+  * Keeping any control-tree pointer across a scene change without
+    ctrl_object_ok().
+  * Matching controls by id: ids change every launch and after every rebuild.
+    Match the event proc or the tree SHAPE.
+  * POPUPSTATE_Exist() returns 0 on the character page.
+  * Calling the engine's per-scene key handler from port code -- it stalls the
+    frame loop. menu_key_press() was deleted for this.
+  * Doing a scroll as a same-frame down/up, or trusting ftruncate() on the
+    Switch devoptab (use "wb" to rewrite).
+  * Passing bionic flag bits straight to newlib (O_TRUNC 0x200 vs 0x400).
+  * Incremental builds after changing config.h / text.h / input.h: --clean.
+
+FOOTGUN -- KEEP THE CONFIG
+  * hide_pad_zone = 0 in every config.ini. Without it the GL interception turns
+    on and the game stalls at 0 FPS / nan ms.
+  * quick_layout / quick_pos identical in all three ini files.
+  * The Eden sdmc config.ini also carries the user's log_level = 3 and
+    tap_script. Do NOT overwrite it with config.ini from this folder.
+  * pad_probe = 0, string_draw = 1, no_pad_art = 1.
+  * Do not edit %APPDATA%\eden\config\qt-config.ini, and do not touch
+    sdmc\switch\inotia4\save\ when deploying. Replace only inotia4_nx.nro.
+
+KNOWN GAPS
+  * Frame pacing: the engine has NO separate Render(). nativeProcess ->
+    jProcessEvent + TM_Run -> MainProcess -> draw -> grpFlushLcd ->
+    requestRender -> egl_swap, 1 tick = 1 frame, animations counted in frames
+    with no time interpolation. Decoupling logic from render is NOT possible
+    without rewriting the engine; the 2026-11-14 attempt (overriding
+    APPINFO_nTimer to 16 ms) reached 60 fps and then black-screened and was
+    reverted (537ab67 -> 2d0f130). Do not retry it. Measured draw interval:
+    mean 49.3 ms, median 50 ms, range 3-95 ms; the jitter comes from polling a
+    60 ms timer at 60 Hz.
+  * The scene-change validation makes a dangling object fail instead of
+    aborting, so a walk can silently skip a control; a menu may look "empty"
+    for one frame right after a scene change.
+  * Panels with no small square close button (e.g. the 409x431 description
+    column) still make B back out of the page instead of closing the panel.
+  * A few pages expose several 0x13e72c scroll viewports; the one nearest the
+    focus is used, which may be the wrong one.
+  * ctrl_hidden_container() only looks 5 levels up the +0xa0 chain and only
+    accepts the exact hidden state 0x31. A control hidden some other way still
+    gets through.
+  * The shop's own confirm dialog has not been re-tested with the new phantom
+    filter -- if its 是/否 ever stop answering, this snapshot is the suspect.
+
+HOW TO RESTORE
+  Fastest (binary only):
+    copy this folder's inotia4_nx.nro over
+      %APPDATA%\eden\sdmc\switch\inotia4\inotia4_nx.nro   (Eden)
+      dist/switch/inotia4\inotia4_nx.nro                  (SD-card tree, D:\switch\inotia4\)
+    do NOT copy config.ini over the Eden one (see FOOTGUN).
+    Verify with: md5sum inotia4_nx.nro -> 28c6ed8864dd41707dca02cbd389f9f2
+  From source:
+    the zip carries src/, build.py, config.prod.ini, README.md, three tools,
+    the memory files, the snapshot files and font.ttf. It does NOT carry the
+    compiler toolchain or the game's own assets. Unpack it over a copy of this
+    repository (which supplies tools/dkp_rootfs, data/libgame.so and
+    dist/switch/inotia4/font.ttf), then `python build.py --clean`.
+    ALWAYS use --clean: input.h / config.h / text.h changed more than once.

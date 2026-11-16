@@ -77,13 +77,34 @@
   且下方 0..160px 内有正文行。括号开头的正文行 → `0xAAAAAA`（心里话）。
 - ⚠️ 气泡控件高度不要改（底板按此高度画，改高气泡视觉变大）。
 
+## 帧率架构（2026-11-16 反汇编定稿，别再试「逻辑/渲染解耦」）
+- 引擎**没有独立 Render()**。链：`nativeProcess`(0x25ae00) → `jProcessEvent` +
+  `TM_Run`(0x25e664) + `ThreadProc` → 定时器到期回调 `MainProcess`(0x169494)
+  → 场景绘制 → `grpFlushLcd` → `requestRender` → 我们 `egl_swap()`。
+  **1 tick = 1 帧**，逻辑与绘制 1:1 绑定。
+- 引擎原生就有真实时间固定步长：`MainProcess` 结尾按 `APPINFO_nTimer`
+  （全局 u16 @0x2b9cc8，appinfo.dat，运行时 60 ms）算 deadline 并
+  `CS_knlSetTimer` 排下一帧；`CS_knlCurrentTime` → `gettimeofday`。
+  移植层 60 Hz 循环（`budget=freq/60`）**只轮询定时器**，不驱动逻辑。
+- 动画**按帧计数、无时间插值**（淡入 alpha 每帧固定 -0.067）。
+  ⇒ 在两个 tick 之间重复绘制只会得到相同画面，不会「视觉平滑化」；
+  改快 tick 则游戏整体变快（60fps ≈ 3.5x，30fps ≈ 1.8x）。
+- 11-14 已实测过 `frame_ms` 覆写 APPINFO_nTimer：Eden loop 59/draw 19 →
+  `frame_ms=16` 时 draw 59，用户确认 60 FPS，但随后**黑屏**并要求整体回退
+  （`537ab67` revert → `2d0f130`，证据 `logs/perf-eden-16ms/`）。
+  当前 src/ 里这些改动残留为 0，**不要再引入**。
+- 现有 requestRender 间隔实测：平均 49.3ms / 中位 50ms / 3~95ms（143 样本）。
+  低风险可做的是**稳定抖动**：60 Hz 轮询把 60ms 周期量化成 34/50/66ms 三档，
+  把轮询改细（如 240 Hz 或按 deadline 精确 sleep）可消除忽快忽慢，不动游戏速度。
+
 ## 备份
 - 远端 `BenAlan11/inotia4_nx`（PAT 有写权限）。**git push 本机不通**（代理只放行 api.github.com），
   用 `GH_TOKEN=... python tools/gh_push.py BenAlan11/inotia4_nx main`（Git Data API）。
   游戏本体/APK/存档/工具链不进仓库。
-- 最新可恢复点：`snapshots/known-good-20261115-1903/`（NRO md5 `4f97e18f…`，
-  build stamp 12:19:48，未重编译=12:28 部署到 Eden 的那份），提交 `aae9082`，
-  远端 head `8a7b04a1`；上一恢复点 `known-good-20261114-1340`（`b838dbc3…`，`fd68c2f`）。
+- 最新可恢复点：`snapshots/known-good-20261116-2122/`（NRO md5 `28c6ed88…`，
+  build stamp 21:19:46，未重编译=21:20 部署到 Eden 且实机用户确认的那份），
+  提交 `4c60784`；上一恢复点 `known-good-20261115-1903`（`4f97e18f…`，`aae9082`，
+  注意这版带着「技能页右侧按钮点不动」的回归）。
 - 远端可能滞后：本机 `git push` 挂住（auth/代理），要用 GH_TOKEN 跑 gh_push.py。
   该脚本已是**增量**（比对远端树，只传差异 + base_tree 建树），2026-11-15 实测
   12 文件/14.9MB 只要 23 秒。索引已按 .gitignore 既定策略收敛到「当前+上一代」

@@ -2875,12 +2875,19 @@ typedef unsigned (*fn_ctrl_id)(void *);
 typedef void *(*fn_ctrl_child)(void *, int);
 typedef int (*fn_ctrl_count)(void *);
 typedef void *(*fn_ctrl_proc)(void *);
+/* ControlObject_IsShow(): +0x10 holds a show state, 0x30 = shown, 0x31 = hidden
+ * (SetShow(false) writes 0x31). The getter returns 1 only for 0x30. A hidden
+ * control stays in the tree and still has a rectangle, which is how the shop
+ * page ended up with an invisible confirm dialog whose buttons swallowed taps
+ * aimed at the item grid. */
+typedef int (*fn_ctrl_show)(void *);
 
 static fn_abs_rect p_abs_rect;
 static fn_ctrl_id p_ctrl_id;
 static fn_ctrl_child p_ctrl_child;
 static fn_ctrl_count p_ctrl_count;
 static fn_ctrl_proc p_ctrl_proc;
+static fn_ctrl_show p_ctrl_show;
 static void (*p_delete_child)(void *parent, void *child);
 
 /* ------------------------------------------------------------------------- *
@@ -2951,6 +2958,38 @@ static CtrlRect safe_abs_rect(void *c) {
 }
 static unsigned safe_ctrl_id(void *c) {
   return ctrl_object_ok(c) && ctrl_id_engine ? ctrl_id_engine(c) : 0u;
+}
+
+/* ControlObject_SetShow only writes the object's own state at +0x10; it does
+ * NOT propagate to children. A hidden container therefore keeps fully "shown"
+ * children with live rectangles, their button procs still play the press sound,
+ * and they still claim taps. That is exactly the shop page's confirm dialog:
+ * id 68 at 431,145 450x350 is never drawn, yet its 是/否 buttons (476/711,420
+ * 125x55) answered taps aimed at the item grid behind them -- the player heard
+ * the click but nothing happened, and x 711..836 of the grid was dead.
+ *
+ * Walk the +0xa0 parent chain and report the first ancestor that is explicitly
+ * hidden (raw +0x10 == 0x31, the value SetShow(false) writes). Reading the raw
+ * word instead of IsShow() matters: IsShow() returns 0 for any state that is
+ * not 0x30, including containers whose word was never initialised, and treating
+ * those as hidden would kill every button inside them. */
+static void *ctrl_hidden_container(void *c) {
+  if (!c || !p_abs_rect)
+    return NULL;
+  void *p = *(void *const volatile *)((unsigned char *)c + 0xa0);
+  for (int d = 0; d < 5 && p; d++) {
+    if (!probe_mem_ok(p, 0xb0))
+      return NULL;
+    const unsigned st = *(const volatile unsigned *)((unsigned char *)p + 0x10);
+    if (st == 0x31) {
+      /* zero-area ancestors are layout wrappers, not drawn layers */
+      const CtrlRect r = p_abs_rect(p);
+      if (r.w > 0 && r.h > 0)
+        return p;
+    }
+    p = *(void *const volatile *)((unsigned char *)p + 0xa0);
+  }
+  return NULL;
 }
 static void *safe_ctrl_child(void *c, int i) {
   return ctrl_object_ok(c) && ctrl_child_engine ? ctrl_child_engine(c, i) : NULL;
@@ -4949,10 +4988,120 @@ static void *live_button_at(void *node, long x, long y, int depth) {
     const CtrlRect r = p_abs_rect(c);
     if (r.w >= 40 && r.w <= 400 && r.h >= 25 && r.h <= 120 &&
         x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h &&
-        p_ctrl_proc(c) == ctrl_button_proc)
+        p_ctrl_proc(c) == ctrl_button_proc &&
+        /* Hidden buttons must not answer. The shop page keeps an invisible
+         * confirm dialog (431,145 450x350) in its tree whose 是/否 buttons at
+         * y=420-475 cover the item grid, so a tap on a cell was dispatched to
+         * a button the player could not even see. */
+        (!p_ctrl_show || p_ctrl_show(c)) &&
+        /* ... and the object's own state is only half the story: SetShow does
+         * not reach children, so the dialog's buttons report show=1 while the
+         * dialog itself is hidden. Reject those too. */
+        !ctrl_hidden_container(c))
       return c;
   }
   return NULL;
+}
+
+/* Port-side hit repair for the description panel's bottom row. The learn and
+ * assign-shortcut buttons are 125x55 each inside a 377x55 container, so 126 px
+ * of that row has no button under it even though the artwork reads as one
+ * continuous bar; taps in the dead strip used to do nothing at all. When the
+ * point is inside a container that holds ControlButtons but inside none of
+ * them, take the button whose centre is nearest. */
+static void *desc_row_button_near(void *node, long x, long y, long min_row_w) {
+  if (!node || !p_ctrl_count || !p_ctrl_child || !p_abs_rect || !p_ctrl_proc ||
+      !ctrl_button_proc)
+    return NULL;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n; i++) {
+    void *row = p_ctrl_child(node, i);
+    if (!row)
+      continue;
+    const CtrlRect rr = p_abs_rect(row);
+    if (rr.w < min_row_w || rr.h < 20 || x < rr.x || x >= rr.x + rr.w ||
+        y < rr.y || y >= rr.y + rr.h)
+      continue;
+    void *best = NULL;
+    long bd = 0;
+    const int cn = p_ctrl_count(row);
+    for (int k = 0; k < cn; k++) {
+      void *c = p_ctrl_child(row, k);
+      if (!c)
+        continue;
+      const CtrlRect r = p_abs_rect(c);
+      if (r.w < 40 || r.w > 400 || r.h < 25 || r.h > 120)
+        continue;
+      if (p_ctrl_proc(c) != ctrl_button_proc)
+        continue;
+      if (p_ctrl_show && !p_ctrl_show(c))
+        continue;
+      if (ctrl_hidden_container(c))
+        continue;
+      long d = x - (r.x + r.w / 2);
+      if (d < 0)
+        d = -d;
+      if (!best || d < bd) {
+        best = c;
+        bd = d;
+      }
+    }
+    if (best)
+      return best;
+  }
+  return NULL;
+}
+
+/* One compact hit report per press: the panel's real children and whether the
+ * tapped point falls inside each. Capped, because this is meant to answer "is
+ * the point even on the button?" for the first few taps of a session. */
+static int desc_hit_reports;
+static void desc_hit_report(void *node, long x, long y, int depth) {
+  if (!node || depth > 2 || desc_hit_reports > 10 || !p_ctrl_count ||
+      !p_ctrl_child || !p_abs_rect || !p_ctrl_proc)
+    return;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n && i < 12; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    const CtrlRect r = p_abs_rect(c);
+    const int in = x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+    debugPrintf("desc: hit d%d id %u rect %ld,%ld %ldx%ld proc +0x%lx %s\n",
+                depth, p_ctrl_id ? p_ctrl_id(c) : 0u, r.x, r.y, r.w, r.h,
+                (unsigned long)((uintptr_t)p_ctrl_proc(c) -
+                                (uintptr_t)game_mod.load_virtbase),
+                in ? "IN" : "out");
+    if (!in)
+      continue;
+    desc_hit_report(c, x, y, depth + 1);
+  }
+}
+
+/* The description panel hangs off an engine global, not off the live root, so
+ * the regular tree dump never shows it. One dump of its own subtree tells us
+ * the real rect / proc of the learn and assign-shortcut buttons instead of
+ * guessing from a fixed viewport rectangle. */
+static int desc_tree_dumps;
+static int desc_tree_done;
+static void dump_desc_tree(void *node, int depth) {
+  if (!node || depth > 3 || desc_tree_dumps > 120 ||
+      !p_ctrl_count || !p_ctrl_child || !p_abs_rect || !p_ctrl_proc)
+    return;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n && i < 30; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    const CtrlRect r = p_abs_rect(c);
+    const uintptr_t base = (uintptr_t)game_mod.load_virtbase;
+    const uintptr_t proc = (uintptr_t)p_ctrl_proc(c);
+    debugPrintf("desc: d%d id %u rect %ld,%ld %ldx%ld proc +0x%lx\n", depth,
+                p_ctrl_id ? p_ctrl_id(c) : 0u, r.x, r.y, r.w, r.h,
+                (unsigned long)(proc >= base ? proc - base : 0));
+    desc_tree_dumps++;
+    dump_desc_tree(c, depth + 1);
+  }
 }
 
 static int colevent_depth;
@@ -5010,8 +5159,11 @@ static long shop_button_pre_dispatch(const long *pt, long code, void *data,
   static int logs;
   if (logs < 16) {
     logs++;
-    debugPrintf("ui: shop button %p pre-dispatch code %04lx at (%ld,%ld) "
-                "-> %ld\n", btn, code, pt[0], pt[1], r);
+    const CtrlRect br = p_abs_rect(btn);
+    debugPrintf("ui: shop button id %u rect %ld,%ld %ldx%ld show %d code %04lx "
+                "at (%ld,%ld) -> %ld\n",
+                p_ctrl_id ? p_ctrl_id(btn) : 0u, br.x, br.y, br.w, br.h,
+                p_ctrl_show ? p_ctrl_show(btn) : -1, code, pt[0], pt[1], r);
   }
   return r;
 }
@@ -5027,6 +5179,32 @@ static long nx_ControlObject_EventProc(void *obj, long code, void *data,
       debugPrintf("ui: stale control %p rejected at event dispatch\n", obj);
     }
     return 0;
+  }
+  /* A button inside a hidden container is a phantom: the engine keeps it in the
+   * tree with a live rectangle, its proc still plays the press sound, and it
+   * still claims the tap -- so the player hears a click while the item cell
+   * behind it never gets the event. Drop pointer events for these instead of
+   * forwarding them, so the engine's child walk falls through to whatever is
+   * actually drawn at that point. */
+  if (obj && code >= 0x17 && code <= 0x1a && ctrl_button_proc && p_ctrl_proc &&
+      p_ctrl_proc(obj) == ctrl_button_proc) {
+    void *phantom = ctrl_hidden_container(obj);
+    if (phantom) {
+      static int phantom_logs;
+      if (phantom_logs < 12) {
+        phantom_logs++;
+        const CtrlRect br = p_abs_rect(obj);
+        const CtrlRect hr = p_abs_rect(phantom);
+        const long *pp = (const long *)data;
+        debugPrintf("ui: phantom button id %u rect %ld,%ld %ldx%ld dropped "
+                    "(hidden container id %u rect %ld,%ld %ldx%ld) code %04lx "
+                    "at (%ld,%ld)\n",
+                    p_ctrl_id ? p_ctrl_id(obj) : 0u, br.x, br.y, br.w, br.h,
+                    p_ctrl_id ? p_ctrl_id(phantom) : 0u, hr.x, hr.y, hr.w, hr.h,
+                    code, pp ? pp[0] : -1, pp ? pp[1] : -1);
+      }
+      return 0;
+    }
   }
   colevent_depth++;
   if (colevent_depth == 1 && !colevent_forwarding && data &&
@@ -5130,31 +5308,166 @@ static long nx_ControlObject_EventProc(void *obj, long code, void *data,
   if (r == 0 && colevent_depth == 1 && !colevent_forwarding &&
       (code == 0x17 || code == 0x18 || code == 0x19) && data) {
     const long *pt = (const long *)data;
-    /* The engine did not claim this press -- usually because TouchHandle_Event
-     * routed it to the item-grid layer while the sell / yes-no buttons live in
-     * a sibling layer. Do NOT forward to the 409x431 info panel container
-     * (that used to run its close path and shut the shop); find the actual
-     * button under the point in the live tree and dispatch to it instead. */
-    /* Start from the info panel's PARENT: in the shop tree that is the page
-     * container holding the confirm box, the info panel and the item grid as
-     * siblings. Searching the whole live root instead would also reach HUD
-     * buttons hidden behind the shop and fire spurious actions. */
+    /* Two different pages need two different recoveries when the engine's own
+     * dispatch comes back empty. Start from the info panel's PARENT: in the
+     * shop tree that is the page container holding the confirm box, the info
+     * plate and the item grid as siblings. Searching the whole live root would
+     * also reach HUD buttons hidden behind the page and fire spurious actions. */
     unsigned char *vb = (unsigned char *)game_mod.load_virtbase;
     void *dp = vb ? *(void **)(vb + 0x2b5a28) : NULL;
     void *page = (dp && ctrl_object_ok(dp))
                      ? *(void *const volatile *)((unsigned char *)dp + 0xa0)
                      : NULL;
-    void *btn = (page && ctrl_object_ok(page))
-                    ? live_button_at(page, pt[0], pt[1], 0) : NULL;
-    if (btn && btn != obj) {
-      colevent_forwarding = 1;
-      r = safe_colevent(btn, code, data, extra);
-      colevent_forwarding = 0;
-      static int logs;
-      if (logs < 16) {
-        logs++;
-        debugPrintf("ui: cross-layer button %p code %04lx at (%ld,%ld) "
-                    "-> %ld\n", btn, code, pt[0], pt[1], r);
+    /* Store / inventory pages have two 4x4 grids of 74x74 ControlItem cells.
+     * That shape is the reliable difference between the shop and the skill /
+     * item description pages; never use a page id, they change every launch. */
+    const int shop_page = page && ctrl_object_ok(page) &&
+                          shop_page_has_grid(page, 0);
+    if (shop_page) {
+      /* The sell / yes-no buttons are siblings of the item grid. Find the real
+       * ControlButton under the point and dispatch to it. Do NOT forward to the
+       * 409x431 info plate: its close path shut the shop page on 11-15. */
+      void *btn = live_button_at(page, pt[0], pt[1], 0);
+      if (btn && btn != obj) {
+        colevent_forwarding = 1;
+        r = safe_colevent(btn, code, data, extra);
+        colevent_forwarding = 0;
+        static int logs;
+        if (logs < 16) {
+          logs++;
+          debugPrintf("ui: cross-layer button %p code %04lx at (%ld,%ld) "
+                      "-> %ld\n", btn, code, pt[0], pt[1], r);
+        }
+      }
+    } else if (dp && dp != obj && ctrl_object_ok(dp) && p_abs_rect &&
+               desc_page_frame != 0 &&
+               g_frame_no - desc_page_frame <= 12) {
+      static int page_logs;
+      if (page_logs < 8) {
+        page_logs++;
+        debugPrintf("ui: desc-page fallback armed (shop=0, drawn %u frames ago) "
+                    "at (%ld,%ld)\n",
+                    g_frame_no - desc_page_frame, pt[0], pt[1]);
+      }
+      if (!desc_tree_done) {
+        desc_tree_done = 1;
+        dump_desc_tree(dp, 0);
+      }
+      /* Skill / item description page: the right-hand panel is a SIBLING of
+       * the window's big content panel, whose rect covers the whole window.
+       * The engine's tree walk reaches that first, returns 0 for a press no
+       * item slot claimed, and never tries the description panel -- so its
+       * buttons (learn / assign shortcut / cancel shortcut) are unreachable.
+       * Forward the unclaimed press to the panel and let the engine recurse.
+       * This branch was removed on 11-15 while fixing the shop; shop_page
+       * above keeps the two behaviours apart. */
+      const CtrlRect dpr = p_abs_rect(dp);
+      if (dpr.w >= 100 && dpr.h >= 60 &&
+          pt[0] >= dpr.x && pt[0] < dpr.x + dpr.w &&
+          pt[1] >= dpr.y && pt[1] < dpr.y + dpr.h) {
+        /* The scroll viewport is 645,193 358x297 and desc_scroll_tick() in
+         * input.c drives it from the real finger. Presses inside it belong to
+         * that scroll: its ControlScroll is the panel's first child and claims
+         * a press there, which both blocks the port's own drag and loses the
+         * release when the finger ends up on a button. The panel's actual
+         * buttons are in the bottom row at y=495, i.e. BELOW the viewport, so
+         * this guard never takes a press meant for them. */
+        const int in_scroll = pt[0] >= 645 && pt[0] < 1003 &&
+                              pt[1] >= 193 && pt[1] < 493;
+        void *btn = NULL;
+        int clamped = 0;
+        if (code == 0x17 || code == 0x18) {
+          btn = live_button_at(dp, pt[0], pt[1], 0);
+          if (!btn && !in_scroll) {
+            void *near = desc_row_button_near(dp, pt[0], pt[1], 60);
+            if (near) {
+              btn = near;
+              clamped = 1;
+            }
+          }
+        }
+        if ((code == 0x17 || code == 0x18) && desc_hit_reports <= 10) {
+          desc_hit_reports++;
+          debugPrintf("desc: press code %04lx at (%ld,%ld) in_scroll=%d "
+                      "btn %p\n", code, pt[0], pt[1], in_scroll, btn);
+          desc_hit_report(dp, pt[0], pt[1], 0);
+        }
+        if (btn) {
+          /* Dispatch straight to the button. Forwarding to the panel instead
+           * walks its children in draw order, and the scroll control comes
+           * first; a button under the finger then depends on that control
+           * declining the event, which is how the same tap behaved
+           * differently depending on where the press started.
+           *
+           * The panel's two buttons are REBUILT on every layout pass: the hit
+           * report shows the scroll control (id 220) and the row (221) keeping
+           * their ids while the buttons climb 222/223 -> 224/225 -> 236/237.
+           * A press therefore lands on one object and the release on a brand
+           * new one that never saw a press, so its release path does nothing.
+           * That is the real shape of "one half of the button works": it works
+           * only when no rebuild happened between press and release. */
+          static void *press_btn;
+          static unsigned press_id;
+          static CtrlRect press_rect;
+          const CtrlRect br = p_abs_rect(btn);
+          if (code == 0x17) {
+            press_btn = btn;
+            press_id = p_ctrl_id ? p_ctrl_id(btn) : 0u;
+            press_rect = br;
+            colevent_forwarding = 1;
+            r = safe_colevent(btn, code, data, extra);
+            colevent_forwarding = 0;
+          } else {
+            const int same_rect = br.x == press_rect.x && br.y == press_rect.y &&
+                                  br.w == press_rect.w && br.h == press_rect.h;
+            colevent_forwarding = 1;
+            if (press_btn && p_ctrl_id && p_ctrl_id(btn) != press_id &&
+                same_rect) {
+              /* Same place, new object: give the replacement the press it
+               * never got, then the release. Done inside one event so no
+               * rebuild can interleave. */
+              safe_colevent(btn, 0x17, data, extra);
+              r = safe_colevent(btn, 0x18, data, extra);
+              static int rl;
+              if (rl < 12) {
+                rl++;
+                debugPrintf("ui: desc btn id %u re-pressed (object rebuilt "
+                            "between press and release) -> %ld\n",
+                            p_ctrl_id ? p_ctrl_id(btn) : 0u, r);
+              }
+            } else {
+              r = safe_colevent(btn, code, data, extra);
+            }
+            colevent_forwarding = 0;
+            press_btn = NULL;
+          }
+          static int bl;
+          if (bl < 24) {
+            bl++;
+            debugPrintf("ui: desc btn id %u rect %ld,%ld %ldx%ld%s code %04lx "
+                        "at (%ld,%ld) -> %ld\n",
+                        p_ctrl_id ? p_ctrl_id(btn) : 0u, br.x, br.y, br.w, br.h,
+                        clamped ? " (nearest, point outside rect)" : "",
+                        code, pt[0], pt[1], r);
+          }
+        } else if (in_scroll) {
+          static int nl;
+          if (nl < 6) {
+            nl++;
+            debugPrintf("ui: desc panel in viewport at (%ld,%ld) code %04lx "
+                        "left to scroll\n", pt[0], pt[1], code);
+          }
+        } else {
+          colevent_forwarding = 1;
+          r = safe_colevent(dp, code, data, extra);
+          colevent_forwarding = 0;
+          static int fl;
+          if (fl < 12) {
+            fl++;
+            debugPrintf("ui: desc panel %p forwarded code %04lx at (%ld,%ld) "
+                        "-> %ld\n", dp, code, pt[0], pt[1], r);
+          }
+        }
       }
     }
   }
@@ -5294,6 +5607,75 @@ static int screen_has_save_rows(void) {
   unsigned char *b = (unsigned char *)input_engine_virtbase();
   void *root = b ? (void *)probe_ptr((uintptr_t)b + 0x2b4140) : NULL;
   return root ? find_save_row(root, 0) : 0;
+}
+
+/* The description panel's bottom row is a port-managed hit region. Waiting for
+ * the engine to decline a press (the r==0 fallback) could only ever fix the
+ * LEFT half: the engine's own dispatch claims a press at (930,520) inside the
+ * assign-shortcut button and returns 1 without running its action, so the
+ * fallback never saw those taps at all. Decide the whole row here, before the
+ * engine is called.
+ *
+ * Second half of the problem: the two buttons are rebuilt on every layout pass
+ * (their ids climb 351 -> 353 while the row keeps its id), so a press and its
+ * release land on different objects and the release path does nothing. The
+ * press is remembered and replayed on the replacement. */
+static long desc_row_dispatch(long code, long coord, long extra) {
+  const long ev = code & 0xffff;
+  if ((ev != 0x17 && ev != 0x18) || !coord ||
+      !probe_mem_ok((const void *)(uintptr_t)coord, 16))
+    return 0;
+  if (desc_page_frame == 0 || g_frame_no - desc_page_frame > 30)
+    return 0;
+  unsigned char *vb = (unsigned char *)game_mod.load_virtbase;
+  void *dp = vb ? *(void **)(vb + 0x2b5a28) : NULL;
+  if (!dp || !ctrl_object_ok(dp) || !p_abs_rect || !p_ctrl_id)
+    return 0;
+  const long x = *(volatile long *)(uintptr_t)coord;
+  const long y = *(volatile long *)((uintptr_t)coord + 8);
+  void *btn = live_button_at(dp, x, y, 0);
+  int clamped = 0;
+  if (!btn) {
+    /* Only the wide description row (377 px) gets the dead-strip clamp; the
+     * narrower rows elsewhere in the UI are left alone so a tap just outside
+     * a confirm button cannot silently confirm something. */
+    btn = desc_row_button_near(dp, x, y, 350);
+    clamped = 1;
+  }
+  if (!btn)
+    return 0;
+  static void *press_btn;
+  static unsigned press_id;
+  static CtrlRect press_rect;
+  const unsigned id = p_ctrl_id(btn);
+  const CtrlRect br = p_abs_rect(btn);
+  int replayed = 0;
+  long r;
+  colevent_forwarding = 1;
+  if (ev == 0x17) {
+    press_btn = btn;
+    press_id = id;
+    press_rect = br;
+    r = safe_colevent(btn, code, (void *)(uintptr_t)coord, extra);
+  } else {
+    const int same = br.x == press_rect.x && br.y == press_rect.y &&
+                     br.w == press_rect.w && br.h == press_rect.h;
+    if (press_btn && id != press_id && same) {
+      safe_colevent(btn, 0x17, (void *)(uintptr_t)coord, extra);
+      replayed = 1;
+    }
+    r = safe_colevent(btn, code, (void *)(uintptr_t)coord, extra);
+    press_btn = NULL;
+  }
+  colevent_forwarding = 0;
+  static int logs;
+  if (logs < 30) {
+    logs++;
+    debugPrintf("ui: desc row %u rect %ld,%ld %ldx%ld code %04lx at (%ld,%ld) "
+                "-> %ld%s%s\n", id, br.x, br.y, br.w, br.h, code, x, y, r,
+                clamped ? " clamped" : "", replayed ? " re-pressed" : "");
+  }
+  return 1;
 }
 
 static long nx_TouchHandle_Event(void *root, long code, long coord, long extra) {
@@ -5480,6 +5862,12 @@ have_root:;
     }
     return 0;
   }
+  /* Claim the description panel's button row before the engine sees it: the
+   * engine's own hit test takes presses on the right half of the
+   * assign-shortcut button and then runs nothing, and an r==0 fallback can
+   * never see those taps. */
+  if (desc_row_dispatch(code, coord, extra))
+    return 1;
   const long r = touch_event_real ? touch_event_real(root, code, coord, extra) : 0;
   /* 0x18 is the single-pointer release, i.e. a completed tap. Recording it
    * *after* the engine has dispatched the event means the handler for the
@@ -9584,6 +9972,8 @@ int main(int argc, char **argv) {
   p_ctrl_count = ctrl_count_engine ? safe_ctrl_count : NULL;
   p_ctrl_proc = (fn_ctrl_proc)so_try_find_addr_rx(&game_mod,
                                                   "ControlObject_GetProc");
+  p_ctrl_show = (fn_ctrl_show)so_try_find_addr_rx(&game_mod,
+                                                  "ControlObject_IsShow");
   /* the shortcut-assign page's slot proc -- its control ids are dynamic */
   shortcut_proc = (void *)so_try_find_addr_rx(
       &game_mod, "UIShortcutMenu_Shortcut_EventProc");

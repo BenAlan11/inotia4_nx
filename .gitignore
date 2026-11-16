@@ -49,7 +49,7 @@ snapshots/known-good-*/inotia4_nx.nro
 snapshots/save-slot-*.zip
 snapshots/save-fix-*.zip
 snapshots/sdcard-before-*/
+!snapshots/known-good-20261116-2122/inotia4_nx.nro
+!snapshots/save-slot-20261116-2122.zip
 !snapshots/known-good-20261115-1903/inotia4_nx.nro
 !snapshots/save-slot-20261115-1903.zip
-!snapshots/known-good-20261114-1340/inotia4_nx.nro
-!snapshots/save-slot-20261114-1340.zip
