@@ -1,0 +1,71 @@
+Inotia 4 for Nintendo Switch -- known good snapshot
+
+build stamp : 2026-11-21 10:58:44
+frozen at   : 2026-11-21 11:08 (user confirmed "正常了" for the shortcut
+              page-2 registration on the 08:06 build; the LT rebind was then
+              corrected at 10:58 and deployed. Binary is the one under test,
+              NOT rebuilt since.)
+nro md5     : e28d3a3124aa3b48010cffe1b9e22bb8
+nro size    : 9326711 bytes
+config      : config.ini in this folder (= dist config.prod.ini, md5 248b1315...,
+              unchanged since 2026-11-08)
+parent      : snapshots/known-good-20261119-0727/ (d8ab8fac..., commit cb98c2a)
+
+What is in this build (all verified on hardware by the user)
+--------------------------------------------------------------------------
+Since the previous snapshot (20261119-0727):
+
+1. Desc callback no longer corrupts the mercenary grid
+   desc_scroll_tick() used to write nx_desc_text_scroll's address into
+   sd+0xa0 every frame, where sd came from the stale +0x2b5a30 scroll global.
+   On the mercenary screen that pointer resolves into recycled heap and the
+   write landed on the second-row first slot's +0x28 WIDTH, stamping
+   0x5a3767710 (24 billion) into it. Every tap in the lower rows then hit that
+   one slot and jumped to row-2 col-1. Gated the write on "a description page
+   is freshly drawn" (desc_page_frame within 3 frames). Confirmed fixed.
+
+2. Shortcut-assign page: R/LT flips the ENGINE page index
+   The popup registers a skill into slot `page*6 + i`, where `page` is the
+   value behind **(vb+0x29e9e8). quick_swap_fire() only swapped the HUD data
+   array, so the first fix changed the visible slots but still registered into
+   page 1. Added shortcut_assign_flip_page() which sets page=(page+1)&1,
+   matching UIShortcutMenu_ButtonScrollExe (0x161368). Confirmed: skills now
+   register into page 2.
+
+3. Key rebinding (user request)
+   The two shortcut-page actions are on LT (NS ZL, Xbox left trigger):
+     - shortcut-assign popup page flip  -> shortcut_assign_flip_page()
+     - field HUD quick-slot page flip   -> quick_swap_fire()
+   The settings-page tab switch STAYS on shoulder R / L (user correction).
+   Eden maps RT->ZR (used as a modifier) and LT->ZL; ZL was previously unused.
+
+Earlier contents inherited from 20261119-0727 (still present)
+--------------------------------------------------------------------------
+- Synthesizer page recognised by its own control tree (+0x2b72b0 global).
+- Bag-page crash fixed: stale "moving control" (+0x2b2eb0) cleared each frame
+  and ControlItem_GetMoving answered by a safe GOT override.
+- Skill points / ability points / money never decrease (cfg.lock_points=1):
+  CHAR_SetSkillPoint, INVEN_MinusMoney, SV_InfoStatPointSet + bss counter
+  +0x2d2e58, lock_points_tick() backstop. lock_points=0 in config.ini disables.
+- Any full-screen page outranks the pad touch veto (ui_page_sync()).
+- Font glyph-metric cache (1024 slots): the 3.7 MB card font no longer makes
+  every frame re-rasterise; ~94117 hits / 90 misses in a typical session.
+- Dispatch safety: only the visible page's controls answer; stale shortcut
+  layers and hidden containers are blocked; desc-row popup re-push (the
+  01709127557 crash) is gated on the popup title being freshly drawn.
+
+Confirmed on hardware by the user
+--------------------------------------------------------------------------
+- Mercenary grid: all slots tappable from first entry (no jump to row-2 col-1).
+- Shortcut login: R (now LT) flips page, skill registers into page 2.
+- Settings tab switch still works on R (right) / L (left).
+- No regression in bag, skill, synthesizer or field quick slots.
+
+Known gaps
+--------------------------------------------------------------------------
+- One older crash report (01708651048) faulted at libgame+0x13357c
+  (LINKEDLISTITEM_getData); not reproduced since, not addressed.
+- Diagnostic logging (CO_EP / hit / obj / desc: f / tree dumps) is still in
+  src/main.c; can be trimmed once this snapshot is considered settled.
+- The synthesizer socket dump has never been captured (page not entered after
+  the dump was added).

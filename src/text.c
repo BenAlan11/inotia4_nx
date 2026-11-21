@@ -211,6 +211,67 @@ static int sane_px(int px) {
   return px;
 }
 
+/* ------------------------------------------------------------------------- */
+/* per-glyph metrics cache                                                   */
+/* ------------------------------------------------------------------------- */
+/* Every drawer asks for the width and the ink box of each character, and the
+ * word-wrap pass inside render() measures each character again -- so a busy
+ * screen ran thousands of FT_Load_Char calls per frame. On the card's CJK face
+ * (DroidSansFallback, 50951 glyphs) that is the whole frame budget, which is
+ * what made the console crawl after font.ttf was dropped into the folder.
+ * Metrics depend only on (codepoint, pixel size), so one cache answers all of
+ * it -- width, ascent and descent -- and the rasteriser runs once per glyph
+ * instead of once per glyph per frame. */
+typedef struct {
+  unsigned cp;
+  int size;
+  int adv, top, bot;
+} GlyphMetric;
+
+#define GMETRIC_SLOTS 1024
+static GlyphMetric gmetrics[GMETRIC_SLOTS];
+static int gmetric_hits, gmetric_misses;
+
+static GlyphMetric *glyph_metric(unsigned cp, int size) {
+  if (!have_face)
+    return NULL;
+  static int seen;
+  if (++seen % 4096 == 0)
+    debugPrintf("text: glyph cache %d hit / %d miss\n", gmetric_hits,
+                gmetric_misses);
+  const unsigned h = (cp * 2654435761u + (unsigned)size * 97u) &
+                     (GMETRIC_SLOTS - 1);
+  GlyphMetric *victim = NULL;
+  for (int i = 0; i < 24; i++) {
+    GlyphMetric *g = &gmetrics[(h + (unsigned)i) & (GMETRIC_SLOTS - 1)];
+    if (g->size && g->size == size && g->cp == cp) {
+      gmetric_hits++;
+      return g;
+    }
+    if (!g->size) {
+      victim = g;
+      break;
+    }
+    if (!victim)
+      victim = g;
+  }
+  if (!victim)
+    victim = &gmetrics[h];
+  gmetric_misses++;
+  victim->cp = cp;
+  victim->size = size;
+  if (FT_Load_Char(face, cp, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT) == 0) {
+    victim->adv = (int)(face->glyph->advance.x >> 6);
+    victim->top = (int)face->glyph->bitmap_top;
+    victim->bot = (int)(face->glyph->bitmap.rows - face->glyph->bitmap_top);
+  } else {
+    victim->adv = 0;
+    victim->top = 0;
+    victim->bot = 0;
+  }
+  return victim;
+}
+
 int text_measure_at(const char *utf8, int px) {
   if (!utf8 || !*utf8)
     return 0;
@@ -234,8 +295,9 @@ int text_measure_at(const char *utf8, int px) {
     if (cp >= 0xF0) { cp = ((cp & 7) << 18) | ((p[0] & 0x3F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); p += 3; }
     else if (cp >= 0xE0) { cp = ((cp & 0xF) << 12) | ((p[0] & 0x3F) << 6) | (p[1] & 0x3F); p += 2; }
     else if (cp >= 0xC0) { cp = ((cp & 0x1F) << 6) | (p[0] & 0x3F); p += 1; }
-    if (FT_Load_Char(face, cp, FT_LOAD_DEFAULT) == 0)
-      width += (int)(face->glyph->advance.x >> 6);
+    GlyphMetric *g = glyph_metric(cp, size);
+    if (g)
+      width += g->adv;
   }
   return width;
 }
@@ -260,16 +322,14 @@ int text_ink_height(const char *utf8, int px) {
     if (cp >= 0xF0) { cp = ((cp & 7) << 18) | ((p[0] & 0x3F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); p += 3; }
     else if (cp >= 0xE0) { cp = ((cp & 0xF) << 12) | ((p[0] & 0x3F) << 6) | (p[1] & 0x3F); p += 2; }
     else if (cp >= 0xC0) { cp = ((cp & 0x1F) << 6) | (p[0] & 0x3F); p += 1; }
-    if (FT_Load_Char(face, cp, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT) == 0) {
-      const int t = (int)face->glyph->bitmap_top;
-      const int b = (int)face->glyph->bitmap.rows - t;
-      if (t > top) top = t;
-      if (b > bottom) bottom = b;
+    GlyphMetric *g = glyph_metric(cp, size);
+    if (g) {
+      if (g->top > top) top = g->top;
+      if (g->bot > bottom) bottom = g->bot;
     }
   }
   return top + bottom;
 }
-
 /* How many pixels this string rises above its baseline -- the same number
  * render() uses as the texture's top padding. Runs of one line must share a
  * baseline: "...可以获得$S每日奖励$B。" is drawn as three separate quads, each
@@ -289,11 +349,9 @@ static int text_ascent_at(const char *utf8, int px) {
     if (cp >= 0xF0) { cp = ((cp & 7) << 18) | ((p[0] & 0x3F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); p += 3; }
     else if (cp >= 0xE0) { cp = ((cp & 0xF) << 12) | ((p[0] & 0x3F) << 6) | (p[1] & 0x3F); p += 2; }
     else if (cp >= 0xC0) { cp = ((cp & 0x1F) << 6) | (p[0] & 0x3F); p += 1; }
-    if (FT_Load_Char(face, cp, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT) == 0) {
-      const int top = (int)face->glyph->bitmap_top;
-      if (top > ascent)
-        ascent = top;
-    }
+    GlyphMetric *g = glyph_metric(cp, size);
+    if (g && g->top > ascent)
+      ascent = g->top;
   }
   return ascent;
 }

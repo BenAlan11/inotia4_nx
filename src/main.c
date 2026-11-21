@@ -2309,14 +2309,27 @@ static void desc_scroll_tick(void) {
     return;
   /* Take the page's draw callback over: the engine's version lays the page out
    * from string-image heights that do not exist here, which is what put the
-   * next level's block and the value comparison on top of each other. */
-  void *ours = (void *)nx_desc_text_scroll;
-  if (*(void **)((char *)sd + 0xa0) != ours) {
-    *(void **)((char *)sd + 0xa0) = ours;
-    static int tl;
-    if (tl < 4) {
-      tl++;
-      debugPrintf("desc: draw callback installed (%p)\n", ours);
+   * next level's block and the value comparison on top of each other.
+   *
+   * Only do this while a description page is ACTUALLY on screen. The global at
+   * +0x2b5a30 is not cleared when the page closes, and after a scene rebuild it
+   * still points at recycled heap. On the mercenary screen that stale pointer
+   * resolves to a `sd` whose +0xa0 lands on the second-row first slot's
+   * +0x28 (its WIDTH): writing our callback there stamped 0x5a3767710 (242
+   * billion) into the slot's width, so every tap in the lower rows hit that one
+   * slot and jumped to row 2 col 1. The page's real draw callback is installed
+   * by the GOT override of UIDesc_DrawTextScroll already, so gating this write
+   * on a freshly drawn page costs nothing -- nx_desc_text_scroll sets
+   * desc_page_frame on its first real draw, from which point this branch runs. */
+  if (desc_page_frame && g_frame_no - desc_page_frame <= 3) {
+    void *ours = (void *)nx_desc_text_scroll;
+    if (*(void **)((char *)sd + 0xa0) != ours) {
+      *(void **)((char *)sd + 0xa0) = ours;
+      static int tl;
+      if (tl < 6) {
+        tl++;
+        debugPrintf("desc: draw callback installed (%p)\n", ours);
+      }
     }
   }
   if (dy == 0)
@@ -2997,6 +3010,28 @@ static void *safe_ctrl_child(void *c, int i) {
 static int safe_ctrl_count(void *c) {
   return ctrl_object_ok(c) && ctrl_count_engine ? ctrl_count_engine(c) : 0;
 }
+
+/* The live control-tree root, i.e. the tree the engine is dispatching on right
+ * now. Used to prove that an object reachable only through an engine global
+ * (the description panel at +0x2b5a28) still belongs to THIS screen instead of
+ * trusting a frame counter that expires when a page stops redrawing. */
+static void *ctrl_live_root(void) {
+  unsigned char *b = (unsigned char *)input_engine_virtbase();
+  return b ? (void *)probe_ptr((uintptr_t)b + 0x2b4140) : NULL;
+}
+static int ctrl_under_root(void *obj, void *root) {
+  if (!obj || !root)
+    return 0;
+  void *p = obj;
+  for (int d = 0; d < 12 && p; d++) {
+    if (p == root)
+      return 1;
+    if (!probe_mem_ok(p, 0xb0))
+      return 0;
+    p = *(void *const volatile *)((unsigned char *)p + 0xa0);
+  }
+  return 0;
+}
 static long safe_colevent(void *c, long code, void *data, long extra) {
   return ctrl_object_ok(c) && colevent_real
              ? colevent_real(c, code, data, extra) : 0;
@@ -3381,7 +3416,11 @@ static void tree_dump_now(const char *tag) {
  * title screen, any popup, then the save-slot panel */
 static void tree_tick(void) {
   static int frames, dumps;
-  if (!g_menu_ready || dumps >= 120)
+  /* Four snapshots, as the comment above says. It used to run to 120, which
+   * wrote ~24k tree lines into every session and buried everything else in the
+   * log; the page dumps that matter are triggered by the pages themselves now
+   * (see the synthesizer dump in hud_tick). */
+  if (!g_menu_ready || dumps >= 4)
     return;
   if (++frames % 180)
     return;
@@ -3849,6 +3888,20 @@ static int hud_overlaps(const HudRect *r, long x, long y, long w, long h) {
 static long quick_pos[6][2];
 static int quick_pos_ok, quick_parsed;
 static void *shortcut_proc;        /* UIShortcutMenu_Shortcut_EventProc */
+/* The synthesizer (POPUP_SC_MIX) page. Its control ids are dynamic, so the page
+ * is recognised by its own event procs: the stuff sockets, the inventory grid
+ * and the inventory bag each have one. */
+static void *mix_stuff_proc;       /* UIMix_StuffItemControlEventProc */
+static void *mix_inven_proc;       /* UIMix_InvenItemControlEventProc */
+static void *mix_bag_proc;         /* UIMix_InvenBagControlEventProc */
+/* ControlItem_GetItem(ctrl): the item record a bag slot is showing, or NULL.
+ * UIEquip_RefreshBagArea() fills the six slots from one item list, so a slot
+ * whose record is NULL answers a tap with nothing at all. */
+static void *(*ctrl_item_get)(void *);
+static volatile unsigned mix_page_frame;  /* last frame the page was in the tree */
+static int mix_dump_pending;
+static int mix_dumped;
+static int mix_slots_seen;
 static int quick_assign_slot;      /* 0..6 while scanning one tree */
 static void *quick_objs[12];       /* 0..5 HUD, 6..11 assign page */
 
@@ -3887,7 +3940,7 @@ static void quick_layout_parse(void) {
     qr[i][3] = 80;
   }
   input_set_quick_rects(qr, cfg.quick_layout && quick_pos_ok);
-  /* the page-swap button is R-only now, in the field and on the assign page */
+  /* the page-swap button is LT-only now, in the field and on the assign page */
   input_set_swap_rect(SWAP_BTN_X, SWAP_BTN_Y, SWAP_BTN_W, SWAP_BTN_H,
                       cfg.quick_layout && quick_pos_ok);
 }
@@ -3945,6 +3998,16 @@ static void quick_layout_apply_slot(void *c, int slot, const char *tag) {
 
 /* Every frame: re-apply to the cached objects. probe_mem_ok() keeps a page
  * whose controls were destroyed from turning into a write to freed memory. */
+/* set by ui_page_sync() (defined with the HUD page code below): a full-screen
+ * page is above the HUD this frame */
+static int g_page_owns_touch;
+
+/* Moving these rects does NOT stop a page tap being stolen: the quick-slot
+ * pre-dispatch in nx_ControlObject_EventProc hands the press straight to the
+ * control object by the fixed quick_pos[] coordinates, without ever looking at
+ * its rectangle. Parking them here only made the layout flap. The real rule is
+ * in the event dispatcher: while a page owns the screen, HUD quick slots are
+ * not part of the visible page and must not answer a finger. */
 static void quick_layout_frame(void) {
   if (!cfg.quick_layout || !quick_pos_ok)
     return;
@@ -3962,7 +4025,7 @@ static void quick_layout_frame(void) {
  * moving those controls' rects -- the stick and A are driven straight on
  * their control objects, and their geometry is what input.c reads. */
 /* ------------------------------------------------------------------------- */
-/* R shoulder: swap ONLY the four right-hand quick slots                     */
+/* LT (NS ZL): swap ONLY the four right-hand quick slots                      */
 /*                                                                           */
 /* PLAYER_ScrollShortcut (0x1be5e0) flips a global page byte (p+6)%12: the   */
 /* 12 shortcut slots are two pages of six, so one press changes all six HUD  */
@@ -3999,6 +4062,39 @@ void quick_swap_fire(void) {
     }
   }
   debugPrintf("quick: R swapped right-hand 4 slots (lower-left 2 fixed)\n");
+}
+
+/* The shortcut-ASSIGN popup ("请选择要设置的快捷键") registers a skill into
+ * slot `page*6 + i`: UIShortcutMenu_Shortcut_EventProc computes that index from
+ * UIShortcutMenu_i32Page (vb+0x29e9e8, a pointer to the page value), NOT from
+ * the shortcut data array. The on-screen page-swap button at 1059,313 calls
+ * UIShortcutMenu_ButtonScrollExe (0x161368), which does exactly
+ *   page = (page + 1) % 2
+ * on the value behind that pointer.
+ *
+ * quick_swap_fire() above only exchanges the DATA array, which is right for
+ * the field HUD but does nothing to the assign popup's write index -- so R
+ * used to show page 2 while a registration still landed on page 1. Flip the
+ * engine's own page value here instead. We replicate the two-instruction
+ * update rather than calling the engine function, so no calling convention or
+ * control-object argument is involved; the algorithm is byte-for-byte the
+ * behaviour of ButtonScrollExe for the only values the page can hold (0/1). */
+#define SHORTCUT_PAGE_PTR_GLOBAL 0x29e9e8u
+void shortcut_assign_flip_page(void) {
+  unsigned char *vb = input_engine_virtbase();
+  if (!vb)
+    return;
+  unsigned long *pp = *(unsigned long *volatile *)(vb + SHORTCUT_PAGE_PTR_GLOBAL);
+  if (!pp || !probe_mem_ok(pp, 8)) {
+    debugPrintf("quick: assign page flip skipped (page ptr %p)\n", (void *)pp);
+    return;
+  }
+  const unsigned long page = *pp;
+  /* ButtonScrollExe computes (page + 1) % 2; the page only ever holds 0 or 1. */
+  const unsigned long next = (page + 1) & 1UL;
+  *pp = next;
+  debugPrintf("quick: assign page %lu -> %lu (write index now %lu*6)\n",
+              page, next, next);
 }
 
 /* Pad -> one quick slot. Fire straight on the HUD control object (the same
@@ -4878,8 +4974,268 @@ static void nav_scan(void) {
   }
 }
 
+/* Dedicated probe for the synthesizer page. hud_scan_node() stops at depth 6
+ * because its only job is the HUD, and a page's item cells already sit at depth
+ * 7 (root > page shell > frame > content > grid board > grid > cell), so the
+ * stuff sockets cannot be reached from there. This walk is deeper and does
+ * nothing but note the page and ask for one tree dump. */
+static int mix_probe_nodes;
+static void mix_probe_node(void *node, int depth) {
+  if (!node || depth > 10 || mix_probe_nodes > 800 || !p_ctrl_count ||
+      !p_ctrl_child || !p_ctrl_proc)
+    return;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n && mix_probe_nodes <= 800; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    mix_probe_nodes++;
+    void *pr = p_ctrl_proc(c);
+    if (pr && (pr == mix_stuff_proc || pr == mix_inven_proc ||
+               pr == mix_bag_proc)) {
+      mix_page_frame = g_frame_no;
+      if (pr == mix_stuff_proc) {
+        mix_slots_seen++;
+        if (!mix_dumped)
+          mix_dump_pending = 1;
+      }
+    }
+    mix_probe_node(c, depth + 1);
+  }
+}
+
+/* The synthesizer page's control tree is NOT a child of the scene root: it
+ * hangs off a module global (UIMix_Exit / UIMix_MixGemEndProcess clear it when
+ * the page closes, so a non-NULL pointer is an exact page test). Scanning the
+ * root for UIMix event procs never matched a single node -- which is why the
+ * page stayed unrecognised and two separate things went wrong:
+ *   - the shop pre-dispatch kept claiming taps aimed at the stuff sockets
+ *     ("the leftmost socket answered nothing while its neighbours worked"),
+ *   - the virtual d-pad veto swallowed every real finger over that socket,
+ *     because its 252x252 disc sits exactly on the left column. Only the sliver
+ *     of the socket above and left of the disc still answered. */
+#define MIX_CONTAINER 0x2b72b0
+
+static void *mix_container_obj(void) {
+  unsigned char *vb = (unsigned char *)game_mod.load_virtbase;
+  if (!vb)
+    return NULL;
+  void *c = *(void *const volatile *)(vb + MIX_CONTAINER);
+  return (c && probe_mem_ok(c, 0x40)) ? c : NULL;
+}
+
+static void mix_dump_container(void *c) {
+  if (!c || !p_abs_rect || !p_ctrl_count)
+    return;
+  const CtrlRect r = p_abs_rect(c);
+  tree_lines = 1;
+  debugPrintf("mix: ---- socket container %p rect %ld,%ld %ldx%ld, %d child(s)\n",
+              c, r.x, r.y, r.w, r.h, p_ctrl_count(c));
+  dump_tree(c, 0);
+}
+
+/* Every full-screen page -- the settings tabs, the bag, the ability splitter,
+ * the shop, the synthesizer -- is drawn ON TOP of the play HUD, but the touch
+ * veto for the virtual pad was swallowing fingers that landed on page controls:
+ * the bag's two lowest bag buttons and the ability page's buttons sit exactly
+ * over the d-pad disc (engine 10,388 252x252). Publish "a page owns the screen"
+ * while one is up so the pad rectangles stop claiming those points. Gameplay has
+ * no full-screen layer above the HUD, so the pad keeps its veto there. */
+/* Page trees are NOT children of ctrl_live_root(). The bag, equipment and
+ * description pages are pushed on their OWN InputLayer root -- the pointer the
+ * engine passes to TouchHandle_Event -- while ctrl_live_root() still holds the
+ * field HUD / title tree. Eden log, tapping the second-to-last bag:
+ *   ui: TouchHandle_Event root 0x210b073878 (live 0x210af6c7d4, 3 children)
+ * Checking only the live root therefore NEVER saw those pages, so
+ * g_page_owns_touch stayed 0 and the entire modal rule never armed -- which is
+ * why the previous build behaved exactly like the one before it.
+ * A page layer is the 1137x640 / 1137x431 frame every full-screen page has;
+ * the field HUD has no such child. */
+static void *g_page_root;
+
+typedef struct { void *root; unsigned frame; int answer; } PageRootCache;
+static int root_is_page_tree(void *root) {
+  static PageRootCache cache[4];
+  static int next;
+  if (!root || !ctrl_object_ok(root))
+    return 0;
+  for (int i = 0; i < 4; i++)
+    if (cache[i].root == root && cache[i].frame == g_frame_no)
+      return cache[i].answer;
+  int answer = 0;
+  if (p_abs_rect) {
+    const CtrlRect r = p_abs_rect(root);
+    if (r.w >= 1000 && r.h >= 400)
+      answer = 1;
+  }
+  if (!answer && p_ctrl_count && p_ctrl_child && p_abs_rect) {
+    const int n = p_ctrl_count(root);
+    for (int i = 0; i < n && i < 64 && !answer; i++) {
+      void *c = p_ctrl_child(root, i);
+      if (!c || !ctrl_object_ok(c))
+        continue;
+      const CtrlRect r = p_abs_rect(c);
+      if (r.w >= 1000 && r.h >= 400) {
+        answer = 1;
+        break;
+      }
+      /* Some pages wrap the frame in a zero-area layout container. */
+      const int m = p_ctrl_count(c);
+      for (int j = 0; j < m && j < 64; j++) {
+        void *g = p_ctrl_child(c, j);
+        if (!g || !ctrl_object_ok(g))
+          continue;
+        const CtrlRect gr = p_abs_rect(g);
+        if (gr.w >= 1000 && gr.h >= 400) {
+          answer = 1;
+          break;
+        }
+      }
+    }
+  }
+  cache[next].root = root;
+  cache[next].frame = g_frame_no;
+  cache[next].answer = answer;
+  next = (next + 1) & 3;
+  return answer;
+}
+
+/* event_root is the tree the engine is dispatching THIS touch on. hud_tick()
+ * passes NULL and uses the last root proven to hold a page, so the pad veto is
+ * already suspended before the finger is injected. */
+static int ui_page_live(void *event_root) {
+  if (root_is_page_tree(event_root))
+    return 1;
+  if (g_page_root && ctrl_object_ok(g_page_root) &&
+      root_is_page_tree(g_page_root))
+    return 1;
+  void *live = ctrl_live_root();
+  if (live != g_page_root && root_is_page_tree(live))
+    return 1;
+  return 0;
+}
+
+static void ui_page_sync(void *event_root) {
+  static int was;
+  if (event_root) {
+    /* A touch on the field HUD proves the page is gone: drop the cached page
+     * root instead of keeping the pad veto suspended for a closed page. */
+    g_page_root = root_is_page_tree(event_root) ? event_root : NULL;
+  }
+  const int on = ui_page_live(event_root) || mix_container_obj() != NULL;
+  g_page_owns_touch = on;
+  if (on == was)
+    return;
+  was = on;
+  if (on) {
+    input_set_page_rect(0, 0, 1137, 640, 1);
+    debugPrintf("ui: page owns the touch area (root %p), pad veto suspended\n",
+                g_page_root);
+  } else {
+    input_set_page_rect(0, 0, 0, 0, 0);
+    debugPrintf("ui: page gone, pad veto back\n");
+  }
+}
+
+static void mix_tick(void) {
+  void *c = mix_container_obj();
+  static int was;
+  const int on = c != NULL;
+  if (on) {
+    mix_page_frame = g_frame_no;
+    if (!was) {
+      debugPrintf("mix: page up, container %p\n", c);
+      if (!mix_dumped) {
+        mix_dumped = 1;
+        mix_dump_container(c);
+      }
+    }
+  } else if (was) {
+    debugPrintf("mix: page down\n");
+  }
+  was = on;
+}
+
+/* The engine's "which control is the finger dragging" slot. When the page that
+ * owned that control is torn down -- the bag's 背包已满 box is the one that bit
+ * us -- the slot keeps pointing at a control whose data block is already gone.
+ * UIEquip_Process then calls ControlItem_GetMoving() on it, which is
+ *   return ((Item *)ControlObject_GetData(ctrl))->flag_0xa;
+ * and ControlObject_GetData returns NULL, so the load faults: Data Abort at
+ * libgame+0x13e59c, four identical crash reports. Clearing the slot as soon as
+ * its control can no longer answer is the only repair that does not depend on
+ * guessing which page took it down (the same pointer is used from the item
+ * pages, the shop and any moving-icon draw). */
+#define TOUCH_MOVING_SLOT 0x2b2eb0
+
+static void lock_points_tick(void);   /* defined with the cheat hooks below */
+
+static void touch_state_tick(void) {
+  unsigned char *vb = (unsigned char *)game_mod.load_virtbase;
+  if (!vb)
+    return;
+  void *c = *(void *const volatile *)(vb + TOUCH_MOVING_SLOT);
+  if (!c)
+    return;
+  void *data = probe_mem_ok(c, 0x58)
+                   ? *(void *const volatile *)((unsigned char *)c + 0x50)
+                   : NULL;
+  if (data && probe_mem_ok(data, 0x10))
+    return;                      /* a live item cell, leave the drag alone */
+  *(void *volatile *)(vb + TOUCH_MOVING_SLOT) = NULL;
+  static int logs;
+  if (logs < 8) {
+    logs++;
+    debugPrintf("ui: dropped stale moving control %p (data %p)\n", c, data);
+  }
+}
+
+/* UIEquip_GetBagSlotIndex() answers "which bag slot is this" by walking the
+ * children of [0x2b66c8] in order, so that container is the authoritative list.
+ * The slot the player cannot use reports TouchHandle_ControlEventProc instead of
+ * UIEquip_InvenBagControlEventProc, i.e. it is not a bag slot at all as far as
+ * the engine's dispatch is concerned. Dump the whole list once per page so the
+ * next run shows whether one slot is odd or the entire row is. */
+#define BAG_SLOT_CONTAINER 0x2b66c8
+
+static void bag_slots_tick(void) {
+  unsigned char *vb = (unsigned char *)game_mod.load_virtbase;
+  if (!vb)
+    return;
+  void *bag = *(void *const volatile *)(vb + BAG_SLOT_CONTAINER);
+  static void *last;
+  if (bag == last)
+    return;
+  last = bag;
+  if (!bag || !ctrl_object_ok(bag) || !p_ctrl_count || !p_ctrl_child ||
+      !p_abs_rect || !p_ctrl_proc)
+    return;
+  const int n = p_ctrl_count(bag);
+  const uintptr_t base = (uintptr_t)vb;
+  debugPrintf("bag: ---- slot container %p, %d child(s) ----\n", bag, n);
+  for (int i = 0; i < n && i < 12; i++) {
+    void *c = p_ctrl_child(bag, i);
+    if (!c)
+      continue;
+    const CtrlRect r = p_abs_rect(c);
+    const uintptr_t pr = (uintptr_t)p_ctrl_proc(c);
+    debugPrintf("bag:   [%d] id %u rect %ld,%ld %ldx%ld proc engine+0x%lx "
+                "show %d child(s) %d item %p\n", i, p_ctrl_id ? p_ctrl_id(c) : 0u,
+                r.x, r.y, r.w, r.h,
+                (base && pr >= base) ? (unsigned long)(pr - base) : 0ul,
+                p_ctrl_show ? p_ctrl_show(c) : -1,
+                p_ctrl_count ? p_ctrl_count(c) : -1,
+                ctrl_item_get ? ctrl_item_get(c) : NULL);
+  }
+}
+
 static void hud_tick(void) {
   static int frames;
+  mix_tick();                    /* page test before anything reads the HUD */
+  bag_slots_tick();              /* one line per bag slot when the page opens */
+  touch_state_tick();            /* a torn-down page leaves a dead drag behind */
+  lock_points_tick();            /* restore counters written behind our back */
+  ui_page_sync(NULL);                /* a page above the HUD suspends the pad veto */
   /* The backing plate is submitted BEFORE the glyphs, so a one-frame flag
    * always let the first plate through, and a two-frame window let it flicker
    * back whenever the text skipped a frame. Hold the suppression for a short
@@ -4909,8 +5265,19 @@ static void hud_tick(void) {
   shop_btn_seen = 0;
   input_set_shop_rect(0, 0, 0, 0, 0);
   input_hud_begin();
+  if (!mix_dumped)
+    mix_slots_seen = 0;
+  mix_probe_nodes = 0;
+  mix_probe_node(root, 0);
   hud_scan_node(root, 0);
   input_hud_end();
+  ui_page_sync(NULL);                /* the scan just decided whether a page is up */
+  if (mix_dump_pending) {
+    mix_dump_pending = 0;
+    mix_dumped = 1;
+    debugPrintf("mix: ---- %d stuff socket(s) in the tree ----\n", mix_slots_seen);
+    tree_dump_now("mix");
+  }
   /* The rects only arm the blit filter after HUD mode is confirmed, so a menu
    * page that reuses these ids keeps drawing its own buttons. */
   if (!input_hud_present())
@@ -4963,6 +5330,37 @@ static void dump_control(void *obj) {
                   (unsigned long)(v - vb));
       obj_lines++;
     }
+  }
+}
+
+/* Which controls actually cover the point? The engine's own dispatch only
+ * reports a result, and once it finds a hit it drops straight to that control's
+ * proc without walking EventProc -- so a control that claims a tap and then does
+ * nothing leaves no trace at all. This lists every node whose rectangle holds
+ * the point, with its proc offset: enough to tell "the right button, but its
+ * action is a no-op" from "a sibling layer ate the tap first". */
+static int hit_report_presses;
+
+static void hit_report(void *node, long x, long y, int depth) {
+  if (!node || depth > 6 || !p_ctrl_count || !p_ctrl_child || !p_abs_rect ||
+      !p_ctrl_proc)
+    return;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c)
+      continue;
+    const CtrlRect r = p_abs_rect(c);
+    if (r.w > 0 && r.h > 0 && x >= r.x && x < r.x + r.w && y >= r.y &&
+        y < r.y + r.h) {
+      const uintptr_t vb = (uintptr_t)input_engine_virtbase();
+      const uintptr_t pr = (uintptr_t)p_ctrl_proc(c);
+      debugPrintf("hit: d%d id %u rect %ld,%ld %ldx%ld proc engine+0x%lx "
+                  "show %d\n", depth, p_ctrl_id ? p_ctrl_id(c) : 0u, r.x, r.y,
+                  r.w, r.h, (vb && pr >= vb) ? (unsigned long)(pr - vb) : 0ul,
+                  p_ctrl_show ? p_ctrl_show(c) : -1);
+    }
+    hit_report(c, x, y, depth + 1);
   }
 }
 
@@ -5107,6 +5505,130 @@ static void dump_desc_tree(void *node, int depth) {
 static int colevent_depth;
 static int colevent_forwarding;
 
+/* ------------------------------------------------------------------------- */
+/* ONE visible page owns the touch                                            */
+/*                                                                           */
+/* The engine keeps every full-screen layer it ever pushed as a 1137x640     */
+/* child of the scene root: the settings menu, then one layer per shortcut-   */
+/* assign popup, plus the play HUD's own containers. All of them stay live    */
+/* in the hit test. The port's quick-slot pre-dispatch made it worse by       */
+/* handing a press straight to a HUD button whenever the point fell inside    */
+/* one of the six quick_pos[] rectangles -- so a tap on the bag's second-to-  */
+/* last slot (973,422 57x57) or the ability page's ">" arrow was answered by  */
+/* the shortcut cross at (945,395 80x80) and the page control never saw it.  */
+/*                                                                           */
+/* This is the same rule the engine applies to key input between the map and  */
+/* the settings menu: while a page owns the screen, only that page's controls */
+/* may answer. A control is dropped when it belongs to                        */
+/*   - a hidden container (a page that is not drawn),                         */
+/*   - a HUD / map container (a direct child of the root that is not a        */
+/*     full-screen page layer),                                               */
+/*   - a stale shortcut-assign popup layer (six 80x80 slots, but its title    */
+/*     plate has not been drawn for several frames),                          */
+/*   - one of the HUD quick slots, whatever tree it hangs off.                */
+/* Controls that are NOT in the scene-root tree are left alone: the engine    */
+/* dispatches many pages (bag, equipment) on a separate InputLayer root, and  */
+/* those controls ARE the visible page.                                      */
+/*                                                                           */
+/* The shortcut-assign popup is the exception: while its "请选择要设置的      */
+/* 快捷键" title plate is being drawn, its own six slots are the visible page */
+/* and must keep answering.                                                  */
+/* ------------------------------------------------------------------------- */
+static volatile unsigned g_shortcut_popup_frame;
+
+static int ui_page_is_layer(void *c) {
+  if (!c || !p_abs_rect)
+    return 0;
+  const CtrlRect r = p_abs_rect(c);
+  return r.w >= 1000 && r.h >= 500;
+}
+
+/* The direct child of `root` this control hangs off, or NULL when the object
+ * is not in that tree at all. */
+static void *ui_root_branch(void *obj, void *root) {
+  void *p = obj;
+  for (int d = 0; d < 12 && p && ctrl_object_ok(p); d++) {
+    void *parent = *(void *const volatile *)((unsigned char *)p + 0xa0);
+    if (!parent || !ctrl_object_ok(parent))
+      return NULL;
+    if (parent == root)
+      return p;
+    p = parent;
+  }
+  return NULL;
+}
+
+static void ui_count_shortcut_slots(void *node, int depth, int *found) {
+  if (!node || depth > 4 || *found >= 6 || !p_ctrl_count || !p_ctrl_child)
+    return;
+  const int n = p_ctrl_count(node);
+  for (int i = 0; i < n && *found < 6; i++) {
+    void *c = p_ctrl_child(node, i);
+    if (!c || !ctrl_object_ok(c))
+      continue;
+    if (p_ctrl_proc && shortcut_proc && p_ctrl_proc(c) == shortcut_proc)
+      (*found)++;
+    ui_count_shortcut_slots(c, depth + 1, found);
+  }
+}
+
+/* The same layers are asked about once per control in a dispatch, so remember
+ * the answers for the frame instead of walking their subtrees dozens of times. */
+typedef struct { void *layer; unsigned frame; int answer; } SlotCache;
+static int ui_layer_has_shortcut_slots(void *layer) {
+  static SlotCache cache[4];
+  static int next;
+  for (int i = 0; i < 4; i++)
+    if (cache[i].layer == layer && cache[i].frame == g_frame_no)
+      return cache[i].answer;
+  int found = 0;
+  ui_count_shortcut_slots(layer, 0, &found);
+  cache[next].layer = layer;
+  cache[next].frame = g_frame_no;
+  cache[next].answer = found >= 6;
+  const int answer = cache[next].answer;
+  next = (next + 1) & 3;
+  return answer;
+}
+
+/* The LAST full-screen child of the root is the layer drawn on top. When the
+ * shortcut-assign popup is up it is that popup; when the popup is gone, every
+ * popup layer left in the tree is stale. */
+static void *ui_last_page_layer(void *root) {
+  static void *cached_root;
+  static unsigned cached_frame;
+  static void *cached_layer;
+  if (cached_root == root && cached_frame == g_frame_no)
+    return cached_layer;
+  void *last = NULL;
+  const int n = p_ctrl_count ? p_ctrl_count(root) : 0;
+  for (int i = 0; i < n && i < 64; i++) {
+    void *c = p_ctrl_child ? p_ctrl_child(root, i) : NULL;
+    if (c && ctrl_object_ok(c) && ui_page_is_layer(c))
+      last = c;
+  }
+  cached_root = root;
+  cached_frame = g_frame_no;
+  cached_layer = last;
+  return last;
+}
+
+/* 1 = this control must not answer a finger while a visible page owns the
+ * screen. DELIBERATELY MINIMAL: the page tree is dispatched on its own
+ * InputLayer root, and returning 0 for a whole branch here skips EVERY control
+ * below it. Rejecting zero-area layout branches made the title screen's
+ * 开始游戏 button (id 10 under the 1137x640 layer) unreachable. The actual
+ * culprit was the HUD quick-slot pre-dispatch, now gated on the page root. */
+static int ui_modal_blocks(void *obj) {
+  if (!g_page_owns_touch || !obj)
+    return 0;
+  if (p_ctrl_proc && ctrl_skill_proc && p_ctrl_proc(obj) == ctrl_skill_proc)
+    return 1;                  /* a HUD quick slot is never part of a page */
+  if (ctrl_hidden_container(obj))
+    return 1;                  /* a page that is not drawn */
+  return 0;
+}
+
 /* A sell / yes-no button can be covered by a 74x74 item cell in a sibling
  * layer. The engine's hit test then returns 1 FOR THE CELL, so an r==0
  * fallback never gets a chance -- that is the intermittent "tap hits the grid
@@ -5150,8 +5672,22 @@ static long shop_button_pre_dispatch(const long *pt, long code, void *data,
    * area"). Pages without the item grids keep the engine's normal dispatch. */
   if (!page || !ctrl_object_ok(page) || !shop_page_has_grid(page, 0))
     return -1;
+  /* The synthesizer page carries the same 4x4 grids of 74x74 cells, so
+   * shop_page_has_grid() is not a unique fingerprint. Without this guard the
+   * pre-dispatch took taps aimed at the stuff sockets and handed them to
+   * whatever ControlButton the socket overlaps -- the leftmost socket answered
+   * nothing while its neighbours worked. */
+  if (mix_page_frame && g_frame_no - mix_page_frame <= 60) {
+    static int mix_logs;
+    if (mix_logs < 6) {
+      mix_logs++;
+      debugPrintf("ui: shop pre-dispatch skipped, synthesizer page at (%ld,%ld)\n",
+                  pt[0], pt[1]);
+    }
+    return -1;
+  }
   void *btn = live_button_at(page, pt[0], pt[1], 0);
-  if (!btn || btn == obj)
+  if (!btn || btn == obj || ui_modal_blocks(btn))
     return -1;
   colevent_forwarding = 1;
   const long r = safe_colevent(btn, code, data, extra);
@@ -5180,31 +5716,46 @@ static long nx_ControlObject_EventProc(void *obj, long code, void *data,
     }
     return 0;
   }
-  /* A button inside a hidden container is a phantom: the engine keeps it in the
-   * tree with a live rectangle, its proc still plays the press sound, and it
-   * still claims the tap -- so the player hears a click while the item cell
-   * behind it never gets the event. Drop pointer events for these instead of
-   * forwarding them, so the engine's child walk falls through to whatever is
-   * actually drawn at that point. */
-  if (obj && code >= 0x17 && code <= 0x1a && ctrl_button_proc && p_ctrl_proc &&
-      p_ctrl_proc(obj) == ctrl_button_proc) {
-    void *phantom = ctrl_hidden_container(obj);
-    if (phantom) {
-      static int phantom_logs;
-      if (phantom_logs < 12) {
-        phantom_logs++;
-        const CtrlRect br = p_abs_rect(obj);
-        const CtrlRect hr = p_abs_rect(phantom);
-        const long *pp = (const long *)data;
-        debugPrintf("ui: phantom button id %u rect %ld,%ld %ldx%ld dropped "
-                    "(hidden container id %u rect %ld,%ld %ldx%ld) code %04lx "
-                    "at (%ld,%ld)\n",
-                    p_ctrl_id ? p_ctrl_id(obj) : 0u, br.x, br.y, br.w, br.h,
-                    p_ctrl_id ? p_ctrl_id(phantom) : 0u, hr.x, hr.y, hr.w, hr.h,
-                    code, pp ? pp[0] : -1, pp ? pp[1] : -1);
-      }
-      return 0;
+  const unsigned ev = (unsigned)code & 0xffffu;
+  const int is_pointer = data && (ev >= 0x17 && ev <= 0x1a);
+  /* A control inside a hidden container is a phantom: the engine keeps it in
+   * the tree with a live rectangle, its proc still plays the press sound, and
+   * it still claims the tap. SetShow(false) only writes the container's own
+   * state, so EVERY control type -- buttons, item cells, shortcut slots --
+   * needs this check, not just ControlButton. Drop pointer events for these
+   * instead of forwarding them, so the engine's child walk falls through to
+   * whatever is actually drawn at that point. */
+  if (obj && is_pointer && ctrl_hidden_container(obj)) {
+    static int phantom_logs;
+    if (phantom_logs < 12 && p_abs_rect) {
+      phantom_logs++;
+      const CtrlRect br = p_abs_rect(obj);
+      const long *pp = (const long *)data;
+      debugPrintf("ui: hidden-page control id %u rect %ld,%ld %ldx%ld dropped "
+                  "code %04lx at (%ld,%ld)\n",
+                  p_ctrl_id ? p_ctrl_id(obj) : 0u, br.x, br.y, br.w, br.h,
+                  code, pp ? pp[0] : -1, pp ? pp[1] : -1);
     }
+    return 0;
+  }
+  /* While a visible page owns the screen, controls belonging to another page
+   * (the map HUD, a hidden layer, a stale shortcut popup) are NOT allowed to
+   * answer a finger. This is the map-vs-settings rule applied to the control
+   * tree: the engine walks every layer it ever pushed, in insertion order,
+   * and stops at the FIRST one that claims the press -- so an old layer in
+   * front of the real page silently eats it. */
+  if (obj && is_pointer && !colevent_forwarding && ui_modal_blocks(obj)) {
+    static int modal_logs;
+    if (modal_logs < 24 && p_abs_rect) {
+      modal_logs++;
+      const CtrlRect br = p_abs_rect(obj);
+      const long *pp = (const long *)data;
+      debugPrintf("ui: off-page control id %u rect %ld,%ld %ldx%ld blocked "
+                  "code %04lx at (%ld,%ld)\n",
+                  p_ctrl_id ? p_ctrl_id(obj) : 0u, br.x, br.y, br.w, br.h,
+                  code, pp ? pp[0] : -1, pp ? pp[1] : -1);
+    }
+    return 0;
   }
   colevent_depth++;
   if (colevent_depth == 1 && !colevent_forwarding && data &&
@@ -5222,6 +5773,10 @@ static long nx_ControlObject_EventProc(void *obj, long code, void *data,
       (code == 0x17 || code == 0x18 || code == 0x19)) {
     const long *tp = (const long *)data;
     void *tab_obj = ui_tab_control_at(tp[0], tp[1]);
+    /* A tab remembered by the last nav scan may belong to a page that is no
+     * longer the visible one. */
+    if (tab_obj && ui_modal_blocks(tab_obj))
+      tab_obj = NULL;
     if (tab_obj) {
       colevent_forwarding = 1;
       const long trr = colevent_real
@@ -5242,9 +5797,30 @@ static long nx_ControlObject_EventProc(void *obj, long code, void *data,
    * straight to the button's own control object: the normal tree walk would
    * reach the virtual stick or the action disc first, and those two must NOT
    * answer screen touches (they are driven by the pad on their objects).
-   * Prefer the shortcut-assign page's own slots while that page is up. */
+   * Prefer the shortcut-assign page's own slots while that page is up.
+   *
+   * A PAGE owns the screen now: the six quick_pos[] rectangles are HUD art,
+   * not the visible page's controls. Leaving this pre-dispatch armed stole the
+   * press at (1016,450) that belonged to the bag's second-to-last slot
+   * (973,422 57x57) and the ability page's ">" arrows. Disable the whole
+   * shortcut while a page is up -- the field HUD still gets it when no page
+   * is present. */
+  /* At depth 1 obj IS the root the engine is walking. Even if the frame-level
+   * flag missed (a page pushed between hud_tick and the touch poll), a page
+   * tree must never let the six HUD quick_pos[] rectangles steal a press. */
+  const int page_dispatch = colevent_depth == 1 && root_is_page_tree(obj);
+  if (page_dispatch && code == 0x17 && data) {
+    static int plogs;
+    if (plogs < 12) {
+      plogs++;
+      const long *ppt = (const long *)data;
+      debugPrintf("ui: page root %p owns dispatch at (%ld,%ld), HUD "
+                  "pre-dispatch disabled\n", obj, ppt[0], ppt[1]);
+    }
+  }
   if (colevent_depth == 1 && !colevent_forwarding && data &&
       (code == 0x17 || code == 0x18 || code == 0x19) &&
+      !g_page_owns_touch && !page_dispatch &&
       cfg.quick_layout && quick_pos_ok) {
     const long *pt = (const long *)data;
     for (int s = 0; s < 6; s++) {
@@ -5280,7 +5856,8 @@ static long nx_ControlObject_EventProc(void *obj, long code, void *data,
     const long *cpt = (const long *)data;
     void *choice_obj = NULL;
     const int crow = ui_choice_button(cpt[0], cpt[1], &choice_obj);
-    if (crow != -1 && choice_obj) {   /* >=0 = row, -2 = content control */
+    if (crow != -1 && choice_obj && !ui_modal_blocks(choice_obj)) {
+                                      /* >=0 = row, -2 = content control */
       colevent_forwarding = 1;
       const long cr = colevent_real
                           ? safe_colevent(choice_obj, code, data, extra) : 0;
@@ -5328,7 +5905,7 @@ static long nx_ControlObject_EventProc(void *obj, long code, void *data,
        * ControlButton under the point and dispatch to it. Do NOT forward to the
        * 409x431 info plate: its close path shut the shop page on 11-15. */
       void *btn = live_button_at(page, pt[0], pt[1], 0);
-      if (btn && btn != obj) {
+      if (btn && btn != obj && !ui_modal_blocks(btn)) {
         colevent_forwarding = 1;
         r = safe_colevent(btn, code, data, extra);
         colevent_forwarding = 0;
@@ -5340,7 +5917,7 @@ static long nx_ControlObject_EventProc(void *obj, long code, void *data,
         }
       }
     } else if (dp && dp != obj && ctrl_object_ok(dp) && p_abs_rect &&
-               desc_page_frame != 0 &&
+               !ui_modal_blocks(dp) && desc_page_frame != 0 &&
                g_frame_no - desc_page_frame <= 12) {
       static int page_logs;
       if (page_logs < 8) {
@@ -5471,12 +6048,39 @@ static long nx_ControlObject_EventProc(void *obj, long code, void *data,
       }
     }
   }
+  /* Synthesizer page only: which control actually claims the tap, in tree order.
+   * The 200-line CO_EP quota is long gone by the time the player opens this
+   * page, so the mix page keeps its own counter. */
+  if ((code == 0x17 || code == 0x18) && mix_page_frame &&
+      g_frame_no - mix_page_frame <= 90 && colevent_depth <= 2) {
+    static int mix_logs;
+    if (mix_logs < 400) {
+      const long *mp = (const long *)data;
+      const unsigned cid2 = p_ctrl_id ? p_ctrl_id(obj) : 0;
+      CtrlRect mr = { 0, 0, 0, 0 };
+      if (p_abs_rect && obj)
+        mr = p_abs_rect(obj);
+      unsigned long poff = 0;
+      if (p_ctrl_proc && obj && game_mod.load_virtbase)
+        poff = (unsigned long)p_ctrl_proc(obj) -
+               (unsigned long)game_mod.load_virtbase;
+      mix_logs++;
+      debugPrintf("mix: ev d%d id %3u rect %4ld,%4ld %4ldx%-4ld proc +0x%-6lx "
+                  "code %04lx at (%ld,%ld) -> %ld\n",
+                  colevent_depth, cid2, mr.x, mr.y, mr.w, mr.h, poff, code,
+                  mp ? mp[0] : -1, mp ? mp[1] : -1, r);
+    }
+  }
   colevent_depth--;
   /* Presses and releases only: which control claims a tap is decided here, and
    * the skill page's two buttons sit under the description's scroll rect, so
    * "the button does nothing" is answered by this list (the first line with
    * result 1 is the control that ate the tap). */
-  if ((code == 0x17 || code == 0x18) && colevent_logs < 200) {
+  /* Presses only, and a quota big enough to reach the settings pages: the old
+   * 200-line budget was spent during start-up, so "this one cell does nothing"
+   * never produced a trace at all. The first line with result 1 is the control
+   * that ate the tap. */
+  if (code == 0x17 && colevent_logs < 2500) {
     colevent_logs++;
     const unsigned cid = p_ctrl_id ? p_ctrl_id(obj) : 0;
     CtrlRect cr = { 0, 0, 0, 0 };
@@ -5625,14 +6229,54 @@ static long desc_row_dispatch(long code, long coord, long extra) {
   if ((ev != 0x17 && ev != 0x18) || !coord ||
       !probe_mem_ok((const void *)(uintptr_t)coord, 16))
     return 0;
-  if (desc_page_frame == 0 || g_frame_no - desc_page_frame > 30)
-    return 0;
   unsigned char *vb = (unsigned char *)game_mod.load_virtbase;
   void *dp = vb ? *(void **)(vb + 0x2b5a28) : NULL;
   if (!dp || !ctrl_object_ok(dp) || !p_abs_rect || !p_ctrl_id)
     return 0;
+  /* The shortcut-assign popup ("请选择要设置的快捷键。") sits ON TOP of this
+   * panel, and its six slots OVERLAP the panel's 登录快捷键 button: the button
+   * is 830,495 125x55 while slot 1 is 865,475 80x80, so a tap on the slot at
+   * (909,514) lands inside both. The title plate is redrawn every frame the
+   * popup is up, so a fresh timestamp is proof the popup is STILL on screen.
+   * Dispatching the panel button underneath it re-fires
+   * UI_SetPopupProcessInfo(1,9) for every slot tap, stacking popup layers until
+   * the engine corrupts state and aborts. Let the tap fall through to the
+   * popup's own slot controls instead.
+   * Real-device evidence: desc row 243 fired twice at (914,518) and again at
+   * (909,514) after the popup was up, each followed by another (1,9) push. */
+  if (g_shortcut_popup_frame &&
+      g_frame_no - g_shortcut_popup_frame <= 4)
+    return 0;
+  /* The panel belongs to a page. When another page owns the screen (the
+   * shortcut-assign popup, the map HUD, a hidden layer) this panel is behind
+   * it and must not answer: firing its "登录快捷键" button from under a popup
+   * is what pushed a fresh popup on every tap and left a stack of dead layers. */
+  if (ui_modal_blocks(dp))
+    return 0;
+  /* Two independent proofs that this panel is the one on screen: our own text
+   * drawer has run within the last 30 frames, OR the object is still a member
+   * of the live control tree. The frame counter alone was not enough -- a shop
+   * screen that stops redrawing let it expire while the panel was still on top,
+   * and the press then fell through to the inventory cell drawn underneath the
+   * sell button ("selling sometimes selects the item behind it"). */
+  const int fresh = desc_page_frame && (g_frame_no - desc_page_frame <= 30);
+  const int member = ctrl_under_root(dp, ctrl_live_root());
+  if (!fresh && !member) {
+    static int gate_logs;
+    if (gate_logs < 12) {
+      gate_logs++;
+      debugPrintf("ui: desc row skipped, stale panel %p drawn %u frames ago\n",
+                  dp, desc_page_frame ? g_frame_no - desc_page_frame : 0u);
+    }
+    return 0;
+  }
   const long x = *(volatile long *)(uintptr_t)coord;
   const long y = *(volatile long *)((uintptr_t)coord + 8);
+  const CtrlRect dpr = p_abs_rect(dp);
+  if (dpr.w < 200 || dpr.h < 150 ||
+      x < dpr.x - 8 || x >= dpr.x + dpr.w + 8 ||
+      y < dpr.y - 8 || y >= dpr.y + dpr.h + 8)
+    return 0;
   void *btn = live_button_at(dp, x, y, 0);
   int clamped = 0;
   if (!btn) {
@@ -5642,11 +6286,27 @@ static long desc_row_dispatch(long code, long coord, long extra) {
     btn = desc_row_button_near(dp, x, y, 350);
     clamped = 1;
   }
-  if (!btn)
-    return 0;
   static void *press_btn;
   static unsigned press_id;
   static CtrlRect press_rect;
+  int reused = 0;
+  if (!btn && ev == 0x18 && press_btn && ctrl_object_ok(press_btn)) {
+    /* We claimed the press, so we own the release even when the panel was
+     * rebuilt in between. Letting the engine see a release it never saw a press
+     * for is exactly how the inventory cell drawn behind the sell button ended
+     * up being selected instead of the button firing. */
+    btn = press_btn;
+    reused = 1;
+  }
+  if (!btn) {
+    static int miss_logs;
+    if (miss_logs < 20) {
+      miss_logs++;
+      debugPrintf("ui: desc row has no button at (%ld,%ld) panel %ld,%ld "
+                  "%ldx%ld\n", x, y, dpr.x, dpr.y, dpr.w, dpr.h);
+    }
+    return 0;
+  }
   const unsigned id = p_ctrl_id(btn);
   const CtrlRect br = p_abs_rect(btn);
   int replayed = 0;
@@ -5672,13 +6332,17 @@ static long desc_row_dispatch(long code, long coord, long extra) {
   if (logs < 30) {
     logs++;
     debugPrintf("ui: desc row %u rect %ld,%ld %ldx%ld code %04lx at (%ld,%ld) "
-                "-> %ld%s%s\n", id, br.x, br.y, br.w, br.h, code, x, y, r,
-                clamped ? " clamped" : "", replayed ? " re-pressed" : "");
+                "-> %ld%s%s%s\n", id, br.x, br.y, br.w, br.h, code, x, y, r,
+                clamped ? " clamped" : "", replayed ? " re-pressed" : "",
+                reused ? " press-held" : "");
   }
   return 1;
 }
 
 static long nx_TouchHandle_Event(void *root, long code, long coord, long extra) {
+  /* Refresh "a page owns the screen" from the tree THIS touch is dispatched
+   * on. Page trees hang off their own InputLayer root, not ctrl_live_root(). */
+  ui_page_sync(root);
   /* Scene changes rebuild the tree. A root that no longer validates must not
    * be handed to the engine's hit test; the fallback below picks the live one. */
   if (root && !ctrl_object_ok(root)) {
@@ -5727,6 +6391,12 @@ static long nx_TouchHandle_Event(void *root, long code, long coord, long extra) 
       for (int i = n - 1; i >= 0; i--) {
         void *c = p_ctrl_child(root, i);
         if (!c)
+          continue;
+        /* Only a layer the player can actually see may win the hit test. An
+         * old shortcut-assign popup or the map HUD is still in the child list
+         * and still covers the point, but its controls are not the visible
+         * page's controls and must not claim this press. */
+        if (ui_modal_blocks(c))
           continue;
         if (tree_contains(c, tx, ty, 0)) {
           static int pick_logs;
@@ -5800,6 +6470,19 @@ static long nx_TouchHandle_Event(void *root, long code, long coord, long extra) 
     }
   }
 have_root:;
+  /* The root may have been swapped for the live / message-box tree above.
+   * Re-run the page test with the FINAL root so g_page_owns_touch matches the
+   * tree the engine is about to walk. */
+  ui_page_sync(root);
+  if ((code & 0xffff) == 0x17 && root && coord &&
+      probe_mem_ok((const void *)(uintptr_t)coord, 16) &&
+      hit_report_presses < 12) {
+    hit_report_presses++;
+    const long hx = *(volatile long *)(uintptr_t)coord;
+    const long hy = *(volatile long *)((uintptr_t)coord + 8);
+    debugPrintf("hit: ---- press at (%ld,%ld) root %p ----\n", hx, hy, root);
+    hit_report(root, hx, hy, 0);
+  }
   /* the class screen is modal: a tap that would land on the save page under it
    * must not reach that page (see is_save_page_hit) */
   if (select_scene_up && coord &&
@@ -9095,6 +9778,12 @@ static void plate_probe(const char *who, const char *str, int x, int y,
                         unsigned color) {
   static struct { const char *who; int x, y; unsigned c; } seen[12];
   static int n;
+  /* The "请选择要设置的快捷键" popup draws this title every frame it is up.
+   * Stamp the frame BEFORE the one-shot dedupe below: the page-ownership rule
+   * needs to know the popup is STILL on screen, not that it once appeared. */
+  if (str && strstr(str, "\xe8\xaf\xb7\xe9\x80\x89\xe6\x8b\xa9") &&
+      strstr(str, "\xe5\xbf\xab\xe6\x8d\xb7\xe9\x94\xae"))
+    g_shortcut_popup_frame = g_frame_no;
   if (y < 30 || y > 120)
     return;
   for (int i = 0; i < n; i++)
@@ -9716,6 +10405,218 @@ static const so_override drm_overrides[] = {
   { "_ZN10Protection12nativeFinishEi",         (void *)drm_native_finish },
 };
 
+/* Caught one step before it faults. ControlItem_GetMoving() is the exact three
+ * instructions the crash report points at:
+ *     x0 = ControlObject_GetData(ctrl)     // ctrl->data, +0x50
+ *     return *(u8 *)(x0 + 0xa)             // Data Abort when data == NULL
+ * Every caller only asks "is this cell being dragged", so answering "no" for a
+ * control that has no data block is correct and keeps the frame alive. The GOT
+ * slot is rewritten (so_resolve), which covers every PLT call to it. */
+static unsigned char ctrlitem_get_moving_safe(void *c) {
+  if (!c || !probe_mem_ok(c, 0x58))
+    return 0;
+  void *data = *(void *const volatile *)((unsigned char *)c + 0x50);
+  if (!data || !probe_mem_ok(data, 0x10)) {
+    static int logs;
+    if (logs < 8) {
+      logs++;
+      debugPrintf("ui: ControlItem_GetMoving(%p) without a data block -> 0\n",
+                  c);
+    }
+    return 0;
+  }
+  return *(unsigned char *)((unsigned char *)data + 0xa);
+}
+
+static const so_override touch_state_overrides[] = {
+  { "ControlItem_GetMoving", (void *)ctrlitem_get_moving_safe },
+};
+
+/* ------------------------------------------------------------------------- */
+/* points and money that never go down                                       */
+/* ------------------------------------------------------------------------- */
+/* Asked for: spending a skill point, an ability point or money must leave the
+ * number where it was. All three live in plain memory and each has exactly one
+ * writer, so the writers are replaced through the PLT:
+ *     CHAR_SetSkillPoint(ch, v)    -> *(u8  *)(ch + 0x328) = v
+ *     CHAR_SetStatusPoint(ch, v)   -> *(u16 *)(ch + 0x32a) = v
+ *     INVEN_MinusMoney(v)          -> inventory +0x00 -= v, returns 1 on success
+ * Raises still go through untouched (levelling up, resetting skills, picking
+ * money up). The live-HUD test keeps a save slot's own initialisation out of
+ * it -- loading a slot legitimately lowers these numbers to what it holds. */
+static void (*set_skill_point_real)(void *, int);
+static void (*set_status_point_real)(void *, int);
+static long (*minus_money_real)(long);
+
+static void lock_set_skill_point(void *ch, int v) {
+  if (cfg.lock_points && ch && input_hud_present()) {
+    const unsigned now =
+        *(const unsigned char *)((const unsigned char *)ch + 0x328);
+    if ((unsigned)(v & 0xff) < now) {
+      static int logs;
+      if (logs < 8) {
+        logs++;
+        debugPrintf("cheat: skill point %u -> %d kept\n", now, v);
+      }
+      return;
+    }
+  }
+  if (set_skill_point_real)
+    set_skill_point_real(ch, v);
+}
+
+static void lock_set_status_point(void *ch, int v) {
+  if (cfg.lock_points && ch && input_hud_present()) {
+    const unsigned now =
+        *(const unsigned short *)((const unsigned char *)ch + 0x32a);
+    static int seen;
+    if (seen < 20) {
+      seen++;
+      debugPrintf("cheat: SetStatusPoint(%p, %d) was %u\n", ch, v, now);
+    }
+    if ((unsigned)(v & 0xffff) < now) {
+      static int logs;
+      if (logs < 8) {
+        logs++;
+        debugPrintf("cheat: ability point %u -> %d kept\n", now, v);
+      }
+      return;
+    }
+  }
+  if (set_status_point_real)
+    set_status_point_real(ch, v);
+}
+
+static long lock_minus_money(long v) {
+  if (cfg.lock_points && input_hud_present()) {
+    static int logs;
+    if (logs < 8) {
+      logs++;
+      debugPrintf("cheat: payment of %ld ignored\n", v);
+    }
+    return 1;                  /* "the payment went through" */
+  }
+  return minus_money_real ? minus_money_real(v) : 0;
+}
+
+/* Diagnostic half of the ability point problem: the ability page may be showing
+ * a number the engine derives (total from the level, minus what has already been
+ * spent) instead of the stored counter -- in that case no setter can hold it.
+ * Log what the page actually asks for, so the next run says which one it is. */
+static unsigned short (*get_status_point_real)(void *);
+
+static unsigned short lock_get_status_point(void *ch) {
+  const unsigned short v =
+      get_status_point_real ? get_status_point_real(ch) : 0;
+  static int logs;
+  if (logs < 24 && input_hud_present()) {
+    logs++;
+    debugPrintf("cheat: GetStatusPoint(%p) -> %u\n", ch, v);
+  }
+  return v;
+}
+
+/* Belt and braces: some path may store the counter without going through the
+ * setter (the engine inlines these eight-byte accessors all over the place).
+ * Put the previous value back once per frame, keyed on the character pointer so
+ * a rebuilt party starts from whatever the save actually holds. */
+static struct { void *ch; unsigned short sp; unsigned char sk; } point_cache[3];
+/* ability-page counter mirror (see lock_sv_infostat_set below) */
+static int (*sv_infostat_set_real)(int);
+static long long stat_left_cache;
+static int stat_left_valid;
+
+static void lock_points_tick(void) {
+  if (!cfg.lock_points)
+    return;
+  unsigned char *vb = (unsigned char *)game_mod.load_virtbase;
+  if (!vb)
+    return;
+  /* ability page counter: keep the highest value seen */
+  {
+    long long *left = (long long *)(vb + 0x2d2e58);
+    if (!stat_left_valid) {
+      stat_left_cache = *left;
+      stat_left_valid = 1;
+    } else if (*left < stat_left_cache) {
+      *left = stat_left_cache;
+    } else {
+      stat_left_cache = *left;
+    }
+  }
+  for (int i = 0; i < 3; i++) {
+    void *ch = *(void *const volatile *)(vb + 0x2d0600 + i * 8);
+    if (!ch || !probe_mem_ok(ch, 0x340)) {
+      point_cache[i].ch = NULL;
+      continue;
+    }
+    unsigned char *p = (unsigned char *)ch;
+    const unsigned short sp = *(unsigned short *)(p + 0x32a);
+    const unsigned char sk = *(unsigned char *)(p + 0x328);
+    if (point_cache[i].ch != ch) {
+      point_cache[i].ch = ch;
+      point_cache[i].sp = sp;
+      point_cache[i].sk = sk;
+      continue;
+    }
+    if (sp < point_cache[i].sp) {
+      *(unsigned short *)(p + 0x32a) = point_cache[i].sp;
+      static int logs;
+      if (logs < 8) {
+        logs++;
+        debugPrintf("cheat: ability point %u -> %u restored\n", sp,
+                    point_cache[i].sp);
+      }
+    } else {
+      point_cache[i].sp = sp;
+    }
+    if (sk < point_cache[i].sk) {
+      *(unsigned char *)(p + 0x328) = point_cache[i].sk;
+    } else {
+      point_cache[i].sk = sk;
+    }
+  }
+}
+
+/* The ability page does NOT spend CHAR+0x32a. StatDivide_AddStat() keeps its own
+ * counter in a bss global and mirrors it into a script variable:
+ *     [0x2d2e58] -= 1                     ; points left on the page
+ *     [0x2d2e60 + stat*8] += 1            ; this page's temporary allocation
+ *     SV_InfoStatPointSet([0x2d2e58])     ; mirror, also what the label shows
+ * Only StatDivide_OKApply() later writes the character, and it uses whatever is
+ * left in [0x2d2e58] -- which is why the CHAR setter alone never fired for this
+ * page. Catch the mirror write, put the page counter back to its previous value
+ * and hand the same value to the engine, so both the label and the counter stay
+ * where they were while the allocation itself still goes through. */
+static void lock_sv_infostat_set(int v) {
+  unsigned char *vb = (unsigned char *)game_mod.load_virtbase;
+  if (cfg.lock_points && input_hud_present() && vb) {
+    long long *left = (long long *)(vb + 0x2d2e58);
+    if (stat_left_valid && (long long)v < stat_left_cache) {
+      *left = stat_left_cache;
+      if (sv_infostat_set_real)
+        sv_infostat_set_real((int)stat_left_cache);
+      static int logs;
+      if (logs < 8) {
+        logs++;
+        debugPrintf("cheat: ability point %d -> %lld kept\n", v,
+                    stat_left_cache);
+      }
+      return;
+    }
+  }
+  if (sv_infostat_set_real)
+    sv_infostat_set_real(v);
+}
+
+static const so_override lock_overrides[] = {
+  { "CHAR_SetSkillPoint",   (void *)lock_set_skill_point },
+  { "CHAR_SetStatusPoint",  (void *)lock_set_status_point },
+  { "CHAR_GetStatusPoint",  (void *)lock_get_status_point },
+  { "SV_InfoStatPointSet",  (void *)lock_sv_infostat_set },
+  { "INVEN_MinusMoney",     (void *)lock_minus_money },
+};
+
 int main(int argc, char **argv) {
   cpu_boost(1);
 
@@ -9876,6 +10777,29 @@ int main(int argc, char **argv) {
                    (int)(sizeof(save_overrides) / sizeof(*save_overrides)));
   so_set_overrides(store_overrides,
                    (int)(sizeof(store_overrides) / sizeof(*store_overrides)));
+  so_set_overrides(touch_state_overrides,
+                   (int)(sizeof(touch_state_overrides) /
+                         sizeof(*touch_state_overrides)));
+  if (cfg.lock_points) {
+    set_skill_point_real = (void (*)(void *, int))so_try_find_addr_rx(
+        &game_mod, "CHAR_SetSkillPoint");
+    set_status_point_real = (void (*)(void *, int))so_try_find_addr_rx(
+        &game_mod, "CHAR_SetStatusPoint");
+    minus_money_real =
+        (long (*)(long))so_try_find_addr_rx(&game_mod, "INVEN_MinusMoney");
+    get_status_point_real = (unsigned short (*)(void *))so_try_find_addr_rx(
+        &game_mod, "CHAR_GetStatusPoint");
+    sv_infostat_set_real = (int (*)(int))so_try_find_addr_rx(
+        &game_mod, "SV_InfoStatPointSet");
+    if (set_skill_point_real && set_status_point_real && minus_money_real &&
+        get_status_point_real && sv_infostat_set_real) {
+      so_set_overrides(lock_overrides,
+                       (int)(sizeof(lock_overrides) / sizeof(*lock_overrides)));
+      debugPrintf("cheat: skill/ability points and money are locked\n");
+    } else {
+      debugPrintf("cheat: point/money writers missing, lock off\n");
+    }
+  }
   if (cfg.text_trace) {
     static const struct { const char *name; txt_fn *slot; } bind[] = {
       { "SGL_grpDrawStringWithFont2", &textprobe_SGL_grpDrawStringWithFont2_real },
@@ -9978,6 +10902,17 @@ int main(int argc, char **argv) {
   shortcut_proc = (void *)so_try_find_addr_rx(
       &game_mod, "UIShortcutMenu_Shortcut_EventProc");
   debugPrintf("quick: shortcut-assign event proc %p\n", shortcut_proc);
+  mix_stuff_proc = (void *)so_try_find_addr_rx(
+      &game_mod, "UIMix_StuffItemControlEventProc");
+  mix_inven_proc = (void *)so_try_find_addr_rx(
+      &game_mod, "UIMix_InvenItemControlEventProc");
+  mix_bag_proc = (void *)so_try_find_addr_rx(
+      &game_mod, "UIMix_InvenBagControlEventProc");
+  ctrl_item_get = (void *(*)(void *))so_try_find_addr_rx(
+      &game_mod, "ControlItem_GetItem");
+  debugPrintf("mix: procs stuff %p inven %p bag %p (getitem %p)\n",
+              mix_stuff_proc, mix_inven_proc, mix_bag_proc,
+              (void *)ctrl_item_get);
   ctrl_button_proc = (void *)so_try_find_addr_rx(&game_mod,
                                                  "ControlButton_EventProc");
   ctrl_scroll_proc = (void *)so_try_find_addr_rx(&game_mod,
@@ -10613,14 +11548,14 @@ static void engine_main(void *arg) {
         glEnable(GL_SCISSOR_TEST);
         glClearColor(0.0f, 1.0f, 1.0f, 1.0f);
         int drawn = 0;
-        int stack[64], sp = 0;
-        void *node[64];
+        int stack[160], sp = 0;
+        void *node[160];
         node[0] = hroot;
         sp = 1;
-        while (sp > 0 && drawn < 40) {
+        while (sp > 0 && drawn < 220) {
           void *c = node[--sp];
           const int cn = p_ctrl_count(c);
-          for (int i = 0; i < cn && sp < 64; i++) {
+          for (int i = 0; i < cn && sp < 160; i++) {
             void *ch = p_ctrl_child(c, i);
             if (!ch)
               continue;

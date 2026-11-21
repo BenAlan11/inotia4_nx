@@ -88,8 +88,17 @@ void input_set_quick_rects(const long r[6][4], int enabled);
 void input_set_swap_rect(long x, long y, long w, long h, int enabled);
 /* retired cash-shop basket: real finger touches on its rect are swallowed */
 void input_set_shop_rect(long x, long y, long w, long h, int enabled);
-/* R shoulder replaces that button. Implemented in main.c (data swap). */
+/* A modal page published by the port: while it is up, fingers inside its rect
+ * are NOT vetoed by the HUD rectangles underneath. The synthesizer's leftmost
+ * socket sits under the virtual d-pad disc, and the veto used to eat every
+ * press there except the sliver above and left of the disc. */
+void input_set_page_rect(long x, long y, long w, long h, int enabled);
+/* LT (NS ZL, Xbox left trigger) replaces that button. Implemented in main.c
+ * (data swap). Rebound from shoulder R at the user's request. */
 void quick_swap_fire(void);
+/* R inside the shortcut-ASSIGN popup: flip the engine's page INDEX so a
+ * registration lands on page 2 (quick_swap_fire only swaps HUD data). */
+void shortcut_assign_flip_page(void);
 /* Fire a press/release straight on one control object, using the same
  * SetSelectedControl / SetReleaseEvent path as the HUD's + / - / A buttons.
  * ex,ey are engine layout coordinates. Returns -1 if the object is missing. */

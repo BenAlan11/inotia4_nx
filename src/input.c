@@ -1277,7 +1277,45 @@ static int hud_shop_hit(float sx, float sy) {
 /* forward: defined with the navigation tables below */
 static int hud_nav_hit(float sx, float sy);
 
+/* A modal page owned by the port (the synthesizer). Its rect must be exempt
+ * from the HUD veto: the page is drawn ON TOP of the pad, so a finger that
+ * lands on a page control may not be swallowed just because the disc is
+ * underneath it. Published in engine layout units, same as the HUD rects. */
+static volatile long g_page_r[4];
+static volatile int g_page_on;
+
+void input_set_page_rect(long x, long y, long w, long h, int enabled) {
+  g_page_on = enabled;
+  g_page_r[0] = x;
+  g_page_r[1] = y;
+  g_page_r[2] = w;
+  g_page_r[3] = h;
+}
+
+static int hud_page_hit(float sx, float sy) {
+  if (!g_page_on)
+    return 0;
+  int ew = input_engine_screen_w(), eh = input_engine_screen_h();
+  if (ew <= 0) ew = 1137;
+  if (eh <= 0) eh = 640;
+  const float x = (float)g_page_r[0] * scr_w / (float)ew;
+  const float y = (float)g_page_r[1] * scr_h / (float)eh;
+  const float w = (float)g_page_r[2] * scr_w / (float)ew;
+  const float h = (float)g_page_r[3] * scr_h / (float)eh;
+  return w > 0 && h > 0 && sx >= x && sx < x + w && sy >= y && sy < y + h;
+}
+
 static int hud_touch_blocked(float sx, float sy) {
+  /* A published page is above the pad: every finger on it belongs to the page.
+   * Checked first so no HUD rect below can claim the point. */
+  if (hud_page_hit(sx, sy)) {
+    static int logs;
+    if (logs < 12) {
+      logs++;
+      debugPrintf("input: page touch passed (%.0f,%.0f)\n", sx, sy);
+    }
+    return 0;
+  }
   if (hud_shop_hit(sx, sy)) {
     static int logs;
     if (logs < 8) {
@@ -1347,10 +1385,21 @@ static void poll_touchscreen(void) {
       seen |= bit;
       continue;
     }
-    if (!was && hud_touch_blocked(x, y)) {
-      blocked_fingers |= bit;
-      seen |= bit;
-      continue;
+    if (!was) {
+      /* One line per real press: tells whether the HUD veto swallowed this
+       * point before the engine ever saw it. */
+      const int blk = hud_touch_blocked(x, y);
+      static int press_logs;
+      if (press_logs < 60) {
+        press_logs++;
+        debugPrintf("input: finger press (%.0f,%.0f) screen, hud block %d\n",
+                    x, y, blk);
+      }
+      if (blk) {
+        blocked_fingers |= bit;
+        seen |= bit;
+        continue;
+      }
     }
     input_touch(was ? 1 : 0, id, x, y);
     seen |= bit;
@@ -1911,10 +1960,28 @@ static void nav_update(u64 down, u64 pressed) {
 
   /* L/R switch tabs immediately. The right stick belongs to the free cursor:
    * scrollable regions (skill tree, description pages) are drawn content, not
-   * controls, so a focus list can never reach them. */
+   * controls, so a focus list can never reach them. R STAYS on shoulder for
+   * tab switching (only the two shortcut-page actions were rebound to LT). */
   if (settings && nav_ntabs > 0 && !nav_tab_pending) {
     if (pressed & HidNpadButton_L) { nav_switch_tab(-1); return; }
     if (pressed & HidNpadButton_R) { nav_switch_tab(+1); return; }
+  }
+  /* The shortcut-assign popup ("请选择要设置的快捷键。") is reported as
+   * SETTINGS with ZERO tabs and exactly six circular slot controls. There is
+   * no tab for L/R to switch, and input_update()'s LT is gated behind
+   * !input_nav_active(), so it fell through and did nothing. LT still has its
+   * field meaning here: flip to the other shortcut page (the on-screen
+   * page-swap button at 1059,313 lives on this popup too), so the player can
+   * register into page 2 without leaving the popup. nav_tab_pending stays
+   * clear for this popup, so a real tab rebuild cannot leak into it. */
+  if (settings && nav_ntabs == 0 && nav_nitems == 6 && !nav_tab_pending &&
+      (pressed & HidNpadButton_ZL)) {
+    debugPrintf("nav: LT flips shortcut page in assign popup\n");
+    /* Flip the engine's write index, not just the HUD data array: otherwise
+     * the visible slots change but registering a skill still lands on page 1. */
+    shortcut_assign_flip_page();
+    nav_dirty = 1;
+    return;
   }
 
   if (pressed & HidNpadButton_B) {
@@ -2049,11 +2116,12 @@ void input_update(void) {
   const u64 released = ~down & pad_prev;
   const int rt = (down & HidNpadButton_ZR) != 0;   /* Xbox RT / NS ZR */
 
-  /* R shoulder replaces the on-screen page-swap button. Global on purpose:
-   * the field HUD and the shortcut-assign page both use it, and neither draws
-   * that button's icon any more. The stick and A never read this key. */
-  /* R swaps quick-slot pages in the field; on a settings page it changes tab */
-  if ((pressed & HidNpadButton_R) && !input_nav_active())
+  /* LT (NS ZL, Xbox left trigger) replaces the on-screen page-swap button.
+   * Global on purpose: the field HUD and the shortcut-assign page both use it,
+   * and neither draws that button's icon any more. The stick and A never read
+   * this key. Rebound from shoulder R at the user's request. */
+  /* LT swaps quick-slot pages in the field; on a settings page it changes tab */
+  if ((pressed & HidNpadButton_ZL) && !input_nav_active())
     quick_swap_fire();
 
   const HidAnalogStickState ls = padGetStickPos(&pad, 0);

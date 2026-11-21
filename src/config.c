@@ -59,6 +59,7 @@ void config_defaults(void) {
   cfg.skip_huge     = 1;  /* and an oversized sprite over the character select */
   cfg.touch_cleanup = 0;  /* off: the engine's own release handling must run */
   cfg.kill_stale_overlay = 1;  /* the Hive prompt leaves a full-screen layer behind */
+  cfg.lock_points   = 1;       /* spending a point or paying never lowers the value */
   cfg.draw_hitboxes = 0;       /* outline the control rects to calibrate clicks */
   cfg.draw_text     = 1;       /* the engine's own glyph rasteriser needs Android */
   cfg.text_trace    = 0;       /* off: only the screens being chased need it */
@@ -177,6 +178,7 @@ void config_load(const char *path) {
     else if (!strcasecmp_compat(key, "skip_huge"))      cfg.skip_huge      = atoi(val);
     else if (!strcasecmp_compat(key, "touch_cleanup"))  cfg.touch_cleanup  = atoi(val);
     else if (!strcasecmp_compat(key, "kill_stale_overlay")) cfg.kill_stale_overlay = atoi(val);
+    else if (!strcasecmp_compat(key, "lock_points"))    cfg.lock_points    = atoi(val);
     else if (!strcasecmp_compat(key, "draw_hitboxes"))  cfg.draw_hitboxes  = atoi(val);
     else if (!strcasecmp_compat(key, "draw_text"))      cfg.draw_text      = atoi(val);
     else if (!strcasecmp_compat(key, "text_trace"))     cfg.text_trace     = atoi(val);

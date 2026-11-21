@@ -43,6 +43,7 @@ typedef struct {
   int  skip_huge;         /* drop texture parts with an absurd destination size */
   int  touch_cleanup;     /* force-clear engine touch state (bring-up; breaks clicks) */
   int  kill_stale_overlay;/* drop the leftover popup layer above the menu */
+  int  lock_points;       /* skill/ability points and money never go down */
   int  draw_hitboxes;     /* outline every control rectangle (bring-up) */
   int  draw_text;         /* draw engine text with FreeType (see main.c) */
   int  text_trace;        /* log the text entry points we do not replace */

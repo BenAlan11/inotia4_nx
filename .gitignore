@@ -43,13 +43,10 @@ tmp_*.py
 .workbuddy/poke.py
 .workbuddy/*.png
 
-# large snapshots stay on disk; only the CURRENT and the immediately previous
-# known-good's NRO and zip are in the repo, older ones keep their VERSION.txt
+# only the CURRENT known-good snapshot is kept (user request 2026-11-21):
+# its NRO, config and VERSION.txt are in the repo; older snapshots were removed.
 snapshots/known-good-*/inotia4_nx.nro
 snapshots/save-slot-*.zip
 snapshots/save-fix-*.zip
 snapshots/sdcard-before-*/
-!snapshots/known-good-20261116-2122/inotia4_nx.nro
-!snapshots/save-slot-20261116-2122.zip
-!snapshots/known-good-20261115-1903/inotia4_nx.nro
-!snapshots/save-slot-20261115-1903.zip
+!snapshots/known-good-20261121-1058/inotia4_nx.nro
